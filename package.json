@@ -1,0 +1,41 @@
+{
+  "name": "vorq-coordinator-node",
+  "version": "0.1.0",
+  "private": true,
+  "license": "FSL-1.1-ALv2",
+  "type": "module",
+  "scripts": {
+    "start": "tsx --import ./src/instrument.ts src/main.ts",
+    "typecheck": "tsc",
+    "test": "vitest run --project unit",
+    "test:ci": "node scripts/require-db-url.mjs && vitest run --project unit",
+    "test:devnet": "vitest run --project devnet",
+    "gen:abi": "./scripts/gen-abi.sh",
+    "gen:vectors": "tsx scripts/gen-vectors.mjs",
+    "bench:pin": "tsx scripts/pin-bench.mts"
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "devDependencies": {
+    "@types/node": "^26.6.3",
+    "tsx": "^4.23.15",
+    "typescript": "^7.0.2",
+    "vitest": "^5.0.3"
+  },
+  "dependencies": {
+    "@fastify/cors": "^11.3.0",
+    "@fastify/multipart": "^10.1.2",
+    "@fastify/swagger": "^9.9.1",
+    "@fastify/swagger-ui": "^6.1.1",
+    "@noble/hashes": "1.8.0",
+    "@sentry/node": "^11.2.0",
+    "@types/pg": "^8.23.1",
+    "ajv": "^8.20.0",
+    "fastify": "^5.12.5",
+    "pg": "^8.23.1",
+    "sodium-native": "^5.1.0",
+    "typebox": "^1.3.34",
+    "viem": "^2.57.2"
+  }
+}

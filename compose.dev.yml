@@ -1,0 +1,35 @@
+# Local Postgres for development and the devnet integration suite.
+#
+# This stack is Postgres and nothing else. The chain is a separate stack with its
+# own lifecycle (`BASE_SEPOLIA_RPC_URL=… make -C ../vorq-evm-contracts/fork up`);
+# do not merge them.
+#
+# Published on 5433, not 5432, to stay clear of any pre-existing local Postgres.
+#
+# Credentials come from the environment; the fallbacks are throwaway local-dev
+# values so a bare `docker compose -f compose.dev.yml up -d` works, and nothing
+# here is ever a real secret. With the fallbacks:
+#   DATABASE_URL=postgres://vorq:vorq@localhost:5433/vorq
+name: vorq-coordinator-dev
+
+services:
+  postgres:
+    image: postgres:16
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-vorq}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-vorq}
+      POSTGRES_DB: ${POSTGRES_DB:-vorq}
+    ports:
+      - "${POSTGRES_PORT:-5433}:5432"
+    volumes:
+      - vorq-coordinator-pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test:
+        ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-vorq} -d ${POSTGRES_DB:-vorq}"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+volumes:
+  vorq-coordinator-pgdata:

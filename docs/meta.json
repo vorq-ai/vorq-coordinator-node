@@ -1,0 +1,12 @@
+{
+  "title": "Coordinator API",
+  "icon": "Network",
+  "root": true,
+  "pages": [
+    "index",
+    "quickstart",
+    "guides",
+    "concepts",
+    "reference"
+  ]
+}

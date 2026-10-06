@@ -1,0 +1,15 @@
+{
+  "title": "Guides",
+  "pages": [
+    "authenticate-with-a-wallet",
+    "submit-a-job",
+    "cancel-a-job",
+    "run-a-batch",
+    "page-through-listings",
+    "claim-and-settle-jobs",
+    "publish-asks",
+    "self-host-the-coordinator",
+    "recover-from-a-reorg",
+    "run-the-escrow"
+  ]
+}

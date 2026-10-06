@@ -1,0 +1,14 @@
+{
+  "title": "Reference",
+  "pages": [
+    "conventions",
+    "errors",
+    "client-api",
+    "provider-api",
+    "auth-api",
+    "escrow-api",
+    "health-api",
+    "signed-messages",
+    "configuration"
+  ]
+}

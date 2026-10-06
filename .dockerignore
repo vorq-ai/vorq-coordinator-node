@@ -1,0 +1,39 @@
+# The build context is this repository; everything below either cannot help the
+# image or must never reach it. Mirrors .gitignore where the reason is the same.
+
+# Host-installed, and platform-specific: `sodium-native` resolves its prebuild at
+# install time, so a macOS tree copied into a linux image would be broken in a
+# way that only surfaces at boot. Both stages run their own `npm ci`.
+node_modules/
+
+# Gitignored, and nothing says a word about how old a copy in a checkout is. The
+# builder stage compiles its own; letting a stray one through would let it win
+# the COPY and ship an older protocol against current clients.
+dist/
+
+.git/
+.gitignore
+
+# Nothing under test runs in the image, and vitest is not installed there.
+test/
+coverage/
+vitest.config.ts
+
+# Secrets live in the environment only — a `.env` baked into an image is a
+# credential published to every registry that holds it.
+.env
+.env.*
+
+# Runtime artefacts of a local devnet, not inputs to a build: `/state` is a
+# published address set and `/addresses.json` is regenerated on every boot. The
+# image reads its addresses from `ADDRESSES_FILE` at run time.
+/state/
+/addresses.json
+
+# The dev loop's own compose file, which builds nothing this Dockerfile needs.
+compose.dev.yml
+
+README.md
+Dockerfile
+.dockerignore
+.DS_Store
