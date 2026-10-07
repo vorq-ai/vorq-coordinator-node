@@ -15,10 +15,12 @@ import {
   Nullable,
   SafeUint,
   Uint32,
+  Usd,
   UsdOut,
 } from "../schemas/common.js";
 import { planBatch } from "../../match/plan.js";
 import { formatUsd } from "../../money.js";
+import { usdParam } from "../usd.js";
 import { attachFile, MAX_BATCH_LINES } from "./files.js";
 
 /**
@@ -62,7 +64,7 @@ const MAX_METADATA_PAIRS = 16;
 const MAX_METADATA_KEY_CHARS = 64;
 const MAX_METADATA_VALUE_CHARS = 512;
 
-/** Distinct models one plan may name: a bound on the work an unsigned read does. */
+/** Entries one plan may name: a bound on the work an unsigned read does. */
 const MAX_PLAN_MODELS = 16;
 
 /** One page of `GET /v1/batches`. OpenAI's default and ceiling. */
@@ -100,6 +102,8 @@ const BatchPlan = Type.Object({
       lines: Uint32({ minimum: 1, maximum: MAX_BATCH_LINES }),
       units_in: SafeUint({ description: "The total over this model's lines." }),
       units_out: SafeUint({ description: "The total over this model's lines." }),
+      max_rate_in: Type.Optional(Usd({ description: "The most these lines pay per 1M input units, in USD." })),
+      max_rate_out: Type.Optional(Usd({ description: "The most these lines pay per 1M output units, in USD." })),
     }),
     { minItems: 1, maxItems: MAX_PLAN_MODELS },
   ),
@@ -114,8 +118,9 @@ const BatchBody = Type.Unsafe<Static<typeof BatchCreate> | Static<typeof BatchPl
   type: "object",
   description:
     "**Create** (`input_file_id` present): a batch over an uploaded file. " +
-    "**Plan** (no `input_file_id`): for lines that name no bid, which providers would take " +
-    "how many lines, at which ask, answered `402` with nothing signed and nothing reserved.",
+    "**Plan** (no `input_file_id`): which providers would take how many lines, at which ask, " +
+    "within each entry's `max_rate_in` / `max_rate_out`, answered `402` with nothing signed " +
+    "and nothing reserved.",
   if: { required: ["input_file_id"] },
   then: BatchCreate,
   else: BatchPlan,
@@ -216,19 +221,24 @@ export function batchCreateRoute(app: App, deps: RouteDeps): void {
 
     // ---- the plan: no file yet, so nothing signed ---------------------------
     //
-    // A client with unpriced lines asks first how the network would take them:
-    // per model, which providers, at which ask, and how many lines each — never
-    // past a provider's on-chain capacity (`match/plan.ts`). It seals each line
+    // A client asks first how the network would take its lines: per entry, which
+    // providers within the entry's ceilings, at which ask, and how many lines
+    // each — never past a provider's on-chain capacity (`match/plan.ts`). It seals each line
     // to its allotted provider and then uploads and creates as usual. Nothing is
     // held, so the answer is about now.
     if (!("input_file_id" in body)) {
       const window = WINDOWS[body.completion_window];
-      const requests = body.models.map((m) => ({
+      const { decimals } = deps.config.addresses;
+      const ceiling = (text: string | undefined, param: string) =>
+        text === undefined ? null : usdParam(text, decimals, param, true);
+      const requests = body.models.map((m, i) => ({
         modelId: BigInt(m.model_id),
         slaSecs: window,
         lines: BigInt(m.lines),
         unitsIn: BigInt(m.units_in),
         unitsOut: BigInt(m.units_out),
+        maxRateIn: ceiling(m.max_rate_in, `models[${i}].max_rate_in`),
+        maxRateOut: ceiling(m.max_rate_out, `models[${i}].max_rate_out`),
       }));
       const plans = await planBatch(deps.db, requests, { livenessMs: deps.config.match.livenessMs });
       return reply
@@ -240,8 +250,8 @@ export function batchCreateRoute(app: App, deps: RouteDeps): void {
             lines: r.lines,
             allocation: (plans[i] ?? []).map((a) => ({
               ...a,
-              rate_in: formatUsd(a.rate_in, deps.config.addresses.decimals),
-              rate_out: formatUsd(a.rate_out, deps.config.addresses.decimals),
+              rate_in: formatUsd(a.rate_in, decimals),
+              rate_out: formatUsd(a.rate_out, decimals),
             })),
           })),
         });

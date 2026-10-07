@@ -151,8 +151,8 @@ describe.skipIf(!TEST_DATABASE_URL)("the matcher", () => {
     unitsOut: 2000n,
   };
 
-  const rank = (job: Partial<MatchJob> = {}, limit = 10, market = false) =>
-    rankProviders(db, { ...openJob, ...job }, { livenessMs: config.match.livenessMs, limit, market });
+  const rank = (job: Partial<MatchJob> = {}, limit = 10) =>
+    rankProviders(db, { ...openJob, ...job }, { livenessMs: config.match.livenessMs, limit });
 
   const ids = async (...args: Parameters<typeof rank>) =>
     (await rank(...args)).map((candidate) => Number(candidate.provider_id));
@@ -290,7 +290,7 @@ describe.skipIf(!TEST_DATABASE_URL)("the matcher", () => {
     expect(await ids()).toEqual([4]);
   });
 
-  it("ranks every live ask for the market, whatever the bid", async () => {
+  it("ranks every live ask for a probe that sets no ceiling", async () => {
     for (const [id, rateIn, rateOut] of [
       [1, "40", "40"],
       [2, "10", "10"],
@@ -303,17 +303,36 @@ describe.skipIf(!TEST_DATABASE_URL)("the matcher", () => {
     await seedAsk(3, "1", "1");
     await seedPresence(3, { free_slots: 0 });
 
-    expect(await ids({ rateIn: 0n, rateOut: 0n }, 10, true)).toEqual([2, 1]);
-    expect(await ids({ rateIn: 0n, rateOut: 0n, designated: 1n }, 10, true)).toEqual([1]);
+    expect(await ids({ rateIn: null, rateOut: null })).toEqual([2, 1]);
+    expect(await ids({ rateIn: null, rateOut: null, designated: 1n })).toEqual([1]);
     // A signed 0/0 bid is still a bid: nothing clears it.
     expect(await ids({ rateIn: 0n, rateOut: 0n })).toEqual([]);
+  });
+
+  it("holds a probe's asks to the ceilings it set, one side at a time", async () => {
+    for (const [id, rateIn, rateOut] of [
+      [1, "10", "90"],
+      [2, "30", "20"],
+      [3, "50", "50"],
+    ] as const) {
+      await seedProvider(id);
+      await seedAsk(id, rateIn, rateOut);
+      await seedPresence(id);
+    }
+    const mix = { unitsIn: 1n, unitsOut: 1n };
+
+    // The other side is unbounded: provider 1's output rate does not exclude it.
+    expect(await ids({ ...mix, rateIn: 30n, rateOut: null })).toEqual([2, 1]);
+    expect(await ids({ ...mix, rateIn: null, rateOut: 50n })).toEqual([2, 3]);
+    expect(await ids({ ...mix, rateIn: 30n, rateOut: 50n })).toEqual([2]);
+    expect(await ids({ ...mix, rateIn: 9n, rateOut: null })).toEqual([]);
   });
 
   it("rotates the market probe across equal asks", async () => {
     await seedFleet();
     const firsts: number[] = [];
     for (let i = 0; i < 4; i += 1) {
-      const [first] = await rank({ rateIn: 0n, rateOut: 0n }, 3, true);
+      const [first] = await rank({ rateIn: null, rateOut: null }, 3);
       if (first === undefined) throw new Error("no candidate");
       await markAssigned(db, first.provider_id, openJob.modelId);
       firsts.push(Number(first.provider_id));
@@ -389,6 +408,8 @@ describe.skipIf(!TEST_DATABASE_URL)("the matcher", () => {
         lines: 1n,
         unitsIn: 1000n,
         unitsOut: 2000n,
+        maxRateIn: null,
+        maxRateOut: null,
         ...r,
       })),
       { livenessMs: config.match.livenessMs },
@@ -411,6 +432,25 @@ describe.skipIf(!TEST_DATABASE_URL)("the matcher", () => {
       [1, 4],
     ]);
     expect(plan![0]!.rate_in).toBe(10n);
+  });
+
+  it("plans only providers whose ask is within the entry's ceilings", async () => {
+    for (const [id, rateIn, rateOut] of [
+      [1, "10", "90"],
+      [2, "30", "20"],
+    ] as const) {
+      await seedProvider(id);
+      await seedAsk(id, rateIn, rateOut);
+      await seedPresence(id);
+    }
+    const [inOnly, outOnly, neither] = await planOf([
+      { lines: 1n, maxRateIn: 10n },
+      { lines: 1n, maxRateOut: 20n },
+      { lines: 1n, maxRateIn: 9n, maxRateOut: 19n },
+    ]);
+    expect(split(inOnly!)).toEqual([[1, 1]]);
+    expect(split(outOnly!)).toEqual([[2, 1]]);
+    expect(neither).toEqual([]);
   });
 
   it("counts claimed jobs and open orders pinned to a provider against its budget", async () => {

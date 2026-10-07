@@ -8,11 +8,11 @@ import type { Queryable } from "../db/db.js";
  * private floor never crosses to this side — so a candidate is a listed
  * provider that polled within the liveness window, has a free slot left after
  * the leases it already holds, publishes an ask for the job's window that
- * clears the signed rates, and has a box key to seal to.
+ * clears the job's rates, and has a box key to seal to.
  *
- * `market` drops the rate check, so every live ask ranks: the answer to a
- * client that names no bid, which then signs the first candidate's own ask
- * pinned to that provider.
+ * A `null` rate is a side with no ceiling: a probe names the ceilings its
+ * client set, possibly neither, and every live ask within them ranks. The
+ * client then signs the first candidate's own ask pinned to that provider.
  *
  * The order is the whole fairness story: cheapest ask for this job's unit mix
  * first, then the provider that was named least recently — a per-model
@@ -27,8 +27,9 @@ export interface MatchJob {
   slaSecs: bigint;
   /** `0n` for an open order; otherwise the only provider that may be named. */
   designated: bigint;
-  rateIn: bigint;
-  rateOut: bigint;
+  /** The most the job pays per side; `null` on a probe that set no ceiling there. */
+  rateIn: bigint | null;
+  rateOut: bigint | null;
   unitsIn: bigint;
   unitsOut: bigint;
 }
@@ -47,7 +48,7 @@ const ZERO_KEY = Buffer.alloc(32);
 export async function rankProviders(
   db: Queryable,
   job: MatchJob,
-  options: { livenessMs: number; limit: number; market?: boolean },
+  options: { livenessMs: number; limit: number },
 ): Promise<Candidate[]> {
   // Every bigint as a string: the driver would otherwise stringify it anyway,
   // and the `::numeric` casts below need text to be exact past 2^53.
@@ -66,7 +67,8 @@ export async function rankProviders(
         AND pr.seen_at >= now() - ($3::bigint * interval '1 millisecond')
         AND ($4::bigint = 0 OR p.provider_id = $4)
         AND pr.free_slots - COALESCE(l.n, 0) > 0
-        AND ($11::boolean OR (a.rate_out <= $8::numeric AND a.rate_in <= $9::numeric))
+        AND ($8::numeric IS NULL OR a.rate_out <= $8::numeric)
+        AND ($9::numeric IS NULL OR a.rate_in <= $9::numeric)
         AND p.box_key IS NOT NULL AND p.box_key <> $10
       ORDER BY (a.rate_in * $5::numeric + a.rate_out * $6::numeric) ASC,
                pr.last_assigned_at ASC NULLS FIRST,
@@ -80,10 +82,9 @@ export async function rankProviders(
       job.unitsIn.toString(),
       job.unitsOut.toString(),
       options.limit,
-      job.rateOut.toString(),
-      job.rateIn.toString(),
+      job.rateOut?.toString() ?? null,
+      job.rateIn?.toString() ?? null,
       ZERO_KEY,
-      options.market === true,
     ],
   );
   return rows;

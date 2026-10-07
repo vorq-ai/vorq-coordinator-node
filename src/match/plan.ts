@@ -3,8 +3,8 @@ import { OPEN } from "../api/routes/jobs.js";
 import { markAssigned } from "./rank.js";
 
 /**
- * The batch planner: how many lines of an unpriced batch each live provider
- * can take, within the network's own limit.
+ * The batch planner: how many lines of a batch each live provider can take,
+ * within the network's own limit and the ceilings the lines set.
  *
  * The limit is the chain's: a provider may hold at most `effectiveCap` claimed
  * jobs, and `claim` reverts `AtCapacity` past it. A provider's **budget** is
@@ -12,7 +12,7 @@ import { markAssigned } from "./rank.js";
  * orders pinned to it — so a plan never books more than the provider could hold
  * at once, and batches and single orders draw on one pool.
  *
- * Allocation is by price: cheapest ask for the model's summed unit mix first,
+ * Allocation is by price: cheapest ask within the ceilings for the summed unit mix first,
  * each provider filled to its budget, equal prices taken least recently named
  * first. Nothing is held: a plan is an answer about now, and the caller seals
  * against it straight away.
@@ -23,6 +23,9 @@ export interface PlanRequest {
   lines: bigint;
   unitsIn: bigint;
   unitsOut: bigint;
+  /** The most these lines pay per side; `null` for no ceiling there. */
+  maxRateIn: bigint | null;
+  maxRateOut: bigint | null;
 }
 
 export interface Allotment {
@@ -68,6 +71,8 @@ async function budgets(
         AND (p.allow_all_models OR $1 = ANY(p.allowed_models))
         AND pr.seen_at >= now() - ($3::bigint * interval '1 millisecond')
         AND p.box_key IS NOT NULL AND p.box_key <> $6
+        AND ($7::numeric IS NULL OR a.rate_in <= $7::numeric)
+        AND ($8::numeric IS NULL OR a.rate_out <= $8::numeric)
       ORDER BY (a.rate_in * $4::numeric + a.rate_out * $5::numeric) ASC,
                pr.last_assigned_at ASC NULLS FIRST,
                p.provider_id ASC`,
@@ -78,13 +83,15 @@ async function budgets(
       request.unitsIn.toString(),
       request.unitsOut.toString(),
       ZERO_KEY,
+      request.maxRateIn?.toString() ?? null,
+      request.maxRateOut?.toString() ?? null,
     ],
   );
   return rows.map((row) => ({ ...row, free: BigInt(row.free) }));
 }
 
 /**
- * One allocation per requested model, in request order. A model's allocation
+ * One allocation per plan entry, in request order. An entry's allocation
  * sums to fewer lines than it asked for when the network cannot take them all;
  * the caller refuses such a batch rather than posting part of it.
  *

@@ -25,7 +25,7 @@ The client seals to the first candidate and sets `designated` to its id. An empt
 
 ## The market probe
 
-A client that names no bid asks for the market first: `POST /v1/jobs` with the order's `model_id`, `sla_secs`, `units_in`, `units_out` and optional `designated`, and **no rates and no signature**. The answer is `402` with `candidates` only: every live ask that meets the other conditions above, ranked the same way, with no quote. An unpinned probe advances the rotation like an open-bid quote does.
+A client asks for the market before it signs: `POST /v1/jobs` with the order's `model_id`, `sla_secs`, `units_in`, `units_out` and optional `designated`, and **no rates and no signature**. Optional `max_rate_in` and `max_rate_out` are ceilings: an ask above one is left out, and a side with no ceiling is unbounded. The answer is `402` with `candidates` only: every live ask within the ceilings that meets the other conditions above, ranked the same way, with no quote. An unpinned probe advances the rotation like an open-bid quote does.
 
 The client then signs the first candidate's `rate_in` and `rate_out` with `designated` set to that provider, and continues with the normal quote.
 
@@ -39,6 +39,6 @@ While a lease lasts, other pollers do not receive that job, so providers polling
 
 ## The batch plan
 
-A batch whose lines name no bid is planned before any line is sealed: [`POST /v1/batches`](../reference/client-api.md#post-v1batches) with no `input_file_id`, the batch window, and per model the line count and summed units. The coordinator answers how many lines each provider takes, at its ask.
+A batch is planned before any line is sealed: [`POST /v1/batches`](../reference/client-api.md#post-v1batches) with no `input_file_id`, the batch window, and per entry a model, the line count, the summed units and optional `max_rate_in` / `max_rate_out` ceilings. The coordinator answers how many lines each provider within the ceilings takes, at its ask.
 
-The budget is the network's own limit. A provider may hold at most its on-chain capacity (reputation times the lesser of what it requested and its ceiling) in claimed jobs, so its share of a plan is that capacity less its claimed jobs and the open orders already designated to it. Single orders and batches draw on the same pool. Providers are filled cheapest first for the model's unit mix; equal prices take turns. A batch larger than the network can take in its window is refused before anything is signed.
+The budget is the network's own limit. A provider may hold at most its on-chain capacity (reputation times the lesser of what it requested and its ceiling) in claimed jobs, so its share of a plan is that capacity less its claimed jobs and the open orders already designated to it. Single orders and batches draw on the same pool. Providers are filled cheapest first for the entry's unit mix; equal prices take turns. An entry's allocation sums to fewer lines than it asked for when the network cannot take them all within its ceilings.

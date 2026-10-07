@@ -275,6 +275,34 @@ describe.skipIf(!TEST_DATABASE_URL)("/v1/batches", () => {
       expect((await db.query("SELECT count(*)::int AS n FROM batches")).rows[0].n).toBe(0);
     });
 
+    it("plans within an entry's ceilings: an ask above one takes no lines", async () => {
+      for (const table of ["provider_presence", "asks_chain", "providers"]) {
+        await db.query(`DELETE FROM ${table}`);
+      }
+      await db.query(
+        `INSERT INTO providers (provider_id, operator, box_key, reputation, capacity_ceiling,
+                                capacity_requested, listed, allow_all_models)
+         VALUES (4, $1, $2, 1000, 2, 2, true, true)`,
+        [Buffer.alloc(20, 4), Buffer.alloc(32, 4)],
+      );
+      await db.query(
+        "INSERT INTO asks_chain (provider_id, model_id, sla, rate_in, rate_out) VALUES (4, 7, 86400, 10, 20)",
+      );
+      await db.query("INSERT INTO provider_presence (provider_id, model_id, free_slots) VALUES (4, 7, 1)");
+
+      const entry = { model_id: 7, lines: 1, units_in: 100, units_out: 200 };
+      const planned = await create({
+        completion_window: "24h",
+        models: [
+          { ...entry, max_rate_in: "0.000009" },
+          { ...entry, max_rate_in: "0.00001" },
+        ],
+      });
+
+      expect(planned.statusCode).toBe(402);
+      expect(planned.json().plan.map((p: { allocation: unknown[] }) => p.allocation.length)).toEqual([0, 1]);
+    });
+
     it("refuses a plan that names no models", async () => {
       const refused = await create({ completion_window: "24h", models: [] });
       expect(refused.statusCode).toBe(400);

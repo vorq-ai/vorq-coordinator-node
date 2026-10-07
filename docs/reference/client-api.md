@@ -56,7 +56,7 @@ Quote or submit an order. The same body, sent without and then with a payment, f
 - `auth_sig` is the owner's [`ReceiveWithAuthorization`](./signed-messages.md#receivewithauthorization) signature over the quoted authorization, and `amount` is the quoted `amount`.
 - Send exactly one of `container` (the sealed container, base64, up to 15 679 488 bytes decoded) and `container_cid` (the `vorq.cid` of an `input` upload by `owner`).
 
-**Market probe** (a body with neither `rate_in` nor `rate_out`): `model_id`, `sla_secs`, `units_in`, `units_out` and optional `designated`, unsigned. The answer is `402` with `{"candidates": [...]}` only: every live ask for the model and window, ranked as below, with no quote. See [Matching and leases](../concepts/matching-and-leases.md#the-market-probe).
+**Market probe** (a body with neither `rate_in` nor `rate_out`): `model_id`, `sla_secs`, `units_in`, `units_out` and optional `designated`, `max_rate_in` and `max_rate_out`, unsigned. The answer is `402` with `{"candidates": [...]}` only: every live ask for the model and window at or under the ceilings named, ranked as below, with no quote. See [Matching and leases](../concepts/matching-and-leases.md#the-market-probe).
 
 **Response `402`**: the quote, when `auth_sig` is absent. `x-vorq-retryable: false`.
 
@@ -214,13 +214,13 @@ Create a batch from an uploaded `batch` file.
 
 **Response `200`:** a [batch object](#batch-object) with `status: "validating"`.
 
-**Batch plan** (a body with no `input_file_id`): for lines that name no bid, ask how the network would take them before sealing anything.
+**Batch plan** (a body with no `input_file_id`): ask how the network would take the lines before sealing anything.
 
 ```json
 { "completion_window": "24h", "models": [{ "model_id": 3, "lines": 120, "units_in": 48000, "units_out": 491520 }] }
 ```
 
-`units_in` and `units_out` are the totals over that model's lines. The answer is `402` with, per model, the providers to seal to, their ask and how many lines each takes:
+`units_in` and `units_out` are the totals over that entry's lines. An entry may add `max_rate_in` and `max_rate_out` (USD per 1M units); only providers asking at or under them are planned. The answer is `402` with, per entry, the providers to seal to, their ask and how many lines each takes:
 
 ```json
 { "plan": [{ "model_id": 3, "lines": 120, "allocation": [{ "provider_id": 1, "box_key": "0x…", "rate_in": "2.1184", "rate_out": "10.6264", "lines": 120 }] }] }

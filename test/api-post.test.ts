@@ -308,6 +308,8 @@ interface StoreOptions {
   unconfirmedJobs?: Set<string>;
   /** What the candidate ranking answers on the challenge. */
   candidates?: Candidate[];
+  /** The parameters of every candidate ranking the door ran. */
+  ranked?: unknown[][];
   /** Every round-robin cursor bump the challenge issued: `[provider_id, model_id]`. */
   bumps?: unknown[][];
   /** Uploads a `container_cid` may name, by cid. */
@@ -349,7 +351,10 @@ function stubDb(options: StoreOptions = {}): Db {
     // write (the round-robin cursor). Checked first: the ranking's LATERAL
     // subquery reads `jobs` too, and must not be mistaken for the duplicate
     // pre-check below.
-    if (text.includes("FROM providers p")) return { rows: options.candidates ?? [] };
+    if (text.includes("FROM providers p")) {
+      options.ranked?.push([...(params ?? [])]);
+      return { rows: options.candidates ?? [] };
+    }
     if (text.includes("UPDATE provider_presence")) {
       options.bumps?.push([...(params ?? [])]);
       return { rows: [] };
@@ -1455,6 +1460,29 @@ describe("POST /v1/jobs — relay", () => {
 
     expect(probe.statusCode).toBe(402);
     expect(bumps).toEqual([]);
+  });
+
+  it("ranks a probe within the ceilings it names, and none where it names none", async () => {
+    const ranked: unknown[][] = [];
+    const { app } = harness({ ranked });
+
+    await post(app, { model_id: 3, sla_secs: 86400, units_in: 10, units_out: 20, max_rate_in: "0.05" });
+    await post(app, { model_id: 3, sla_secs: 86400, units_in: 10, units_out: 20 });
+
+    // $8 is the output ceiling, $9 the input one.
+    expect(ranked.map((params) => [params[7], params[8]])).toEqual([
+      [null, "50000"],
+      [null, null],
+    ]);
+  });
+
+  it("refuses a probe ceiling finer than the token's decimals", async () => {
+    const { app } = harness();
+    const probe = await post(app, {
+      model_id: 3, sla_secs: 86400, units_in: 10, units_out: 20, max_rate_out: "0.0000001",
+    });
+    expect(probe.statusCode).toBe(400);
+    expect(probe.json().error.param).toBe("max_rate_out");
   });
 
   it("refuses a market probe with an out-of-range member", async () => {

@@ -48,8 +48,10 @@ import {
   SafeUint,
   Sig65,
   Uint32,
+  Usd,
   UsdOut,
 } from "../schemas/common.js";
+import { usdParam } from "../usd.js";
 import { attachFile, findUpload } from "./files.js";
 
 /**
@@ -328,6 +330,8 @@ export const MarketProbe = Type.Object({
   units_in: Uint32(),
   units_out: Uint32(),
   designated: Type.Optional(Uint32({ description: "Pin one provider; its ask is the only candidate." })),
+  max_rate_in: Type.Optional(Usd({ description: "Only asks at or under this, USD per 1M input units." })),
+  max_rate_out: Type.Optional(Usd({ description: "Only asks at or under this, USD per 1M output units." })),
 });
 type MarketProbe = Static<typeof MarketProbe>;
 
@@ -340,7 +344,7 @@ const JobBody = Type.Unsafe<MarketProbe | Submission>({
   type: "object",
   description:
     "**Probe** (neither `rate_in` nor `rate_out`): the ranked live asks for the model and window, " +
-    "unsigned, answered `402 {candidates}`. **Challenge** (a signed order, no `auth_sig`): " +
+    "within `max_rate_in` / `max_rate_out` where set, unsigned, answered `402 {candidates}`. **Challenge** (a signed order, no `auth_sig`): " +
     "answered `402` with the quote to sign. **Submission** (order, `auth_sig`, `amount` and " +
     "exactly one of `container`/`container_cid`): relayed, `201`.",
   if: PROBE_TEST,
@@ -439,24 +443,27 @@ export function postRoutes(app: App, deps: RouteDeps): void {
     //
     // Every order carries both rates, so a body with neither is a client asking
     // for the market before it signs anything: every live ask for the model and
-    // window, ranked as the challenge ranks them, and nothing to pay yet. It
+    // window within the ceilings it set, ranked as the challenge ranks them, and
+    // nothing to pay yet. It
     // needs no signature because it commits to nothing — which in a browser is
     // one wallet prompt fewer per job. An open probe advances the rotation
     // exactly as an open challenge does.
     if (isProbe(body)) {
+      const { decimals } = deps.config.addresses;
+      const ceiling = (text: string | undefined, param: string) =>
+        text === undefined ? null : usdParam(text, decimals, param, true);
       const job = {
         modelId: BigInt(body.model_id),
         slaSecs: BigInt(body.sla_secs),
         designated: BigInt(body.designated ?? 0),
-        rateIn: 0n,
-        rateOut: 0n,
+        rateIn: ceiling(body.max_rate_in, "max_rate_in"),
+        rateOut: ceiling(body.max_rate_out, "max_rate_out"),
         unitsIn: BigInt(body.units_in),
         unitsOut: BigInt(body.units_out),
       };
       const ranked = await rankProviders(deps.db, job, {
         livenessMs: deps.config.match.livenessMs,
         limit: deps.config.match.candidates,
-        market: true,
       });
       const first = ranked[0];
       if (first !== undefined && job.designated === 0n) {
@@ -465,7 +472,7 @@ export function postRoutes(app: App, deps: RouteDeps): void {
       return reply
         .code(402)
         .header("x-vorq-retryable", "false")
-        .send({ candidates: ranked.map((c) => candidateOf(c, deps.config.addresses.decimals)) });
+        .send({ candidates: ranked.map((c) => candidateOf(c, decimals)) });
     }
 
     const chain = requireChain(deps.chain);
