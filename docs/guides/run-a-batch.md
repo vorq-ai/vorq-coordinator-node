@@ -39,7 +39,7 @@ curl -s -X POST "$VORQ/v1/batches" \
   | tee batch.json | jq '{id, status}'
 ```
 
-`endpoint` is `/v1/responses` or `/v1/embeddings`. `completion_window` is `1h` or `24h`. The batch starts as `validating`; the coordinator picks it up within about 15 seconds and posts its lines on chain.
+`endpoint` is `/v1/responses` or `/v1/embeddings`. `completion_window` is `1h` or `24h`; a `24h` batch usually takes minutes to a few hours, 24 hours at most. The batch starts as `validating`; the coordinator picks it up within about 15 seconds and posts its lines on chain.
 
 Lines that use `container_cid` are attached only when the batch is processed, and an unattached upload is deleted after 300 seconds. Upload those containers right before creating the batch.
 
