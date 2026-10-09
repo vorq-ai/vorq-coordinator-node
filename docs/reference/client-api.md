@@ -11,11 +11,11 @@ Routes under `/v1/*`. Encoding, headers, paging and body limits are in [API conv
 
 ### GET /v1/models
 
-The model catalog. `GET /evm/models` returns the same body.
+The models that can be ordered. Disabled models are not listed; [`GET /evm/models`](./provider-api.md#get-evmmodels) lists every registered model in the same shape.
 
 **Auth:** public · **Index-backed:** yes · **Paged:** yes
 
-`id` is the model's name; `vorq.model_id` is the id orders use. New orders are accepted only while `vorq.enabled` is `true`.
+`id` is the model's name; `vorq.model_id` is the id orders use. `vorq.enabled` is `true` on every listed model.
 
 ```sh
 curl -s https://api.vorq.co/v1/models

@@ -71,10 +71,10 @@ export JOB_REGISTRY=$(jq -r .contracts.job_registry chain.json)
 List the catalog:
 
 ```sh
-curl -s "$VORQ/v1/models" | jq '.data[] | {name: .id, model_id: .vorq.model_id, enabled: .vorq.enabled}'
+curl -s "$VORQ/v1/models" | jq '.data[] | {name: .id, model_id: .vorq.model_id}'
 ```
 
-Pick an enabled model and read the cheapest published price for each SLA:
+Pick a model and read the cheapest published price for each SLA:
 
 ```sh
 export MODEL_ID=3   # a model_id from the list above

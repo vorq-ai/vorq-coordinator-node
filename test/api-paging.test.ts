@@ -333,7 +333,7 @@ describe.skipIf(!TEST_DATABASE_URL)("paging over a seeded projection", () => {
     expect(res.json().entries.length).toBeLessThan(200);
   });
 
-  it("pages the model catalog, and both paths stay byte-identical", async () => {
+  it("pages the model catalog, and both paths agree while every model is enabled", async () => {
     await db.query(
       "INSERT INTO models (model_id, name) SELECT i, 'model-' || i FROM generate_series(1, 150) AS i",
     );

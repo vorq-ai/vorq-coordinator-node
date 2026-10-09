@@ -15,7 +15,7 @@ const Model = Type.Object({
   owned_by: Type.Literal("vorq"),
   vorq: Type.Object({
     model_id: Int("The on-chain id an order names."),
-    enabled: Type.Boolean({ description: "`false` for a retired model: served, never orderable." }),
+    enabled: Type.Boolean({ description: "`false` for a retired model: never orderable, and absent from the `/v1/models` listing." }),
   }),
 });
 
@@ -72,13 +72,17 @@ export function catalogRoutes(
     },
   );
 
-  // One handler on two paths. `/v1/models` keeps the emulator's OpenAI shape
-  // (R27) so Plan 4's client needs no change, and `/evm/models` serves the
-  // identical body rather than a parallel projection that can drift.
-  const models = async (page: Page, reply: FastifyReply) => {
+  // One handler on two paths, one filter apart. `/evm/models` is the index as
+  // it stands, disabled rows included: a daemon binds its config against it and
+  // a job row's `model_id` has to resolve to a name long after the model was
+  // retired. `/v1/models` keeps the emulator's OpenAI shape (R27) and lists only
+  // what can be ordered — a client picking a model off it must not be handed
+  // one the post door refuses.
+  const models = async (page: Page, reply: FastifyReply, orderable: boolean) => {
     const asOf = await asOfBlock();
     const { rows } = await db.query<{ model_id: bigint; name: string; enabled: boolean }>(
-      "SELECT model_id, name, enabled FROM models ORDER BY model_id LIMIT $1 OFFSET $2",
+      `SELECT model_id, name, enabled FROM models${orderable ? " WHERE enabled" : ""}
+       ORDER BY model_id LIMIT $1 OFFSET $2`,
       [page.limit, page.offset],
     );
     return {
@@ -93,29 +97,35 @@ export function catalogRoutes(
     };
   };
 
-  const listing = (path: string, summary: string) =>
+  const listing = (path: string, summary: string, description: string, orderable: boolean) =>
     gated.get(
       path,
       {
         schema: {
           tags: ["catalog"],
           summary,
+          description,
           querystring: Type.Object(Paging),
           response: { 200: ModelList, ...errors(400, 503) },
         },
       },
-      async (request, reply) => models(pageOf(request.query), reply),
+      async (request, reply) => models(pageOf(request.query), reply, orderable),
     );
-  listing("/evm/models", "List models");
-  listing("/v1/models", "List models (OpenAI shape)");
+  listing("/evm/models", "List models", "Every registered model, disabled ones included.", false);
+  listing(
+    "/v1/models",
+    "List models (OpenAI shape)",
+    "Enabled models only. A disabled model is still served by name on `/v1/models/{name}` and listed on `/evm/models`.",
+    true,
+  );
 
   // `client.models.retrieve(name)`. A **wildcard**, not `/:name`, because a model name is
   // org-qualified — `org/model:fp8` — so the value spans path segments however the caller
   // spells it. Percent-encoded or not, the wildcard hands back the rest of the path and the
   // decode below normalises the two spellings onto the one name the catalog stores.
   //
-  // A disabled model is served, not hidden: a client holding the name needs to learn that it
-  // is retired, and a 404 says only that the name is unknown.
+  // A disabled model is served here though the listing hides it: a client holding the name
+  // needs to learn that it is retired, and a 404 says only that the name is unknown.
   gated.get(
     "/v1/models/*",
     {

@@ -1524,8 +1524,20 @@ describe.skipIf(!TEST_DATABASE_URL)("read API", () => {
       await db.query("INSERT INTO models (model_id, name, enabled) VALUES (8, 'model-b', FALSE)");
     });
 
-    it("keeps the emulator's OpenAI shape on /v1/models (R27)", async () => {
+    it("keeps the emulator's OpenAI shape on /v1/models (R27), enabled models only", async () => {
       const res = await get("/v1/models");
+
+      expect(res.json()).toEqual({
+        object: "list",
+        data: [
+          { id: "model-a", object: "model", owned_by: "vorq", vorq: { model_id: 7, enabled: true } },
+        ],
+        as_of_block: 4242,
+      });
+    });
+
+    it("serves the whole catalog on /evm/models, disabled models included", async () => {
+      const res = await get("/evm/models");
 
       expect(res.json()).toEqual({
         object: "list",
@@ -1537,10 +1549,12 @@ describe.skipIf(!TEST_DATABASE_URL)("read API", () => {
       });
     });
 
-    it("serves the same body on /evm/models, so the two can never drift", async () => {
-      const evm = await get("/evm/models");
-      const v1 = await get("/v1/models");
-      expect(evm.body).toBe(v1.body);
+    it("pages /v1/models over enabled rows, so a disabled one costs no slot", async () => {
+      await db.query("INSERT INTO models (model_id, name) VALUES (9, 'model-c')");
+
+      const res = await get("/v1/models?limit=1&offset=1");
+
+      expect(res.json().data.map((m: { id: string }) => m.id)).toEqual(["model-c"]);
     });
 
     it("retrieves one model by name, the OpenAI way", async () => {

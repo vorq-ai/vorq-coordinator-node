@@ -183,7 +183,7 @@ One provider plus `as_of_block`.
 
 ### GET /evm/models
 
-The model catalog; the same body as [`GET /v1/models`](./client-api.md#get-v1models).
+Every registered model, disabled ones included, in the shape of [`GET /v1/models`](./client-api.md#get-v1models).
 
 ### GET /evm/allowlist
 
