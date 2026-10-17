@@ -1,4 +1,5 @@
 import type { FastifyInstance } from "fastify";
+import { toFunctionSelector } from "viem";
 import { privateKeyToAccount } from "viem/accounts";
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { buildApp } from "../src/api/app.js";
@@ -268,6 +269,33 @@ describe("chain-backed routes", () => {
     });
 
     expect(res.json()).toEqual({ ok: true });
+  });
+
+  it("reads feeBps once for many claim attempts: from the node's cell, not per call", async () => {
+    const { app: server, stub } = build({
+      views: {
+        getJob: jobView(),
+        idOf: 5,
+        isListed: true,
+        modelAllowed: true,
+        activeJobs: 1,
+        effectiveCap: 8,
+        feeBps: 100,
+      },
+    });
+    for (let i = 0; i < 2; i++) {
+      const res = await server.inject({
+        method: "POST",
+        url: "/evm/simulate/claim",
+        payload: { job_id: `0x${"01".repeat(32)}`, address: `0x${"cc".repeat(20)}` },
+      });
+      expect(res.json()).toEqual({ ok: true });
+    }
+    const selector = toFunctionSelector("feeBps()");
+    const reads = stub.requests.filter(
+      (r) => r.method === "eth_call" && (r.params as [{ data: string }])[0].data.startsWith(selector),
+    );
+    expect(reads).toHaveLength(1);
   });
 
   /**

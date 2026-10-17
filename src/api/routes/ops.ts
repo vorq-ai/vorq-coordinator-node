@@ -3,7 +3,7 @@ import { Type, type Static } from "typebox";
 import { encodeFunctionData, recoverTypedDataAddress, type Abi, type Hex } from "viem";
 import { jobRegistryAbi } from "../../abi/jobRegistry.js";
 import { providerRegistryAbi } from "../../abi/providerRegistry.js";
-import { atFloor, type Chain } from "../../chain/client.js";
+import { atFloor, chainParams, type Chain, type ChainParams } from "../../chain/client.js";
 // `atFloor` is used by `/evm/simulate/claim`'s state reads only; see `simulateThenRelay`.
 import { decodeRevert, isVerdict } from "../../chain/revert.js";
 import type { Address } from "../../config.js";
@@ -564,6 +564,11 @@ const ABIS: readonly Abi[] = [jobRegistryAbi as Abi, providerRegistryAbi as Abi]
 export function opsRoutes(app: App, deps: RouteDeps): void {
   const serialized = subjectQueue("ops");
   const pinner: Pinner = pinnerFor(deps.config, deps.db);
+  // Built on first use, as in `post.ts`: the app is constructible without a
+  // chain, and the cache must outlive the request.
+  let params: ChainParams | null = null;
+  const configOf = (chain: Chain): ChainParams =>
+    (params ??= chainParams(chain, deps.config.addresses));
 
   // Reconcile-on-error, hung on the refusal rather than on the route (R3/R4).
   const repair = repairOnRefusal(
@@ -906,7 +911,9 @@ export function opsRoutes(app: App, deps: RouteDeps): void {
     // The escrow pull, last as in `claim`: the payment token refuses it when the
     // owner holds less than `cap + feeCap + gasFeeSnap`, with a string revert
     // the daemon could only log as a lost race and try again every sweep.
-    const feeBps = await read<number>(jobRegistryAbi as Abi, jobRegistry, "feeBps", []);
+    // From the node's 60 s cell, as `POST /v1/jobs` reads it: `feeBps` changes
+    // by governance, not per block, and this gate runs on every claim attempt.
+    const feeBps = await viewRead("claim_simulate_read", () => configOf(chain).feeBps());
     const escrow = capOf({
       rateIn: job.rateIn,
       rateOut: job.rateOut,
