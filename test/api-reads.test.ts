@@ -1542,8 +1542,8 @@ describe.skipIf(!TEST_DATABASE_URL)("read API", () => {
       expect(res.json()).toEqual({
         object: "list",
         data: [
-          { id: "model-a", object: "model", owned_by: "vorq", vorq: { model_id: 7, enabled: true } },
           { id: "model-b", object: "model", owned_by: "vorq", vorq: { model_id: 8, enabled: false } },
+          { id: "model-a", object: "model", owned_by: "vorq", vorq: { model_id: 7, enabled: true } },
         ],
         as_of_block: 4242,
       });
@@ -1554,7 +1554,8 @@ describe.skipIf(!TEST_DATABASE_URL)("read API", () => {
 
       const res = await get("/v1/models?limit=1&offset=1");
 
-      expect(res.json().data.map((m: { id: string }) => m.id)).toEqual(["model-c"]);
+      // Newest first: c, a. Counting the disabled b would land on it instead.
+      expect(res.json().data.map((m: { id: string }) => m.id)).toEqual(["model-a"]);
     });
 
     it("retrieves one model by name, the OpenAI way", async () => {

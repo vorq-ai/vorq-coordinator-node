@@ -82,7 +82,7 @@ export function catalogRoutes(
     const asOf = await asOfBlock();
     const { rows } = await db.query<{ model_id: bigint; name: string; enabled: boolean }>(
       `SELECT model_id, name, enabled FROM models${orderable ? " WHERE enabled" : ""}
-       ORDER BY model_id LIMIT $1 OFFSET $2`,
+       ORDER BY model_id DESC LIMIT $1 OFFSET $2`,
       [page.limit, page.offset],
     );
     return {

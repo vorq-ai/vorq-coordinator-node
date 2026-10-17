@@ -343,8 +343,8 @@ describe.skipIf(!TEST_DATABASE_URL)("paging over a seeded projection", () => {
 
     expect(evm.body).toBe(v1.body);
     expect(evm.json().data.map((model: { id: string }) => model.id)).toEqual([
-      "model-2",
-      "model-3",
+      "model-149",
+      "model-148",
     ]);
   });
 });
