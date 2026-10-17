@@ -160,6 +160,9 @@ describe("every request-path chain read is classified (R77)", () => {
     expect(guarded).toEqual([
       // `resolveProviderId` — `POST /evm/ops`, `PUT /evm/asks`, the handshake.
       "api/deps.ts",
+      // `tokenBalance` — the payer's funds, read by `POST /v1/jobs`, the batch
+      // worker and the claim gate.
+      "api/funding.ts",
       // The advisory gate's six reads, through one wrapped helper.
       "api/routes/ops.ts",
       // `registryFloor` — `lastIdentityAt` / `lastCapacityAt`, the registry ops'

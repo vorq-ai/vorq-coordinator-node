@@ -339,10 +339,13 @@ describe.skipIf(!TEST_DATABASE_URL)("the batch worker's posting pass", () => {
     return keccak256(new TextEncoder().encode(`${errorName}()`)).slice(0, 10) as Hex;
   }
 
-  function chainWith(options: { receiptLogs?: () => unknown[] } = {}): StubChain {
+  function chainWith(
+    options: { receiptLogs?: () => unknown[]; tokenBalance?: Record<string, bigint> } = {},
+  ): StubChain {
     return stubChain(config, {
       views: { gasFee: GAS_FEE, feeBps: FEE_BPS },
       receiptLogs: options.receiptLogs,
+      tokenBalance: options.tokenBalance,
     });
   }
 
@@ -540,6 +543,27 @@ describe.skipIf(!TEST_DATABASE_URL)("the batch worker's posting pass", () => {
 
     expect(outcome).toEqual(expect.objectContaining({ posted: 0, skipped: 1 }));
     expect((await lineRows(batchId))[0].skip_reason).toBe("invalid_model");
+  });
+
+  /**
+   * Funded in file order out of what the owner holds: the claim pulls each
+   * line's amount, so a line past the balance would post and rest Open until it
+   * expired.
+   */
+  it("skips the lines the owner's balance cannot fund, in file order", async () => {
+    const batchId = await seedBatch([await jsonLine(1), await jsonLine(2), await jsonLine(3)]);
+    const cap = (30_000n * 1000n + 90_000n * 2000n + 999_999n) / 1_000_000n;
+    const amount = cap + feeOf(cap, FEE_BPS) + GAS_FEE;
+    // Two lines' worth and one atomic unit short of a third.
+    const stub = chainWith({ tokenBalance: { [owner.address.toLowerCase()]: amount * 3n - 1n } });
+
+    const outcome = await run(stub, batchId);
+
+    expect(outcome).toEqual(expect.objectContaining({ posted: 2, skipped: 1 }));
+    const rows = await lineRows(batchId);
+    expect(rows[0].job_id).not.toBeNull();
+    expect(rows[1].job_id).not.toBeNull();
+    expect(rows[2].skip_reason).toBe("insufficient_funds");
   });
 
   it("skips the second of two lines that name the same job", async () => {

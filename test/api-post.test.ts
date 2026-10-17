@@ -326,6 +326,8 @@ interface StoreOptions {
   written?: unknown[][];
   /** Makes the write-through transaction fail. */
   writeError?: Error;
+  /** The owner's open, unexpired jobs the funds check sums: `jobs` rows' price columns. */
+  openJobs?: { rate_in: string; rate_out: string; units_in: string; units_out: string; gas_fee: string }[];
 }
 
 /**
@@ -362,6 +364,11 @@ function stubDb(options: StoreOptions = {}): Db {
     if (text.includes("FROM models")) {
       const enabled = models.get(BigInt(params?.[0] as bigint | number));
       return { rows: enabled === undefined ? [] : [{ enabled }] };
+    }
+    // The funds check's sum over the owner's open jobs, ahead of the duplicate
+    // pre-check, which reads `jobs` by id.
+    if (text.includes("FROM jobs") && text.includes("state = 0")) {
+      return { rows: options.openJobs ?? [] };
     }
     if (text.includes("FROM jobs")) {
       const jobId = params?.[0] as Buffer;
@@ -511,6 +518,7 @@ function harness(
     receiptLogs?: () => unknown[];
     receiptMissing?: boolean;
     code?: Record<string, Hex>;
+    tokenBalance?: Record<string, bigint>;
   } = {},
   nodeOptions: { partBytes?: number; maxBlobBytes?: number; jobRateLimit?: number } = {},
 ): Harness {
@@ -539,6 +547,7 @@ function harness(
     receiptLogs: chainOptions.receiptLogs,
     receiptMissing: chainOptions.receiptMissing,
     code: chainOptions.code,
+    tokenBalance: chainOptions.tokenBalance,
   });
   const app = buildApp({
     db: stubDb(storeOptions),
@@ -1012,6 +1021,35 @@ describe("POST /v1/jobs — validation", () => {
     expect(stub.simulated).toEqual([]);
     expect(store.objects.size).toBe(0);
     expect(store.uploads.size).toBe(0);
+  });
+
+  /**
+   * **A wallet that cannot fund the claim is refused before anything is filed.**
+   * The claim pulls the escrow, not the post, so without this an empty wallet
+   * posts perfectly and its job rests Open until it expires — measured on Base
+   * Sepolia 2026-10-17, fifteen of them.
+   */
+  it("refuses insufficient_funds when the owner cannot cover the claim on top of its open jobs", async () => {
+    const holder = owner.address.toLowerCase();
+    // One open job pulling 110 + 1 + 0, so 211 short of 212 + 111 = 323.
+    const openJobs = [{ rate_in: "0", rate_out: "1000000", units_in: "0", units_out: "110", gas_fee: "0" }];
+    const { app, stub } = harness({ openJobs }, { tokenBalance: { [holder]: 322n } });
+    const t = terms();
+    const response = await post(app, submission(wire(t, await signOrder(t)), CONTAINER, await payment(t, amountFor())));
+
+    expect(response.statusCode).toBe(400);
+    expect(response.json().error.code).toBe("insufficient_funds");
+    expect(response.json().error.param).toBe("owner");
+    expect(response.json().error.message).toMatch(/can fund 0\.000211 USDC after its open jobs, and the claim of this order pulls 0\.000212/);
+    expect(response.headers["x-vorq-retryable"]).toBe("false");
+    expect(stub.simulated).toEqual([]);
+    expect(stub.broadcasts).toEqual([]);
+    expect(store.objects.size).toBe(0);
+
+    // Exactly enough posts.
+    const funded = harness({ openJobs }, { tokenBalance: { [holder]: 323n } });
+    const ok = await post(funded.app, submission(wire(t, await signOrder(t)), CONTAINER, await payment(t, amountFor())));
+    expect(ok.statusCode).toBe(201);
   });
 
   it("reads the payer's code at latest and posts when it is empty", async () => {

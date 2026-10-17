@@ -91,7 +91,7 @@ export class CapOverflowError extends Error {}
  * quote for a dust order is `1`, never `0`. All of it in `bigint` — the products
  * reach ~2^86 and a double would round them silently (R45, R46).
  */
-export function capOf(terms: Terms): bigint {
+export function capOf(terms: Pick<Terms, "rateIn" | "rateOut" | "unitsIn" | "unitsOut">): bigint {
   const raw = terms.rateIn * terms.unitsIn + terms.rateOut * terms.unitsOut;
   const ceiling = (raw + RATE_SCALE - 1n) / RATE_SCALE;
   const cap = ceiling === 0n ? 1n : ceiling;

@@ -257,6 +257,7 @@ describe("chain-backed routes", () => {
         modelAllowed: true,
         activeJobs: 1,
         effectiveCap: 8,
+        feeBps: 100,
       },
     });
 
@@ -267,6 +268,37 @@ describe("chain-backed routes", () => {
     });
 
     expect(res.json()).toEqual({ ok: true });
+  });
+
+  /**
+   * The escrow pull, which the payment token refuses with a string revert the
+   * daemon could only take for a lost race. Measured 2026-10-17: fifteen orders
+   * from empty wallets passed this gate and were refused at `/evm/ops` every
+   * sweep until they expired. The job pulls `cap + feeCap + gasFeeSnap`:
+   * 210 + 2 + 30 000 = 30 212 atomic.
+   */
+  it("refuses InsufficientFunds when the owner holds less than the pull, and ok at exactly the pull", async () => {
+    const views = {
+      getJob: jobView(),
+      idOf: 5,
+      isListed: true,
+      modelAllowed: true,
+      activeJobs: 1,
+      effectiveCap: 8,
+      feeBps: 100,
+    };
+    const ask = (server: FastifyInstance) =>
+      server.inject({
+        method: "POST",
+        url: "/evm/simulate/claim",
+        payload: { job_id: `0x${"01".repeat(32)}`, address: `0x${"cc".repeat(20)}` },
+      });
+
+    const short = build({ views, tokenBalance: { [`0x${"aa".repeat(20)}`]: 30_211n } });
+    expect((await ask(short.app)).json()).toEqual({ ok: false, reason: "InsufficientFunds" });
+
+    const exact = build({ views, tokenBalance: { [`0x${"aa".repeat(20)}`]: 30_212n } });
+    expect((await ask(exact.app)).json()).toEqual({ ok: true });
   });
 
   /**

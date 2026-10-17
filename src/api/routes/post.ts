@@ -33,6 +33,7 @@ import {
 import { pinnerFor, put } from "../../pin/pinner.js";
 import { chainGate, requireChain, type App, type RouteDeps } from "../deps.js";
 import { sendFailure, viewRead } from "../chain-failure.js";
+import { fundsLeft } from "../funding.js";
 import { ApiError, badRequest, errorBody, isRetryable } from "../errors.js";
 import { MAX_BODY_BYTES } from "../limits.js";
 import { formatUsd } from "../../money.js";
@@ -697,6 +698,14 @@ export function postRoutes(app: App, deps: RouteDeps): void {
         .send(await quote(params, cap, jobId, terms, gasFee, feeBps));
     }
 
+    // ---- the funds -----------------------------------------------------------
+
+    // The claim pulls `amount` from the owner's wallet, not the post, so a wallet
+    // that cannot cover it would post, pin and front the gas for a job no
+    // provider can ever claim. Its other open jobs pull from the same balance.
+    const funds = await fundsLeft(chain, deps.db, deps.config.addresses.usdc, owner, feeBps, now);
+    if (funds < amount) throw insufficientFunds(owner, funds, amount, deps.config.addresses.decimals);
+
     // ---- the commitment ----------------------------------------------------
 
     // The one check no other party can make: no contract sees a container, and
@@ -1011,6 +1020,21 @@ const candidateOf = (candidate: Candidate, decimals: number) => ({
 const configRead = <T>(read: () => Promise<T>): Promise<T> => viewRead("config_read", read);
 
 const duplicateJob = (): ApiError => refusal({ reason: "DuplicateJob", raw: null });
+
+/**
+ * The owner's wallet cannot cover this order's claim on top of its open jobs'.
+ * Not retryable: the identical request succeeds only once the wallet is funded.
+ */
+const insufficientFunds = (owner: Address, funds: bigint, amount: bigint, decimals: number): ApiError =>
+  new ApiError(
+    400,
+    "invalid_request",
+    `owner ${owner} can fund ${formatUsd(funds > 0n ? funds : 0n, decimals)} USDC after its open ` +
+      `jobs, and the claim of this order pulls ${formatUsd(amount, decimals)}: fund the wallet ` +
+      "with USDC and post again",
+    "owner",
+    "insufficient_funds",
+  );
 
 /**
  * `container_cid` names no `input` upload of this owner's.

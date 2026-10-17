@@ -130,6 +130,8 @@ export interface AdmittedLine {
   jobId: Hex;
   signature: Hex;
   authSig: Hex;
+  /** What this line's claim pulls from `owner`: `cap + feeCap + gasFeeSnap`. */
+  amount: bigint;
   /**
    * The sealed container, inline or by name. Inline bytes are filed as-is and
    * the name the store mints is this line's `task_cid`; a cid **is** that
@@ -313,7 +315,7 @@ export async function admitLine(raw: string, ctx: LineContext): Promise<LineVerd
       );
     }
 
-    return { ok: true, line: { terms, owner, jobId, signature, authSig, content } };
+    return { ok: true, line: { terms, owner, jobId, signature, authSig, amount, content } };
   } catch (error) {
     // The schema's refusal and `parseOrder`'s — a missing member, a value past
     // its chain width, a malformed signature, a `job_id` that is not the order's.

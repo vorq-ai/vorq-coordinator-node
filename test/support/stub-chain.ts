@@ -1,6 +1,7 @@
 import {
   custom,
   decodeFunctionData,
+  erc20Abi,
   parseTransaction,
   encodeErrorResult,
   encodeFunctionResult,
@@ -120,6 +121,12 @@ export interface StubOptions {
    * only observable behaviour is the happy path.
    */
   code?: Record<string, Hex>;
+  /**
+   * The payment token's `balanceOf`, by address (lower-cased). Anything not named
+   * holds a thousand dollars, so a door that reads a payer's funds passes unless a
+   * test says the payer is short.
+   */
+  tokenBalance?: Record<string, bigint>;
   receiptStatus?: "success" | "reverted";
   /**
    * The transaction count **before any broadcast**. Every broadcast advances it,
@@ -270,6 +277,7 @@ const ABIS: { abi: Abi; names: Set<string> }[] = [
   { abi: jobRegistryAbi as Abi, names: new Set<string>() },
   { abi: providerRegistryAbi as Abi, names: new Set<string>() },
   { abi: askRegistryAbi as Abi, names: new Set<string>() },
+  { abi: erc20Abi as Abi, names: new Set<string>() },
 ];
 
 /**
@@ -474,6 +482,11 @@ export function stubChain(config: Config, options: StubOptions = {}): StubChain 
           }
 
           const views = options.views ?? {};
+          if (functionName === "balanceOf" && !(functionName in views)) {
+            const [holder] = args as [string];
+            const held = options.tokenBalance?.[holder.toLowerCase()] ?? 1_000_000_000n;
+            return encodeFunctionResult({ abi, functionName, result: held as never });
+          }
           if (!(functionName in views)) {
             throw new Error(`stub-chain: no stub for view ${functionName}`);
           }

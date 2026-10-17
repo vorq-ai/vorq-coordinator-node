@@ -3,6 +3,7 @@ import { jobRegistryAbi } from "../abi/jobRegistry.js";
 import { chainParams, type Chain } from "../chain/client.js";
 import type { Config } from "../config.js";
 import type { Db } from "../db/db.js";
+import { fundsLeft } from "../api/funding.js";
 import { writePostedRows } from "../index/write-through.js";
 import { taskCidHex } from "../orders.js";
 import { put, type Pinner } from "../pin/pinner.js";
@@ -360,11 +361,30 @@ async function decide(
     deps.db,
     admitted.map(({ line }) => line.terms.modelId),
   );
-  const pinnable = admitted.filter(({ lineNo, line }) => {
+  const modelled = admitted.filter(({ lineNo, line }) => {
     if (enabled.has(line.terms.modelId)) return true;
     decisions.set(lineNo, { lineNo, kind: "skip", reason: "invalid_model" });
     return false;
   });
+
+  // The claim pulls each line's `amount` from its owner, so lines are funded in
+  // file order out of what each owner can still fund; the rest are skipped
+  // rather than posted to rest Open until they expire. One read per owner.
+  const left = new Map<string, bigint>();
+  const pinnable: typeof modelled = [];
+  for (const entry of modelled) {
+    const owner = entry.line.owner.toLowerCase();
+    const funds =
+      left.get(owner) ??
+      (await fundsLeft(chain, deps.db, deps.config.addresses.usdc, entry.line.owner, feeBps, context.now));
+    if (funds < entry.line.amount) {
+      left.set(owner, funds);
+      decisions.set(entry.lineNo, { lineNo: entry.lineNo, kind: "skip", reason: "insufficient_funds" });
+      continue;
+    }
+    left.set(owner, funds - entry.line.amount);
+    pinnable.push(entry);
+  }
 
   // The bytes, filed — and for a line that named an upload, the upload adopted
   // instead. A failure here throws and the pass is retried whole: no row has

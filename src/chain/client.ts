@@ -427,11 +427,12 @@ export function missingBlock(error: unknown): boolean {
  * again for up to {@link FLOOR_RETRIES} attempts rather than served stale.
  * Anything else is thrown unchanged, for the caller's own classification.
  *
- * **Never a simulate.** The pre-relay `eth_call` is a verdict on the
- * transaction as it would mine, and the contract reads `block.timestamp`
- * (`AlreadyExpired`, `ExpiryTooFar`, the fail-grace price); at an older block
- * it refused a valid 24 h order as `ExpiryTooFar` (measured 2026-09-23). Those
- * stay at `latest`.
+ * **Not the `post` simulate.** That `eth_call` is a verdict on the transaction
+ * as it would mine, and `ExpiryTooFar` tightens at an older block: it refused a
+ * valid 24 h order there (measured 2026-09-23), so `POST /v1/jobs` stays at
+ * `latest`. The `/evm/ops` simulate is pinned here — its ops follow this node's
+ * own receipts, and none of their timestamp checks tightens (see
+ * `simulateThenRelay`).
  *
  * Before the first head poll or receipt the floor is `0n` and the read goes to
  * `latest`, because there is nothing yet to be consistent with.

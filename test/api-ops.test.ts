@@ -828,6 +828,37 @@ describe("POST /evm/ops", () => {
     expect(stub.simulatedFrom[0]?.toLowerCase()).not.toBe(provider.address.toLowerCase());
   });
 
+  /**
+   * **The simulate and the gas estimate read at the node's floor, not `latest`.**
+   * Measured on Base Sepolia 2026-10-15: a settle one second after its claim's
+   * `201` was simulated on a load-balanced node one block behind and refused
+   * `NotClaimed`, so the job failed with its answer in hand. The floor here is a
+   * receipt three blocks past what this endpoint calls `latest`.
+   */
+  it("simulates and estimates at the floor, and broadcasts with that estimate", async () => {
+    const { server, stub } = build();
+    stub.chain.saw(1003n);
+    const issuedAt = now();
+
+    const res = await push(server, {
+      op: "claim",
+      job_id: JOB_ID, issued_at: Number(issuedAt),
+      signature: await signClaim(provider, JOB_ID, issuedAt),
+    });
+
+    expect(res.statusCode).toBe(201);
+    const simulate = stub.requests.find(
+      (r) => r.method === "eth_call" && (r.params as [{ data: Hex }])[0].data === stub.simulated[0],
+    );
+    expect((simulate?.params as unknown[])[1]).toBe("0x3eb");
+    const estimates = stub.requests.filter((r) => r.method === "eth_estimateGas");
+    expect(estimates).toHaveLength(1);
+    expect((estimates[0]?.params as unknown[])[1]).toBe("0x3eb");
+    // The stub estimates 200 000; the broadcast carries exactly that rather
+    // than estimating again at `latest`.
+    expect(stub.relayedGas).toEqual([200_000n]);
+  });
+
   it("relays a registry op that clears its floor", async () => {
     const { server, stub } = build({ views: { lastIdentityAt: 1n } });
     const issuedAt = now();

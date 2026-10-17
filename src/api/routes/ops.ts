@@ -25,7 +25,8 @@ import {
 } from "../deps.js";
 import { throughPinner } from "../pin-failure.js";
 import { subjectQueue } from "../queue.js";
-import { EIP712_NAMES } from "../../orders.js";
+import { capOf, EIP712_NAMES, feeOf } from "../../orders.js";
+import { tokenBalance } from "../funding.js";
 import {
   Address as AddressIn,
   Base64,
@@ -763,7 +764,8 @@ export function opsRoutes(app: App, deps: RouteDeps): void {
         summary: "Would a claim land?",
         description:
           "The advisory gate a daemon consults before it signs: chain view reads only, so it " +
-          "answers during the finality lag. It cannot see the escrow pull; `/evm/ops` simulates that.",
+          "answers during the finality lag. The escrow pull is checked against the owner's " +
+          "balance (`InsufficientFunds`); `/evm/ops` simulates the pull itself.",
         body: Type.Object({ job_id: Hex32(), address: AddressIn({ description: "The operator." }) }),
         response: { 200: SimulateResult, ...errors(400, 503) },
       },
@@ -803,9 +805,15 @@ export function opsRoutes(app: App, deps: RouteDeps): void {
     const job = await read<{
       found: boolean;
       state: number;
+      owner: Address;
       providerId: number;
       designated: number;
       modelId: number;
+      rateIn: bigint;
+      rateOut: bigint;
+      unitsIn: number;
+      unitsOut: number;
+      gasFee: bigint;
     }>(jobRegistryAbi as Abi, jobRegistry, "getJob", [jobId]);
 
     if (!job.found) {
@@ -895,9 +903,24 @@ export function opsRoutes(app: App, deps: RouteDeps): void {
     ]);
     if (active >= cap) return { ok: false, reason: "AtCapacity" };
 
-    // Advisory, and it says so by what it omits: the escrow pull, the op
-    // signature and the ±600 s window are not evaluated here. The authoritative
-    // simulate is the one inside `POST /evm/ops`.
+    // The escrow pull, last as in `claim`: the payment token refuses it when the
+    // owner holds less than `cap + feeCap + gasFeeSnap`, with a string revert
+    // the daemon could only log as a lost race and try again every sweep.
+    const feeBps = await read<number>(jobRegistryAbi as Abi, jobRegistry, "feeBps", []);
+    const escrow = capOf({
+      rateIn: job.rateIn,
+      rateOut: job.rateOut,
+      unitsIn: BigInt(job.unitsIn),
+      unitsOut: BigInt(job.unitsOut),
+    });
+    const due = escrow + feeOf(escrow, feeBps) + job.gasFee;
+    if ((await tokenBalance(chain, deps.config.addresses.usdc, job.owner)) < due) {
+      return { ok: false, reason: "InsufficientFunds" };
+    }
+
+    // Advisory, and it says so by what it omits: the op signature and the
+    // ±600 s window are not evaluated here, nor an authorization the owner
+    // cancelled. The authoritative simulate is the one inside `POST /evm/ops`.
     return { ok: true };
   });
 }
@@ -1054,13 +1077,29 @@ async function simulateThenRelay(
    */
   extra: Record<string, unknown> = {},
 ): Promise<FastifyReply> {
-  // At `latest`, never at the node's floor: a simulate is a verdict on the
-  // transaction as it would mine, and the contract reads `block.timestamp`
-  // (`AlreadyExpired`, `ExpiryTooFar`, the fail-grace price). Pinned to an older
-  // block it refused a valid 24 h order as `ExpiryTooFar` (measured 2026-09-23).
-  // The floor is for state reads that authorise against this node's own receipts.
+  // **At the node's floor, and the gas estimate with it.** Every op on this door
+  // follows one of this node's own receipts — a settle or a fail its claim, a
+  // claim the post — and `latest` on a load-balanced endpoint is whichever node
+  // answers. Measured on Base Sepolia 2026-10-15: a settle relayed one second
+  // after its claim's `201` was simulated on a node one block behind and refused
+  // `NotClaimed`, and the job failed with its answer in hand. The estimate is
+  // pinned too because the broadcast otherwise estimates at `latest` and meets
+  // the same stale node at the send.
+  //
+  // Safe here and not on `POST /v1/jobs`: the floor trails the head by at most
+  // one indexer tick, and none of these five ops has a check that block's
+  // earlier `block.timestamp` can wrongly fail — `NotOpen`, `SlaExpired` and the
+  // fail grace only loosen, `StaleOp` has ±600 s. `post`'s `ExpiryTooFar`
+  // tightens, which is why that door simulates at `latest` (measured
+  // 2026-09-23).
+  let gas: bigint;
   try {
-    await chain.publicClient.call({ account: chain.account.address, to, data });
+    await atFloor(chain, (pin) =>
+      chain.publicClient.call({ account: chain.account.address, to, data, ...pin }),
+    );
+    gas = await atFloor(chain, (pin) =>
+      chain.publicClient.estimateGas({ account: chain.account, to, data, ...pin }),
+    );
   } catch (error) {
     return chainFailure(reply, error, onRefusal);
   }
@@ -1096,7 +1135,7 @@ async function simulateThenRelay(
   // parameter to tell one kind from another.
   let txHash: Hex;
   try {
-    txHash = await chain.relay({ to, data });
+    txHash = await chain.relay({ to, data, gas });
   } catch (error) {
     return chainFailure(reply, error, onRefusal);
   }
