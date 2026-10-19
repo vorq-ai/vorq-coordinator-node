@@ -14,8 +14,9 @@ import { markAssigned } from "./rank.js";
  *
  * Allocation is by price: cheapest ask within the ceilings for the summed unit mix first,
  * each provider filled to its budget, equal prices taken least recently named
- * first. Nothing is held: a plan is an answer about now, and the caller seals
- * against it straight away.
+ * first. An entry that lists providers plans onto those alone, under the same
+ * ordering, and leaves unplaced what they cannot take. Nothing is held: a plan is
+ * an answer about now, and the caller seals against it straight away.
  */
 export interface PlanRequest {
   modelId: bigint;
@@ -23,6 +24,8 @@ export interface PlanRequest {
   lines: bigint;
   unitsIn: bigint;
   unitsOut: bigint;
+  /** The providers these lines may go to; `null` for the whole market. */
+  providers: bigint[] | null;
   /** The most these lines pay per side; `null` for no ceiling there. */
   maxRateIn: bigint | null;
   maxRateOut: bigint | null;
@@ -73,6 +76,7 @@ async function budgets(
         AND p.box_key IS NOT NULL AND p.box_key <> $6
         AND ($7::numeric IS NULL OR a.rate_in <= $7::numeric)
         AND ($8::numeric IS NULL OR a.rate_out <= $8::numeric)
+        AND ($9::bigint[] IS NULL OR p.provider_id = ANY($9::bigint[]))
       ORDER BY (a.rate_in * $4::numeric + a.rate_out * $5::numeric) ASC,
                pr.last_assigned_at ASC NULLS FIRST,
                p.provider_id ASC`,
@@ -85,6 +89,7 @@ async function budgets(
       ZERO_KEY,
       request.maxRateIn?.toString() ?? null,
       request.maxRateOut?.toString() ?? null,
+      request.providers?.map(String) ?? null,
     ],
   );
   return rows.map((row) => ({ ...row, free: BigInt(row.free) }));
@@ -95,7 +100,7 @@ async function budgets(
  * sums to fewer lines than it asked for when the network cannot take them all;
  * the caller refuses such a batch rather than posting part of it.
  *
- * Budgets are shared across the models of one plan: a provider serving two of
+ * Budgets are shared across the entries of one plan: a provider serving two of
  * them is not counted free twice.
  */
 export async function planBatch(

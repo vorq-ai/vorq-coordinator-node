@@ -220,7 +220,7 @@ Create a batch from an uploaded `batch` file.
 { "completion_window": "24h", "models": [{ "model_id": 3, "lines": 120, "units_in": 48000, "units_out": 491520 }] }
 ```
 
-`units_in` and `units_out` are the totals over that entry's lines. An entry may add `max_rate_in` and `max_rate_out` (USD per 1M units); only providers asking at or under them are planned. The answer is `402` with, per entry, the providers to seal to, their ask and how many lines each takes:
+`units_in` and `units_out` are the totals over that entry's lines. An entry may add `max_rate_in` and `max_rate_out` (USD per 1M units); only providers asking at or under them are planned. An entry may add `providers`, 1 to 64 distinct provider ids (absent for the whole market); its lines are planned onto those providers alone, cheapest first, and get fewer or none when they cannot take them. Entries may repeat a `model_id` with different `providers`, up to 16 entries. The answer is `402` with, per entry, the providers to seal to, their ask and how many lines each takes:
 
 ```json
 { "plan": [{ "model_id": 3, "lines": 120, "allocation": [{ "provider_id": 1, "box_key": "0x…", "rate_in": "2.1184", "rate_out": "10.6264", "lines": 120 }] }] }

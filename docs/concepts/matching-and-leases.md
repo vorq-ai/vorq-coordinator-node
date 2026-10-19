@@ -39,6 +39,8 @@ While a lease lasts, other pollers do not receive that job, so providers polling
 
 ## The batch plan
 
-A batch is planned before any line is sealed: [`POST /v1/batches`](../reference/client-api.md#post-v1batches) with no `input_file_id`, the batch window, and per entry a model, the line count, the summed units and optional `max_rate_in` / `max_rate_out` ceilings. The coordinator answers how many lines each provider within the ceilings takes, at its ask.
+A batch is planned before any line is sealed: [`POST /v1/batches`](../reference/client-api.md#post-v1batches) with no `input_file_id`, the batch window, and per entry a model, the line count, the summed units, optional `max_rate_in` / `max_rate_out` ceilings and an optional `providers` list. The coordinator answers how many lines each provider within the ceilings takes, at its ask.
+
+An entry with `providers` set plans onto those providers alone, under the same checks and in the same order, and gets fewer lines or none when they cannot take them; its lines never go to a provider outside the list. Without it, the entry draws on the whole market.
 
 The budget is the network's own limit. A provider may hold at most its on-chain capacity (reputation times the lesser of what it requested and its ceiling) in claimed jobs, so its share of a plan is that capacity less its claimed jobs and the open orders already designated to it. Single orders and batches draw on the same pool. Providers are filled cheapest first for the entry's unit mix; equal prices take turns. An entry's allocation sums to fewer lines than it asked for when the network cannot take them all within its ceilings.

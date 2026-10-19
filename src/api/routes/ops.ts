@@ -1,10 +1,11 @@
 import type { FastifyReply } from "fastify";
 import { Type, type Static } from "typebox";
-import { encodeFunctionData, recoverTypedDataAddress, type Abi, type Hex } from "viem";
+import { encodeFunctionData, erc20Abi, recoverTypedDataAddress, type Abi, type Hex } from "viem";
 import { jobRegistryAbi } from "../../abi/jobRegistry.js";
 import { providerRegistryAbi } from "../../abi/providerRegistry.js";
-import { atFloor, chainParams, type Chain, type ChainParams } from "../../chain/client.js";
-// `atFloor` is used by `/evm/simulate/claim`'s state reads only; see `simulateThenRelay`.
+import { atFloor, chainParams, floorMemo, type Chain, type ChainParams } from "../../chain/client.js";
+// `atFloor` pins the `/evm/ops` simulate (see `simulateThenRelay`); `floorMemo`
+// serves `/evm/simulate/claim`'s state reads.
 import { decodeRevert, isVerdict } from "../../chain/revert.js";
 import type { Address } from "../../config.js";
 import { repairOnRefusal } from "../../index/reconcile.js";
@@ -26,7 +27,6 @@ import {
 import { throughPinner } from "../pin-failure.js";
 import { subjectQueue } from "../queue.js";
 import { capOf, EIP712_NAMES, feeOf } from "../../orders.js";
-import { tokenBalance } from "../funding.js";
 import {
   Address as AddressIn,
   Base64,
@@ -562,6 +562,8 @@ function parseOp(body: OpBody): ParsedOp {
 const ABIS: readonly Abi[] = [jobRegistryAbi as Abi, providerRegistryAbi as Abi];
 
 export function opsRoutes(app: App, deps: RouteDeps): void {
+  /** `/evm/simulate/claim`'s view reads, one per distinct read per floor block. */
+  const claimReads = floorMemo();
   const serialized = subjectQueue("ops");
   const pinner: Pinner = pinnerFor(deps.config, deps.db);
   // Built on first use, as in `post.ts`: the app is constructible without a
@@ -787,10 +789,16 @@ export function opsRoutes(app: App, deps: RouteDeps): void {
     // promise that the identical request can never succeed — false the moment the
     // RPC comes back. Wrapping the helper rather than the call sites is the point:
     // a seventh gate added below this line cannot be written unwrapped.
+    //
+    // Through `claimReads`: a batch's lines are claimed in a burst, and each
+    // answer would otherwise re-read the same owner balance and provider gates
+    // at the same block. Remembered per floor block, so every answer is still
+    // the chain's own at that block.
     const read = <T>(abi: Abi, at: Address, functionName: string, args: unknown[]): Promise<T> =>
       viewRead("claim_simulate_read", () =>
-        atFloor(
+        claimReads(
           chain,
+          `${at}:${functionName}:${args.map(String).join(",")}`,
           (pin) =>
             chain.publicClient.readContract({ address: at, abi, functionName, args, ...pin }) as Promise<T>,
         ),
@@ -921,7 +929,10 @@ export function opsRoutes(app: App, deps: RouteDeps): void {
       unitsOut: BigInt(job.unitsOut),
     });
     const due = escrow + feeOf(escrow, feeBps) + job.gasFee;
-    if ((await tokenBalance(chain, deps.config.addresses.usdc, job.owner)) < due) {
+    const balance = await read<bigint>(erc20Abi as Abi, deps.config.addresses.usdc, "balanceOf", [
+      job.owner,
+    ]);
+    if (balance < due) {
       return { ok: false, reason: "InsufficientFunds" };
     }
 

@@ -62,6 +62,8 @@ const TABLES = [
   // The object-store name book (R73): `cid → s3_key`, written at mint time
   // because a store-minted CID carries no key to re-derive.
   "pins",
+  // Operator-set display names. Preserved: no chain log carries a name.
+  "provider_names",
   // Advisory matcher state: the last poll each provider made per model, with
   // its floors, free slots and round-robin cursor. Droppable — the next poll
   // recreates it.
@@ -265,6 +267,8 @@ describe.skipIf(!TEST_DATABASE_URL)("db", () => {
 
     describe("0002_job_fees", () => {
       const CHAIN_DERIVED = ["allowlist", "asks_chain", "cursor", "jobs", "models", "providers"];
+      /** The PRESERVED tables 0001 declares: `provider_names` arrives later, in 0003. */
+      const KEPT = PRESERVED.filter((table) => table !== "provider_names");
       const migration = (version: string): string =>
         readFileSync(new URL(`../src/db/migrations/${version}`, import.meta.url), "utf8");
 
@@ -330,7 +334,7 @@ describe.skipIf(!TEST_DATABASE_URL)("db", () => {
         await db.migrate();
 
         expect(await counts(CHAIN_DERIVED)).toEqual(every(CHAIN_DERIVED, 0n));
-        expect(await counts(PRESERVED)).toEqual(every(PRESERVED, 1n));
+        expect(await counts(KEPT)).toEqual(every(KEPT, 1n));
         const columns = await db.query<{
           column_name: string;
           data_type: string;
@@ -352,18 +356,47 @@ describe.skipIf(!TEST_DATABASE_URL)("db", () => {
         // Rows the cold start has since rebuilt, both fees included. Neither a
         // second boot nor a replay of the file itself (the rebuild path re-runs
         // every migration over the tables it keeps) may empty them again.
-        await db.query(`TRUNCATE ${PRESERVED.join(", ")}`);
+        await db.query(`TRUNCATE ${KEPT.join(", ")}`);
         await seed(jobFields({ state: 2, ended_because: 1, fee: "2500" }));
 
         await db.migrate();
         await db.query(migration("0002_job_fees.sql"));
 
         expect(await counts(CHAIN_DERIVED)).toEqual(every(CHAIN_DERIVED, 1n));
-        expect(await counts(PRESERVED)).toEqual(every(PRESERVED, 1n));
+        expect(await counts(KEPT)).toEqual(every(KEPT, 1n));
         const { rows } = await db.query<{ gas_fee: bigint; fee: bigint }>("SELECT gas_fee, fee FROM jobs");
         expect(rows).toEqual([{ gas_fee: 30000n, fee: 2500n }]);
 
-        await db.query(`TRUNCATE ${[...CHAIN_DERIVED, ...PRESERVED].join(", ")}`);
+        await db.query(`TRUNCATE ${[...CHAIN_DERIVED, ...KEPT].join(", ")}`);
+      });
+    });
+
+    describe("0003_provider_names", () => {
+      const NAME = "INSERT INTO provider_names (provider_id, name) VALUES ($1, $2)";
+
+      it("keeps a name across a replay that empties providers", async () => {
+        await db.migrate();
+        await db.query("INSERT INTO providers (provider_id, operator) VALUES (3, $1)", [bytes(0xcd, 20)]);
+        await db.query(NAME, [3, "provider-a"]);
+
+        await db.query("TRUNCATE cursor, jobs, providers, models, allowlist, asks_chain");
+        await db.query(
+          readFileSync(new URL("../src/db/migrations/0003_provider_names.sql", import.meta.url), "utf8"),
+        );
+
+        const { rows } = await db.query("SELECT provider_id, name FROM provider_names");
+        expect(rows).toEqual([{ provider_id: 3n, name: "provider-a" }]);
+        const rls = await db.query("SELECT relrowsecurity FROM pg_class WHERE oid = 'provider_names'::regclass");
+        expect(rls.rows).toEqual([{ relrowsecurity: true }]);
+        await db.query("DELETE FROM provider_names");
+      });
+
+      it("refuses an empty name and one past 64 characters", async () => {
+        await db.migrate();
+        await expect(db.query(NAME, [4, ""])).rejects.toThrow(/check constraint/);
+        await expect(db.query(NAME, [4, "x".repeat(65)])).rejects.toThrow(/check constraint/);
+        await db.query(NAME, [4, "x".repeat(64)]);
+        await db.query("DELETE FROM provider_names");
       });
     });
   });

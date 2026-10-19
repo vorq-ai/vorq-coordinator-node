@@ -440,7 +440,12 @@ export function missingBlock(error: unknown): boolean {
 export async function atFloor<T>(chain: Chain, read: (at: BlockPin) => Promise<T>): Promise<T> {
   const floor = chain.floor();
   if (floor === 0n) return read({ blockTag: "latest" });
-  const at: BlockPin = { blockNumber: floor };
+  return atBlock(floor, read);
+}
+
+/** One read pinned at `block`, asked again while a lagging endpoint has not reached it. */
+async function atBlock<T>(block: bigint, read: (at: BlockPin) => Promise<T>): Promise<T> {
+  const at: BlockPin = { blockNumber: block };
   for (let attempt = 1; ; attempt++) {
     try {
       return await read(at);
@@ -449,6 +454,45 @@ export async function atFloor<T>(chain: Chain, read: (at: BlockPin) => Promise<T
       await new Promise((resolve) => setTimeout(resolve, FLOOR_RETRY_MS));
     }
   }
+}
+
+/**
+ * {@link atFloor}, remembered for as long as the floor stands.
+ *
+ * State at a fixed block never changes, so a read keyed by `(block, key)` is
+ * exact for every caller at that block — no TTL, no staleness. What it saves is
+ * the burst: a provider claiming a batch asks `/evm/simulate/claim` once per
+ * line, and every one of those answers reads the same owner balance and the
+ * same provider gates at the same floor. One `eth_call` per distinct read per
+ * block, concurrent misses sharing it. The memo holds the current floor's
+ * entries only and drops them when the floor moves; a failed read is not
+ * remembered. Before the first floor (`0n`) reads go to `latest`, which is not
+ * a fixed state, and are never remembered.
+ */
+export function floorMemo(): <T>(
+  chain: Chain,
+  key: string,
+  read: (at: BlockPin) => Promise<T>,
+) => Promise<T> {
+  let block = 0n;
+  let entries = new Map<string, Promise<unknown>>();
+  return <T>(chain: Chain, key: string, read: (at: BlockPin) => Promise<T>): Promise<T> => {
+    const floor = chain.floor();
+    if (floor === 0n) return read({ blockTag: "latest" });
+    if (floor !== block) {
+      block = floor;
+      entries = new Map();
+    }
+    const hit = entries.get(key);
+    if (hit !== undefined) return hit as Promise<T>;
+    const run = atBlock(floor, read);
+    const mine = entries;
+    mine.set(key, run);
+    run.catch(() => {
+      if (mine.get(key) === run) mine.delete(key);
+    });
+    return run;
+  };
 }
 
 // ---------------------------------------------------------------------------

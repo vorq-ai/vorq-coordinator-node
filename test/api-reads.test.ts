@@ -110,7 +110,7 @@ const GATED_ROUTES = [
   "/evm/allowlist",
   "/evm/models",
   "/v1/models",
-  "/evm/asks/floors",
+  "/evm/asks",
   // Inlined rather than `hex(OWNER)`: both are defined below this constant, and
   // this list is only read inside a test body, so the literal is the small fix.
   `/evm/jobs/summary?owner=0x${"aa".repeat(20)}`,
@@ -442,19 +442,6 @@ describe.skipIf(!TEST_DATABASE_URL)("read API", () => {
     await db.query("INSERT INTO models (model_id, name) VALUES ($1, $2)", [modelId, name]);
   }
 
-  async function seedAsk(row: {
-    provider_id: number;
-    model_id: number;
-    sla: number;
-    rate_in: number;
-    rate_out: number;
-  }): Promise<void> {
-    await db.query(
-      "INSERT INTO asks_chain (provider_id, model_id, sla, rate_in, rate_out) VALUES ($1, $2, $3, $4, $5)",
-      [row.provider_id, row.model_id, row.sla, row.rate_in, row.rate_out],
-    );
-  }
-
   async function setCursor(block: bigint): Promise<void> {
     await db.query(
       "INSERT INTO cursor (id, block_number, block_hash) VALUES (1, $1, '0xbebebebebebebebebebebebebebebebebebebebebebebebebebebebebebebebe') " +
@@ -489,7 +476,7 @@ describe.skipIf(!TEST_DATABASE_URL)("read API", () => {
   beforeEach(async () => {
     for (const table of [
       "jobs", "providers", "models", "allowlist", "cursor", "asks_chain",
-      "sessions", "provider_presence", "job_leases",
+      "sessions", "provider_presence", "job_leases", "provider_names",
     ]) {
       await db.query(`DELETE FROM ${table}`);
     }
@@ -797,98 +784,6 @@ describe.skipIf(!TEST_DATABASE_URL)("read API", () => {
       await setCursor(4243n);
       const res = await get("/evm/jobs");
       expect(res.json().as_of_block).toBe(4243);
-    });
-  });
-
-  describe("GET /evm/asks/floors", () => {
-    beforeEach(async () => {
-      await seedModel(7);
-      await seedModel(8);
-      await seedProvider({ provider_id: 1 });
-      await seedProvider({ provider_id: 2 });
-      await seedProvider({ provider_id: 3, listed: false });
-      // Two listed providers on one (model, window): the cheaper INPUT rate is
-      // provider 1's and the cheaper OUTPUT rate is provider 2's.
-      await seedAsk({ provider_id: 1, model_id: 7, sla: 3600, rate_in: 30000, rate_out: 90000 });
-      await seedAsk({ provider_id: 2, model_id: 7, sla: 3600, rate_in: 50000, rate_out: 20000 });
-      // Unlisted: cheaper on both legs, and must not count.
-      await seedAsk({ provider_id: 3, model_id: 7, sla: 3600, rate_in: 1, rate_out: 2 });
-      // A second window and a second model, so the grouping is visible.
-      await seedAsk({ provider_id: 1, model_id: 7, sla: 86400, rate_in: 10000, rate_out: 40000 });
-      await seedAsk({ provider_id: 2, model_id: 8, sla: 3600, rate_in: 70000, rate_out: 80000 });
-      // A model the catalog does not carry: nothing can be ordered against it.
-      await seedAsk({ provider_id: 1, model_id: 99, sla: 3600, rate_in: 5, rate_out: 5 });
-    });
-
-    it("answers each leg's minimum over listed providers, per (model, window), in R18's shape", async () => {
-      const res = await get("/evm/asks/floors");
-      expect(res.statusCode).toBe(200);
-      expect(res.headers["x-vorq-page-truncated"]).toBe("false");
-      expect(res.json()).toEqual({
-        floors: [
-          { model_id: 7, sla: 3600, rate_in: "0.03", rate_out: "0.02" },
-          { model_id: 7, sla: 86400, rate_in: "0.01", rate_out: "0.04" },
-          { model_id: 8, sla: 3600, rate_in: "0.07", rate_out: "0.08" },
-        ],
-        as_of_block: 4242,
-      });
-    });
-
-    it("filters by model, before paging", async () => {
-      const res = await get("/evm/asks/floors?model=8&limit=1");
-      expect(res.json().floors).toEqual([
-        { model_id: 8, sla: 3600, rate_in: "0.07", rate_out: "0.08" },
-      ]);
-    });
-
-    /**
-     * The money path reads ONE `(model, window)` row, so it must be able to ask
-     * for one: `sla` bounds the window side the way `model` bounds the model
-     * side, and how many junk windows a provider has published stops mattering.
-     */
-    it("filters by window, leaving every other window out", async () => {
-      const res = await get("/evm/asks/floors?sla=86400");
-      expect(res.statusCode).toBe(200);
-      expect(res.json().floors).toEqual([
-        { model_id: 7, sla: 86400, rate_in: "0.01", rate_out: "0.04" },
-      ]);
-
-      const one = await get("/evm/asks/floors?model=7&sla=3600");
-      expect(one.json().floors).toEqual([
-        { model_id: 7, sla: 3600, rate_in: "0.03", rate_out: "0.02" },
-      ]);
-    });
-
-    it("refuses a window that is not a uint32", async () => {
-      const res = await get("/evm/asks/floors?sla=4294967296");
-      expect(res.statusCode).toBe(400);
-      expect(res.json().error).toMatchObject({ param: "sla" });
-    });
-
-    /**
-     * Offsets are absolute, not per-page: the second page of the three-group
-     * fixture is the second group, with nothing repeated and nothing skipped.
-     */
-    it("pages by absolute offset", async () => {
-      const res = await get("/evm/asks/floors?limit=1&offset=1");
-      expect(res.json().floors).toEqual([
-        { model_id: 7, sla: 86400, rate_in: "0.01", rate_out: "0.04" },
-      ]);
-      // A page the byte budget did not cut carries no resume point (R58): the
-      // row bound ended this page, and `limit` alone is the caller's cursor.
-      expect(res.headers["x-vorq-page-truncated"]).toBe("false");
-      expect(res.headers["x-vorq-next-offset"]).toBeUndefined();
-
-      const third = await get("/evm/asks/floors?limit=1&offset=2");
-      expect(third.json().floors).toEqual([
-        { model_id: 8, sla: 3600, rate_in: "0.07", rate_out: "0.08" },
-      ]);
-    });
-
-    it("refuses a limit past the maximum rather than clamping it", async () => {
-      const res = await get("/evm/asks/floors?limit=100000");
-      expect(res.statusCode).toBe(400);
-      expect(res.json().error).toMatchObject({ param: "limit" });
     });
   });
 
@@ -1444,6 +1339,7 @@ describe.skipIf(!TEST_DATABASE_URL)("read API", () => {
         providers: [
           {
             provider_id: 4294967295,
+            name: null,
             operator: hex(bytes(0xcc, 20)),
             box_key: hex(bytes(0xdd)),
             evidence: { raw: "0xdeadbeef" },
@@ -1457,6 +1353,21 @@ describe.skipIf(!TEST_DATABASE_URL)("read API", () => {
         ],
         as_of_block: 4242,
       });
+    });
+
+    it("serves the name the coordinator set, and null where it set none", async () => {
+      await seedProvider({ provider_id: 1 });
+      await seedProvider({ provider_id: 2 });
+      // A name for a provider not indexed yet joins nothing and lists nothing.
+      await db.query("INSERT INTO provider_names (provider_id, name) VALUES (1, 'provider-a'), (9, 'provider-z')");
+
+      const list = (await get("/evm/providers")).json() as { providers: { provider_id: number; name: string | null }[] };
+      expect(list.providers.map(({ provider_id, name }) => [provider_id, name])).toEqual([
+        [1, "provider-a"],
+        [2, null],
+      ]);
+      expect((await get("/evm/providers/1")).json().name).toBe("provider-a");
+      expect((await get("/evm/providers/2")).json().name).toBeNull();
     });
 
     it("passes a jsonb number through as stored, without rounding it (R51)", async () => {

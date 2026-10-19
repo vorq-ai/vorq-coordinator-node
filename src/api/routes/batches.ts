@@ -67,6 +67,9 @@ const MAX_METADATA_VALUE_CHARS = 512;
 /** Entries one plan may name: a bound on the work an unsigned read does. */
 const MAX_PLAN_MODELS = 16;
 
+/** Providers one plan entry may list. */
+const MAX_PLAN_PROVIDERS = 64;
+
 /** One page of `GET /v1/batches`. OpenAI's default and ceiling. */
 const DEFAULT_LIMIT = 20;
 const MAX_LIMIT = 100;
@@ -102,6 +105,14 @@ const BatchPlan = Type.Object({
       lines: Uint32({ minimum: 1, maximum: MAX_BATCH_LINES }),
       units_in: SafeUint({ description: "The total over this model's lines." }),
       units_out: SafeUint({ description: "The total over this model's lines." }),
+      providers: Type.Optional(
+        Type.Array(Uint32({ minimum: 1 }), {
+          minItems: 1,
+          maxItems: MAX_PLAN_PROVIDERS,
+          uniqueItems: true,
+          description: "Plan these lines onto these providers alone; absent for the whole market.",
+        }),
+      ),
       max_rate_in: Type.Optional(Usd({ description: "The most these lines pay per 1M input units, in USD." })),
       max_rate_out: Type.Optional(Usd({ description: "The most these lines pay per 1M output units, in USD." })),
     }),
@@ -222,8 +233,8 @@ export function batchCreateRoute(app: App, deps: RouteDeps): void {
     // ---- the plan: no file yet, so nothing signed ---------------------------
     //
     // A client asks first how the network would take its lines: per entry, which
-    // providers within the entry's ceilings, at which ask, and how many lines
-    // each — never past a provider's on-chain capacity (`match/plan.ts`). It seals each line
+    // providers within the entry's ceilings (only those it lists, if any), at
+    // which ask, and how many lines each — never past a provider's on-chain capacity (`match/plan.ts`). It seals each line
     // to its allotted provider and then uploads and creates as usual. Nothing is
     // held, so the answer is about now.
     if (!("input_file_id" in body)) {
@@ -237,6 +248,7 @@ export function batchCreateRoute(app: App, deps: RouteDeps): void {
         lines: BigInt(m.lines),
         unitsIn: BigInt(m.units_in),
         unitsOut: BigInt(m.units_out),
+        providers: m.providers?.map(BigInt) ?? null,
         maxRateIn: ceiling(m.max_rate_in, `models[${i}].max_rate_in`),
         maxRateOut: ceiling(m.max_rate_out, `models[${i}].max_rate_out`),
       }));

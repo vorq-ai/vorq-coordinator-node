@@ -303,6 +303,68 @@ describe.skipIf(!TEST_DATABASE_URL)("/v1/batches", () => {
       expect(planned.json().plan.map((p: { allocation: unknown[] }) => p.allocation.length)).toEqual([0, 1]);
     });
 
+    it("plans a listed entry onto its providers only", async () => {
+      for (const table of ["provider_presence", "asks_chain", "providers"]) {
+        await db.query(`DELETE FROM ${table}`);
+      }
+      for (const id of [4, 5]) {
+        await db.query(
+          `INSERT INTO providers (provider_id, operator, box_key, reputation, capacity_ceiling,
+                                  capacity_requested, listed, allow_all_models)
+           VALUES ($1, $2, $3, 1000, 2, 2, true, true)`,
+          [id, Buffer.alloc(20, id), Buffer.alloc(32, id)],
+        );
+        await db.query(
+          "INSERT INTO asks_chain (provider_id, model_id, sla, rate_in, rate_out) VALUES ($1, 7, 86400, $2, 20)",
+          [id, id === 4 ? 10 : 30],
+        );
+        await db.query("INSERT INTO provider_presence (provider_id, model_id, free_slots) VALUES ($1, 7, 1)", [id]);
+      }
+
+      const entry = { model_id: 7, lines: 3, units_in: 100, units_out: 200 };
+      const planned = await create({
+        completion_window: "24h",
+        models: [
+          { ...entry, providers: [5] },
+          { ...entry, providers: [9] },
+          { ...entry, providers: [9, 5, 4] },
+        ],
+      });
+
+      expect(planned.statusCode).toBe(402);
+      const allotted = planned.json().plan.map((p: { allocation: { provider_id: number; lines: number }[] }) =>
+        p.allocation.map((a) => [a.provider_id, a.lines]),
+      );
+      // Provider 5 holds two of its three lines and the cheaper 4 takes none of them;
+      // nobody is 9; the last entry gets 4's two and nothing 5 has left.
+      expect(allotted).toEqual([[[5, 2]], [], [[4, 2]]]);
+    });
+
+    it("refuses a provider list that is empty, repeats, overflows or names an id outside uint32", async () => {
+      const entry = { model_id: 7, lines: 1, units_in: 1, units_out: 1 };
+      const cases: [unknown, string][] = [
+        [[], "models[0].providers"],
+        [[1, 1], "models[0].providers"],
+        [Array.from({ length: 65 }, (_, i) => i + 1), "models[0].providers"],
+        [3, "models[0].providers"],
+        [[1, 0], "models[0].providers[1]"],
+        [[-1], "models[0].providers[0]"],
+        [[4_294_967_296], "models[0].providers[0]"],
+        [[1.5], "models[0].providers[0]"],
+        [["1"], "models[0].providers[0]"],
+      ];
+      for (const [providers, param] of cases) {
+        const refused = await create({ completion_window: "24h", models: [{ ...entry, providers }] });
+        expect(refused.statusCode).toBe(400);
+        expect(refused.json().error.param).toBe(param);
+      }
+      const full = await create({
+        completion_window: "24h",
+        models: [{ ...entry, providers: Array.from({ length: 64 }, (_, i) => i + 1) }],
+      });
+      expect(full.statusCode).toBe(402);
+    });
+
     it("refuses a plan that names no models", async () => {
       const refused = await create({ completion_window: "24h", models: [] });
       expect(refused.statusCode).toBe(400);

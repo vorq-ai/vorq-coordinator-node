@@ -101,7 +101,9 @@ An advisory check before signing a claim, for a `job_id` and the provider wallet
 
 **Auth:** public · **Index-backed:** no
 
-**Response `200`:** `{"ok": true}`, or `{"ok": false, "reason": …}` with the first failing check, in the contract's order: `UnknownJob`, `NotOpen`, `UnknownProvider`, `NotListed`, `ModelNotAllowed`, `NotDesignated`, `AtCapacity`. It does not check the payment, the signature or the ±600-second window; `POST /evm/ops` simulates the real transaction.
+**Response `200`:** `{"ok": true}`, or `{"ok": false, "reason": …}` with the first failing check, in the contract's order: `UnknownJob`, `NotOpen`, `UnknownProvider`, `NotListed`, `ModelNotAllowed`, `NotDesignated`, `AtCapacity`, `InsufficientFunds` (the owner's balance is below the escrow pull). It does not check the signature or the ±600-second window; `POST /evm/ops` simulates the real transaction.
+
+Reads are pinned to the node's floor block and shared within it: a burst of checks — a batch's lines claimed one after another — reads the owner's balance and each provider gate once per block, and only `getJob` once per job.
 
 ## Asks
 
@@ -153,12 +155,6 @@ Published asks of listed providers.
 
 **Auth:** public · **Index-backed:** yes · **Paged:** yes
 
-### GET /evm/asks/floors
-
-The lowest ask per `(model_id, sla)` across listed providers, for catalog models. `rate_in` and `rate_out` are each minimised on their own, so a floor row may combine two providers' rates.
-
-**Auth:** public · **Index-backed:** yes · **Paged:** yes
-
 ## Providers and catalog
 
 ### GET /evm/providers
@@ -167,6 +163,7 @@ Registered providers, by id.
 
 **Auth:** public · **Index-backed:** yes · **Paged:** yes
 
+- `name` is the display name this coordinator gives the provider; `null` when it gives none. It is not on chain.
 - `box_key` is the X25519 key designated orders are sealed to; `null` until set.
 - `evidence` is the identity evidence published with `set_identity`, or `null`.
 - `reputation` is `100`–`1000`.

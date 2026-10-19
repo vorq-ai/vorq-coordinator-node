@@ -3,7 +3,7 @@ title: Page through listings
 description: Read a whole job book, provider list or catalog with limit, offset and the truncation headers.
 ---
 
-The public listings (`/evm/jobs`, `/evm/providers`, `/v1/models`, `/evm/models`, `/evm/asks`, `/evm/asks/floors`, `/evm/allowlist`) are paged with `limit` and `offset`. A page can end early when the response would pass 4 MiB, so the length of the page alone does not tell you whether you are done.
+The public listings (`/evm/jobs`, `/evm/providers`, `/v1/models`, `/evm/models`, `/evm/asks`, `/evm/allowlist`) are paged with `limit` and `offset`. A page can end early when the response would pass 4 MiB, so the length of the page alone does not tell you whether you are done.
 
 ## The loop
 

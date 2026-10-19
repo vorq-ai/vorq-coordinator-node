@@ -1004,11 +1004,12 @@ describe("the rebuild path's drop set", () => {
     // `files` joins them for `pins`' own reason, one level up: it is the `file_id → cid`
     // book, no chain log carries it, and dropping it leaves every batch naming an input
     // file this node can no longer resolve to an object.
-    for (const preserved of ["batch_lines", "batches", "files", "pins", "quotes_live"]) {
+    // `provider_names` holds names an operator set by hand; no chain log carries one.
+    for (const preserved of ["batch_lines", "batches", "files", "pins", "provider_names", "quotes_live"]) {
       expect(DROPPABLE).not.toContain(preserved);
       expect(PRESERVED).toContain(preserved);
     }
-    expect(PRESERVED).toEqual(["batch_lines", "batches", "files", "pins", "quotes_live"]);
+    expect(PRESERVED).toEqual(["batch_lines", "batches", "files", "pins", "provider_names", "quotes_live"]);
   });
 
   it("classifies every table the migrations declare exactly once", () => {

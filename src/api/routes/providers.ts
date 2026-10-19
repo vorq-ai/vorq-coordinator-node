@@ -6,10 +6,14 @@ import { budgeted, pageOf, Paging } from "../paging.js";
 import { AsOfBlock, errors, HexOut, Int, Nullable, Uint32 } from "../schemas/common.js";
 import { jsonb } from "../wire.js";
 
-/** The provider directory, as the projection holds it. */
+/**
+ * The provider directory, as the projection holds it, with the display name
+ * this coordinator curates (`provider_names`; on no chain log).
+ */
 
 export interface ProviderRow {
   provider_id: bigint;
+  name: string | null;
   operator: Buffer;
   box_key: Buffer | null;
   /** `evidence::text` — the raw `jsonb` text, never a parsed value (R51). */
@@ -23,7 +27,7 @@ export interface ProviderRow {
 }
 
 const PROVIDER_QUERY = `
-  SELECT p.provider_id, p.operator, p.box_key, p.evidence::text AS evidence,
+  SELECT p.provider_id, n.name, p.operator, p.box_key, p.evidence::text AS evidence,
          p.listed, p.reputation, p.allow_all_models, p.allowed_models,
          -- effectiveCap, in SQL and to the chain's formula. Every input is
          -- load-bearing (R12): reputation scales it, the ceiling caps what may
@@ -33,10 +37,12 @@ const PROVIDER_QUERY = `
          -- Matches the chain's activeJobs while Plan 1 defers slot leasing.
          (SELECT count(*) FROM jobs j WHERE j.provider_id = p.provider_id AND j.state = 1)
            AS active_jobs
-  FROM providers p`;
+  FROM providers p
+  LEFT JOIN provider_names n ON n.provider_id = p.provider_id`;
 
 const evmProvider = (row: ProviderRow) => ({
   provider_id: row.provider_id,
+  name: row.name,
   operator: row.operator,
   box_key: row.box_key,
   evidence: jsonb(row.evidence),
@@ -50,6 +56,7 @@ const evmProvider = (row: ProviderRow) => ({
 
 export const EvmProvider = Type.Object({
   provider_id: Int(),
+  name: Nullable(Type.String({ description: "The display name this coordinator gives the provider; not on chain." })),
   operator: HexOut("The operator address that signs this provider's ops."),
   box_key: Nullable(HexOut("The X25519 key a designated order is sealed to.")),
   evidence: Type.Unknown({ description: "The provider's published identity evidence, as JSON." }),

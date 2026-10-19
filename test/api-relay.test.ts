@@ -299,6 +299,58 @@ describe("chain-backed routes", () => {
   });
 
   /**
+   * A batch's lines are claimed in a burst, one simulate per line. At one floor
+   * block the owner balance and the provider gates are one read each, however
+   * many lines ask; `getJob` is per job and stays per call. A new floor reads
+   * again — the memo is exact per block, not a TTL.
+   */
+  it("reads the balance and provider gates once per floor block across a claim burst", async () => {
+    const { app: server, stub } = build({
+      views: {
+        getJob: jobView(),
+        idOf: 5,
+        isListed: true,
+        modelAllowed: true,
+        activeJobs: 1,
+        effectiveCap: 8,
+        feeBps: 100,
+      },
+    });
+    const claim = (n: number) =>
+      server.inject({
+        method: "POST",
+        url: "/evm/simulate/claim",
+        payload: { job_id: `0x${n.toString(16).padStart(64, "0")}`, address: `0x${"cc".repeat(20)}` },
+      });
+    const calls = (signature: string) => {
+      const selector = toFunctionSelector(signature);
+      return stub.requests.filter(
+        (r) => r.method === "eth_call" && (r.params as [{ data: string }])[0].data.startsWith(selector),
+      ).length;
+    };
+
+    stub.chain.saw(10n);
+    const burst = await Promise.all([1, 2, 3, 4, 5].map(claim));
+    expect(burst.map((r) => r.json())).toEqual(Array(5).fill({ ok: true }));
+    expect(calls("getJob(bytes32)")).toBe(5);
+    for (const gate of [
+      "balanceOf(address)",
+      "idOf(address)",
+      "isListed(uint32)",
+      "modelAllowed(uint32,uint32)",
+      "activeJobs(uint32)",
+      "effectiveCap(uint32)",
+    ]) {
+      expect(calls(gate), gate).toBe(1);
+    }
+
+    stub.chain.saw(11n);
+    expect((await claim(6)).json()).toEqual({ ok: true });
+    expect(calls("balanceOf(address)")).toBe(2);
+    expect(calls("activeJobs(uint32)")).toBe(2);
+  });
+
+  /**
    * The escrow pull, which the payment token refuses with a string revert the
    * daemon could only take for a lost race. Measured 2026-10-17: fifteen orders
    * from empty wallets passed this gate and were refused at `/evm/ops` every

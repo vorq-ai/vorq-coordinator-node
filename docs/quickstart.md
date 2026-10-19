@@ -74,15 +74,15 @@ List the catalog:
 curl -s "$VORQ/v1/models" | jq '.data[] | {name: .id, model_id: .vorq.model_id}'
 ```
 
-Pick a model and read the cheapest published price for each SLA:
+Pick a model and read the published asks for it:
 
 ```sh
 export MODEL_ID=3   # a model_id from the list above
-curl -s "$VORQ/evm/asks/floors?model=$MODEL_ID" | jq .floors
+curl -s "$VORQ/evm/asks?model=$MODEL_ID" | jq .asks
 ```
 
 ```json
-[{ "model_id": 3, "sla": 3600, "rate_in": "0.0012", "rate_out": "0.005" }]
+[{ "provider_id": 1, "model_id": 3, "sla": 3600, "rate_in": "0.0012", "rate_out": "0.005" }]
 ```
 
 Take the `sla` and rates of one row. An order whose rates are at or above a provider's ask can be matched by that provider:

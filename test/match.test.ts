@@ -408,6 +408,7 @@ describe.skipIf(!TEST_DATABASE_URL)("the matcher", () => {
         lines: 1n,
         unitsIn: 1000n,
         unitsOut: 2000n,
+        providers: null,
         maxRateIn: null,
         maxRateOut: null,
         ...r,
@@ -504,6 +505,70 @@ describe.skipIf(!TEST_DATABASE_URL)("the matcher", () => {
     for (let n = 1; n <= 6; n++) await seedJob(n, { designated: 1 });
     const [second] = await planOf([{ lines: 10n }]);
     expect(split(second!)).toEqual([[1, 4]]);
+  });
+
+  it("plans a listed entry onto its providers alone, cheapest first, even past a cheaper one", async () => {
+    for (const [id, rate] of [
+      [1, "10"],
+      [2, "50"],
+      [3, "30"],
+    ] as const) {
+      await seedProvider(id);
+      await seedAsk(id, rate, rate);
+      await seedPresence(id);
+    }
+    const [listed, open] = await planOf([{ lines: 24n, providers: [2n, 3n] }, { lines: 4n }]);
+    // Short of what it asked rather than spilled onto provider 1.
+    expect(split(listed!)).toEqual([
+      [3, 10],
+      [2, 10],
+    ]);
+    expect(listed![0]!.rate_in).toBe(30n);
+    expect(split(open!)).toEqual([[1, 4]]);
+  });
+
+  it("plans part or nothing of a listed entry its providers cannot take", async () => {
+    await seedFleet([1]);
+    for (const id of [2, 3, 4]) await seedProvider(id);
+    await seedPresence(2, { seen_at: new Date(Date.now() - 3_600_000) }); // not live
+    await seedAsk(2);
+    await seedPresence(3); // live, but no ask at this window
+    await seedAsk(4, "40000", "90000");
+    await seedPresence(4);
+    const plans = await planOf([
+      { providers: [2n] },
+      { providers: [3n] },
+      { providers: [4n], maxRateIn: 39999n },
+      { providers: [5n] }, // not a provider at all
+      { lines: 14n, providers: [1n, 2n, 3n, 4n, 5n], maxRateIn: 39999n },
+    ]);
+    expect(plans.map(split)).toEqual([[], [], [], [], [[1, 10]]]);
+  });
+
+  it("shares one budget between entries listing the same provider", async () => {
+    await seedFleet([1, 2]);
+    const [only, either] = await planOf([
+      { lines: 8n, providers: [1n] },
+      { lines: 4n, providers: [1n, 2n] },
+    ]);
+    expect(split(only!)).toEqual([[1, 8]]);
+    // Equal asks: provider 2 has not been named yet, so its turn comes first.
+    expect(split(either!)).toEqual([[2, 4]]);
+    const second = await planOf([
+      { lines: 10n, providers: [1n] },
+      { lines: 1n, providers: [1n] },
+    ]);
+    expect(second.map(split)).toEqual([[[1, 10]], []]);
+  });
+
+  it("takes turns among the listed providers at equal asks", async () => {
+    await seedFleet([1, 2, 3]);
+    const firsts: number[] = [];
+    for (let i = 0; i < 3; i++) {
+      const [plan] = await planOf([{ providers: [2n, 3n] }]);
+      firsts.push(...split(plan!).map(([id]) => id!));
+    }
+    expect(firsts).toEqual([2, 3, 2]);
   });
 
   it("caps the candidate list at the requested size", async () => {

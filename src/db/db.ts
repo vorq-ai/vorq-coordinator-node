@@ -42,8 +42,9 @@ export const SCHEMA_LOCK_KEY = 0x564f5251_5343484dn;
  * a store-minted CID's object lives (R73) — the name is on chain, the key that
  * resolves it is here and nowhere else; `files` is the only record of an upload's
  * name; `batches` and `batch_lines` are the only record that a set of jobs is one
- * caller's batch, which no chain log says; and `quotes_live` holds signed
- * snapshots providers pushed and will not push again on demand. Everything in
+ * caller's batch, which no chain log says; `quotes_live` holds signed
+ * snapshots providers pushed and will not push again on demand; and
+ * `provider_names` holds the display names an operator set by hand. Everything in
  * `DROPPABLE` is either a pure function of the chain, costs a caller one
  * handshake to re-obtain, or is advisory and regenerated within one provider
  * poll.
@@ -81,6 +82,7 @@ export const PRESERVED: readonly string[] = [
   "batches",
   "files",
   "pins",
+  "provider_names",
   "quotes_live",
 ];
 
