@@ -706,7 +706,8 @@ describe.skipIf(!TEST_DATABASE_URL)("startIndexer", () => {
       await Promise.all([indexer.poll(), indexer.poll(), indexer.coldStart()]);
 
       expect(stub.getLogsCalls).toHaveLength(1);
-      expect(stub.headReads).toBe(1);
+      // One run: the tick's head, and its one window's readiness re-read.
+      expect(stub.headReads).toBe(2);
       expect(await cursorBlock(db)).toBe(5n);
     });
   });
@@ -814,6 +815,29 @@ describe.skipIf(!TEST_DATABASE_URL)("startIndexer", () => {
       vi.spyOn(Date, "now").mockReturnValue(now + 5_001);
 
       await expect(indexer.status()).rejects.toThrow(/no chain head/);
+    });
+
+    it("keeps the head fresh through a catch-up longer than the ready lag", async () => {
+      // A multi-window catch-up outlasts READY_LAG_BLOCKS × BLOCK_TIME_MS; reading
+      // the head only once per tick made status() reject (chain_unreachable) for
+      // a node that was indexing fine.
+      let clock = Date.now();
+      vi.spyOn(Date, "now").mockImplementation(() => clock);
+      const stub = makeStub({
+        logs: [],
+        latest: 11_999n,
+        maxSpan: 5000,
+        onGetLogs: async () => {
+          clock += 4_000;
+        },
+      });
+      const indexer = start(stub, { readyLagBlocks: 5, blockTimeMs: 1000 });
+
+      await indexer.coldStart();
+
+      // Three windows, 12 s of catch-up against a 5 s staleness bound.
+      await expect(indexer.status()).resolves.toMatchObject({ ready: true, cursor: 11_999n });
+      expect(stub.headReads).toBe(4);
     });
 
     it("keeps reporting a fork after the loop has stopped reading heads", async () => {

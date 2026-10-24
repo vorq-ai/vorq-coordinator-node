@@ -383,6 +383,12 @@ export function startIndexer(chain: Chain, db: Db, config: Config): Indexer {
       //
       // The cost is one `eth_getBlockByNumber` per window. The steady state never
       // gets here: gaps up to `HEADER_SPAN` take the header path.
+      //
+      // The head is re-read per window for readiness only; the windows still end
+      // at the head this tick started from. A catch-up outlasts the ready lag's
+      // worth of time, and a head that went stale under it made `status()` read
+      // a node working through a backlog as one that cannot see the chain.
+      seen = { head: (await chain.head()).number, at: Date.now() };
       const toHash = await chain.blockHash(window.to);
       await verifyCursor(at, head);
       guarded = true;
