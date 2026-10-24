@@ -8,8 +8,10 @@ import * as Sentry from "@sentry/node";
  * On when `SENTRY_DSN` is set and a no-op otherwise; `SENTRY_ENVIRONMENT` and
  * `SENTRY_RELEASE` are read from the environment too. Every `error`-level log
  * line becomes an event, which covers the unhandled-route handler and every
- * background worker alike, since each of them reports through `app.log`; no
- * line is shipped as a Sentry log. No trace headers go out: the RPC and the
+ * background worker alike, since each of them reports through `app.log`; so
+ * does every `console.error`, which is how the indexer loop, the pool's idle
+ * client and a failed boot report, outside `app.log`. No line is shipped as a
+ * Sentry log. No trace headers go out: the RPC and the
  * object store are someone else's APIs.
  *
  * The Fastify hook reports nothing itself. It fires on every throw, before the
@@ -22,5 +24,6 @@ Sentry.init({
   integrations: [
     Sentry.pinoIntegration({ error: { levels: ["error", "fatal"] }, log: { levels: [] } }),
     Sentry.fastifyIntegration({ shouldHandleError: () => false }),
+    Sentry.captureConsoleIntegration({ levels: ["error"] }),
   ],
 });

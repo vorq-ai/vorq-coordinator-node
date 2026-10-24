@@ -264,7 +264,7 @@ async function main(): Promise<void> {
           onSync: (result) =>
             app.log.debug({ adopted: result.adopted }, "escrow peer sync"),
           onError: (error) =>
-            app.log.warn({ err: error }, "escrow peer sync failed; the peer link is paused"),
+            app.log.error({ err: error }, "escrow peer sync failed; the peer link is paused"),
         });
   void peerSync?.tick();
 
@@ -364,7 +364,7 @@ async function main(): Promise<void> {
         { relayer: chain.account.address, balanceWei: balance.toString() },
         "relayer balance is low; top it up before relays stop",
       ),
-    (error) => app.log.warn({ err: error }, "relayer balance read failed"),
+    (error) => app.log.error({ err: error }, "relayer balance read failed"),
   );
   void relayerBalance.tick();
 
@@ -424,6 +424,5 @@ async function main(): Promise<void> {
 main().catch(async (error: unknown) => {
   console.error("vorq-coordinator-node failed to start", error);
   process.exitCode = 1;
-  Sentry.captureException(error);
   await Sentry.flush(2000);
 });

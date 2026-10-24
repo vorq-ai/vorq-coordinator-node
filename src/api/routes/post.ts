@@ -1211,7 +1211,7 @@ async function bestEffort(
   } catch (error) {
     // `job_id` as well as the hash: the operator's question after one of these is
     // which job is unreadable, and the answer is in the body being sent.
-    reply.log.warn({ err: error, txHash, jobId: body.job_id }, message);
+    reply.log.error({ err: error, txHash, jobId: body.job_id }, message);
   }
 }
 

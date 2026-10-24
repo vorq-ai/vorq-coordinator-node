@@ -26,7 +26,7 @@ const LIMIT_EXCEEDED = -32005;
  * match, because halving would then hide a real failure behind a retry loop.
  */
 const RANGE_MESSAGE =
-  /block range|range exceeded|range too large|too many blocks|query returned more than|more than \d+ results|log response size|exceeds? (?:the )?maximum (?:block )?range/i;
+  /block range|range exceeded|range too large|too many blocks|query returned more than|more than \d+ results|log response size|exceeds? (?:the )?maximum (?:block )?range|limited to (?:a )?\d+ (?:block )?range/i;
 
 /** Walks the cause chain: viem wraps the transport error more than one deep. */
 function isRangeError(error: unknown): boolean {

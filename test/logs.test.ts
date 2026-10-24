@@ -344,6 +344,25 @@ describe("fetchLogsChunked", () => {
     expect(logs).toHaveLength(expectedLogCount(0, 11_999));
   });
 
+  it("halves on the public Base endpoint's -32614 \"limited to a 200 range\" refusal", async () => {
+    // sepolia.base.org answers an oversized range with its own code and wording;
+    // left unrecognised it stalled the production index at a 1000-block cap.
+    const stub = makeStub({
+      maxSpan: 200,
+      failWith: { code: -32614, message: "eth_getLogs is limited to a 200 range" },
+    });
+
+    const logs = await fetchLogsChunked(stub.client, {
+      address: CONTRACTS,
+      fromBlock: 0n,
+      toBlock: 1999n,
+      cap: 1000,
+    });
+
+    expect(stub.getLogsCalls.filter((c) => c.failed).map((c) => c.span)).toEqual([1000n, 500n, 250n]);
+    expect(logs).toHaveLength(expectedLogCount(0, 1999));
+  });
+
   it("throws when a single-block window still fails", async () => {
     // Nothing is servable, so halving bottoms out. Returning the partial result
     // here would silently truncate the index; the only correct answer is to fail.
