@@ -17,7 +17,7 @@ import {
   headBlockOf,
   makeChain,
 } from "../src/chain/client.js";
-import { fetchLogsChunked } from "../src/chain/logs.js";
+import { fetchLogsChunked, HeadLagError } from "../src/chain/logs.js";
 import type { Addresses, Config } from "../src/config.js";
 import { MAX_BLOB_BYTES } from "../src/api/routes/files.js";
 
@@ -361,6 +361,29 @@ describe("fetchLogsChunked", () => {
 
     expect(stub.getLogsCalls.filter((c) => c.failed).map((c) => c.span)).toEqual([1000n, 500n, 250n]);
     expect(logs).toHaveLength(expectedLogCount(0, 1999));
+  });
+
+  it("does not halve a refusal from a node behind the range's end", async () => {
+    // sepolia.base.org, 2026-11-09: a load-balanced node two blocks behind the
+    // head the indexer read. Its "block range" wording matched the range check,
+    // so a one-block window was halved and reported as an oversized range.
+    const stub = makeStub({
+      maxSpan: 0,
+      failWith: {
+        code: -32602,
+        message: "block range extends beyond current head block: requested 56574716, head 56574714",
+      },
+    });
+
+    const read = fetchLogsChunked(stub.client, {
+      address: CONTRACTS,
+      fromBlock: 56_574_700n,
+      toBlock: 56_574_716n,
+      cap: 200,
+    });
+
+    await expect(read).rejects.toBeInstanceOf(HeadLagError);
+    expect(stub.getLogsCalls).toHaveLength(1);
   });
 
   it("throws when a single-block window still fails", async () => {

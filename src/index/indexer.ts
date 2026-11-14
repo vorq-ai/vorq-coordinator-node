@@ -1,7 +1,7 @@
 import { BlockNotFoundError, type Log } from "viem";
 import { bloomHasAny } from "../chain/bloom.js";
 import type { Chain, Header } from "../chain/client.js";
-import { fetchLogsChunked } from "../chain/logs.js";
+import { fetchLogsChunked, HeadLagError } from "../chain/logs.js";
 import type { Address, Config } from "../config.js";
 import type { Db, Queryable } from "../db/db.js";
 import { reduceRange } from "./reducer.js";
@@ -440,8 +440,10 @@ export function startIndexer(chain: Chain, db: Db, config: Config): Indexer {
       // the next tick re-closes the range this one failed on. A loop that died
       // here would need a process restart to index again after a transient RPC
       // fault. A failure that is not transient keeps being logged, and readiness
-      // turns false as the head pulls away from the cursor.
-      console.error("indexer:", error);
+      // turns false as the head pulls away from the cursor. A node behind the
+      // head it was asked for is the load balancer, not a fault: it is a warning.
+      if (error instanceof HeadLagError) console.warn("indexer:", error.message);
+      else console.error("indexer:", error);
     }
     // A tripped guard is the one failure that is not retried: the range under
     // the cursor is gone, so re-reading it would apply the replacement chain on

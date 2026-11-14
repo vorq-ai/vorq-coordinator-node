@@ -28,8 +28,25 @@ const LIMIT_EXCEEDED = -32005;
 const RANGE_MESSAGE =
   /block range|range exceeded|range too large|too many blocks|query returned more than|more than \d+ results|log response size|exceeds? (?:the )?maximum (?:block )?range|limited to (?:a )?\d+ (?:block )?range/i;
 
+/**
+ * A load-balanced endpoint answers a range ending past the head of the node that
+ * served it with "block range extends beyond current head block". The range is
+ * not too wide — that node is a block or two behind the one the head was read
+ * from — so this must never halve, and its "block range" wording would otherwise
+ * match {@link RANGE_MESSAGE}.
+ */
+const HEAD_LAG_MESSAGE = /beyond (?:the )?current head/i;
+
+/**
+ * The range was refused because the serving node has not reached its end yet.
+ * Not a fault: the cursor did not move, and the next tick reads the range again.
+ */
+export class HeadLagError extends Error {
+  override readonly name = "HeadLagError";
+}
+
 /** Walks the cause chain: viem wraps the transport error more than one deep. */
-function isRangeError(error: unknown): boolean {
+function matches(error: unknown, test: (node: { code?: unknown }, text: string[]) => boolean): boolean {
   for (let current = error, depth = 0; current != null && depth < 10; depth++) {
     const node = current as {
       code?: unknown;
@@ -38,14 +55,20 @@ function isRangeError(error: unknown): boolean {
       shortMessage?: unknown;
       cause?: unknown;
     };
-    if (node.code === LIMIT_EXCEEDED) return true;
-    for (const text of [node.message, node.details, node.shortMessage]) {
-      if (typeof text === "string" && RANGE_MESSAGE.test(text)) return true;
-    }
+    const text = [node.message, node.details, node.shortMessage].filter(
+      (t): t is string => typeof t === "string",
+    );
+    if (test(node, text)) return true;
     current = node.cause;
   }
   return false;
 }
+
+const isHeadLag = (error: unknown): boolean =>
+  matches(error, (_, text) => text.some((t) => HEAD_LAG_MESSAGE.test(t)));
+
+const isRangeError = (error: unknown): boolean =>
+  matches(error, (node, text) => node.code === LIMIT_EXCEEDED || text.some((t) => RANGE_MESSAGE.test(t)));
 
 /**
  * Orders logs by `(blockNumber, logIndex)`.
@@ -104,6 +127,11 @@ export async function fetchLogsChunked(client: PublicClient, range: LogRange): P
       for (const log of chunk) collected.push(log);
       cursor = end + 1n;
     } catch (error) {
+      if (isHeadLag(error)) {
+        throw new HeadLagError(`eth_getLogs to ${end} was served by a node behind that block`, {
+          cause: error,
+        });
+      }
       if (!isRangeError(error)) throw error;
 
       // Halve the span actually attempted, not the nominal window: the last
