@@ -23,6 +23,7 @@ import {
 import { cid } from "../wire.js";
 import { usdParam } from "../usd.js";
 import { formatUsd } from "../../money.js";
+import { publishHeld } from "../../match/held.js";
 import { leaseOpenJobs } from "../../match/lease.js";
 import { upsertPresence } from "../../match/rank.js";
 
@@ -435,6 +436,10 @@ export function jobRoutes(
      * else sees those rows on their poll until the lease lapses; the chain
      * still decides every claim.
      *
+     * Some of those jobs are **held orders** — paid orders no live ask cleared
+     * when they arrived, kept as open rows off chain (`match/held.ts`). The
+     * poll posts the ones it leased before it answers.
+     *
      * The same call is the heartbeat: it records the caller's presence for the
      * model — free slots and freshness, never the floors, which are used here
      * and discarded — so a daemon that stops polling stops being named on a
@@ -480,6 +485,18 @@ export function jobRoutes(
           params,
         });
       });
+      // Held orders among those leases go on chain now, so every job this poll
+      // answers is one the caller can claim. A relay that fails drops their
+      // leases and the poll answers the rest; the next poll tries again.
+      try {
+        await publishHeld(
+          { db, chain: deps.chain, jobRegistry: deps.config.addresses.jobRegistry },
+          providerId,
+          BigInt(model),
+        );
+      } catch (error) {
+        request.log.error({ err: error, providerId, model }, "publishing held orders failed");
+      }
       where.push(
         "job_id IN (SELECT job_id FROM job_leases" +
           ` WHERE provider_id = ${bind(providerId.toString())} AND expires_at > now())`,

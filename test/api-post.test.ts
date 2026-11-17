@@ -326,6 +326,22 @@ interface StoreOptions {
   written?: unknown[][];
   /** Makes the write-through transaction fail. */
   writeError?: Error;
+  /**
+   * What the ranking answers at the relay, where the door asks whether any live
+   * ask clears the order. Defaults to one provider, so a paid post relays; `[]`
+   * makes the door hold the order instead.
+   */
+  clearing?: Candidate[];
+  /** Every held row the door wrote: the `INSERT INTO jobs` parameters. */
+  held?: unknown[][];
+  /** Makes the held insert find a row already there. */
+  heldConflict?: boolean;
+  /** The owner of a held, unleased row the cancel door finds for its `job_id`. */
+  heldOwner?: Buffer;
+  /** The held row has a live lease: a poll is posting it. */
+  heldLeased?: boolean;
+  /** Every held row the cancel door cancelled: `[job_id]`. */
+  heldCancelled?: unknown[][];
   /** The owner's open, unexpired jobs the funds check sums: `jobs` rows' price columns. */
   openJobs?: { rate_in: string; rate_out: string; units_in: string; units_out: string; gas_fee: string }[];
 }
@@ -342,6 +358,9 @@ interface StoreOptions {
  * object back. A stub rather than a schema, so a read this door is not supposed
  * to make is a hard failure instead of an empty result set.
  */
+/** A provider whose ask clears every order this file posts. */
+const CLEARING: Candidate = { provider_id: 1n, box_key: Buffer.alloc(32, 9), rate_in: 0n, rate_out: 0n };
+
 function stubDb(options: StoreOptions = {}): Db {
   const models = options.models ?? new Map([[1n, true]]);
   const jobs = options.jobs ?? new Set<string>();
@@ -354,9 +373,18 @@ function stubDb(options: StoreOptions = {}): Db {
     // subquery reads `jobs` too, and must not be mistaken for the duplicate
     // pre-check below.
     if (text.includes("FROM providers p")) {
+      // The relay-time check asks for one row; the challenge and the probe ask
+      // for `MATCH_CANDIDATES`.
+      if (params?.[6] === 1) return { rows: options.clearing ?? [CLEARING] };
       options.ranked?.push([...(params ?? [])]);
       return { rows: options.candidates ?? [] };
     }
+    if (text.includes("INSERT INTO jobs")) {
+      if (options.heldConflict === true) return { rows: [], rowCount: 0 };
+      options.held?.push([...(params ?? [])]);
+      return { rows: [], rowCount: 1 };
+    }
+
     if (text.includes("UPDATE provider_presence")) {
       options.bumps?.push([...(params ?? [])]);
       return { rows: [] };
@@ -413,6 +441,16 @@ function stubDb(options: StoreOptions = {}): Db {
     const staged: unknown[][] = [];
     const result = await fn({
       query: (async (text: string, params?: readonly unknown[]) => {
+        // The cancel door's held-order transaction: the locked row, its lease,
+        // and the one write.
+        if (text.includes("FROM jobs") && text.includes("FOR UPDATE")) {
+          return { rows: options.heldOwner === undefined ? [] : [{ owner: options.heldOwner }] };
+        }
+        if (text.includes("FROM job_leases")) return { rows: options.heldLeased === true ? [{}] : [] };
+        if (text.includes("UPDATE jobs SET state = 3")) {
+          options.heldCancelled?.push([...(params ?? [])]);
+          return { rows: [], rowCount: 1 };
+        }
         if (!text.includes("INSERT INTO jobs")) throw new Error(`stubDb: unexpected tx query ${text}`);
         const [jobId, , , , , , , , , , , , postedBlock] = params as unknown[];
         staged.push([`0x${(jobId as Buffer).toString("hex")}`, postedBlock]);
@@ -1347,6 +1385,46 @@ describe("POST /v1/jobs — relay", () => {
     expect(stub.simulated).toEqual([]);
   });
 
+  it("holds an order no live ask clears: 202, a row carrying both signatures, nothing relayed", async () => {
+    const held: unknown[][] = [];
+    const { app, stub } = harness({ clearing: [], held }, { gasFee: 5n });
+    const t = terms();
+    const jobId = jobIdFor(owner.address, t.c);
+    const body = await signed(t, amountFor(5n));
+
+    const response = await post(app, body);
+
+    expect(response.statusCode).toBe(202);
+    expect(response.json()).toEqual({ job_id: jobId, task_cid: MINTED_CID });
+    // The chain passed its verdict and the bytes were filed, but no gas was spent.
+    expect(stub.simulated).toHaveLength(1);
+    expect(stub.broadcasts).toEqual([]);
+
+    expect(held).toHaveLength(1);
+    const row = held[0] as unknown[];
+    const hexOf = (value: unknown) => `0x${(value as Buffer).toString("hex")}`;
+    expect(hexOf(row[0])).toBe(jobId);
+    expect(hexOf(row[1])).toBe(owner.address.toLowerCase());
+    expect(row.slice(3, 11)).toEqual(
+      [t.modelId, t.slaSecs, t.designated, t.rateIn, t.rateOut, t.unitsIn, t.unitsOut, t.expiresAt].map(String),
+    );
+    expect((row[11] as Buffer).toString("utf8")).toBe(MINTED_CID);
+    expect(row[12]).toBe("5");
+    expect(hexOf(row[13])).toBe(body.signature);
+    expect(hexOf(row[14])).toBe(body.auth_sig);
+  });
+
+  it("refuses a second post of a held job_id as the duplicate it is", async () => {
+    const { app, stub } = harness({ clearing: [], heldConflict: true });
+    const t = terms();
+
+    const response = await post(app, await signed(t, amountFor()));
+
+    expect(response.statusCode).toBe(409);
+    expect(response.json().error.code).toBe("DuplicateJob");
+    expect(stub.broadcasts).toEqual([]);
+  });
+
   it("refuses a wallet past JOB_RATE_LIMIT at the challenge, before it signs a payment", async () => {
     const { app, stub } = harness({}, {}, { jobRateLimit: 1 });
     const t = terms();
@@ -2235,6 +2313,67 @@ describe("POST /v1/jobs/{id}/cancel", () => {
     expect(call.functionName).toBe("cancel");
     expect(call.args?.[0]).toBe(jobId);
     expect(call.args?.[1]).toBe(issuedAt);
+  });
+
+  it("cancels a held order in the row, relaying nothing", async () => {
+    const heldCancelled: unknown[][] = [];
+    const jobId = jobIdFor(owner.address, C);
+    const { app, stub } = harness({
+      heldOwner: Buffer.from(owner.address.slice(2), "hex"),
+      heldCancelled,
+    });
+    const issuedAt = now();
+
+    const response = await cancel(app, jobId, {
+      issued_at: Number(issuedAt),
+      signature: await signCancel(jobId, issuedAt),
+    });
+
+    expect(response.statusCode).toBe(200);
+    expect(response.json()).toEqual({ job_id: jobId });
+    expect(heldCancelled).toHaveLength(1);
+    expect(stub.simulated).toEqual([]);
+    expect(stub.broadcasts).toEqual([]);
+  });
+
+  it("sends the cancel of a leased held order to the chain: a poll is posting it", async () => {
+    const heldCancelled: unknown[][] = [];
+    const jobId = jobIdFor(owner.address, C);
+    const { app, stub } = harness({
+      heldOwner: Buffer.from(owner.address.slice(2), "hex"),
+      heldLeased: true,
+      heldCancelled,
+    });
+    const issuedAt = now();
+
+    const response = await cancel(app, jobId, {
+      issued_at: Number(issuedAt),
+      signature: await signCancel(jobId, issuedAt),
+    });
+
+    expect(response.statusCode).toBe(200);
+    expect(heldCancelled).toEqual([]);
+    expect(broadcastCall(stub.broadcasts[0] as string).functionName).toBe("cancel");
+  });
+
+  it("refuses to cancel a held order for anyone but its owner", async () => {
+    const heldCancelled: unknown[][] = [];
+    const jobId = jobIdFor(owner.address, C);
+    const { app, stub } = harness({
+      heldOwner: Buffer.from(stranger.address.slice(2), "hex"),
+      heldCancelled,
+    });
+    const issuedAt = now();
+
+    const response = await cancel(app, jobId, {
+      issued_at: Number(issuedAt),
+      signature: await signCancel(jobId, issuedAt),
+    });
+
+    expect(response.statusCode).toBe(409);
+    expect(response.json().error.code).toBe("NotTheOwner");
+    expect(heldCancelled).toEqual([]);
+    expect(stub.broadcasts).toEqual([]);
   });
 
   it("refuses an issued_at outside the ±600 s job-op window (R24, R33)", async () => {

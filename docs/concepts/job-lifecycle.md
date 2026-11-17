@@ -8,7 +8,7 @@ A job is an order on the `JobRegistry` contract. The coordinator relays every st
 ## From quote to result
 
 1. **Quote.** The client signs an `Order` and posts it to [`POST /v1/jobs`](../reference/client-api.md#post-v1jobs) without payment. The coordinator answers `402` with the price and up to three candidate providers.
-2. **Post.** The client signs the payment authorization and posts the same order with it and the sealed payload. The coordinator stores the payload, relays `post` and answers `201`. The job is **open**.
+2. **Post.** The client signs the payment authorization and posts the same order with it and the sealed payload. The coordinator stores the payload, relays `post` and answers `201`. The job is **open**. An order no live provider's ask clears is [held](./matching-and-leases.md#held-orders) instead: the answer is `202`, the job reads as open, and `post` is relayed when a provider takes it.
 3. **Claim.** A provider relays a signed `claim` through [`POST /evm/ops`](../reference/provider-api.md#post-evmops). The contract collects the client's payment. The job is **claimed**.
 4. **Settle.** The provider relays a signed `settle` with the sealed result. The contract pays out. The job is **settled**.
 5. **Collect.** The client polls [`GET /v1/jobs/{id}`](../reference/client-api.md#get-v1jobsid) and fetches the result by `result_cid`.

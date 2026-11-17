@@ -23,6 +23,12 @@ They are ordered by what the order would cost at their ask, cheapest first. Amon
 
 The client seals to the first candidate and sets `designated` to its id. An empty list means no live provider currently matches; the order can still be posted as an open bid.
 
+## Held orders
+
+A paid order is posted on chain at once only when a live provider's ask clears it, by the same conditions as the candidates above. Otherwise the coordinator holds it: the order is stored with its signatures, answered `202`, and listed as an open job, but no transaction is sent.
+
+A held order goes on chain when a provider's poll leases it. The provider's own filters (`model`, `min_rate_in`, `min_rate_out`) decide that, so the order is posted for a provider that will take it. Until then it costs no gas, collects no payment, and can be cancelled by its owner. It expires at its `expires_at` like any open job.
+
 ## The market probe
 
 A client asks for the market before it signs: `POST /v1/jobs` with the order's `model_id`, `sla_secs`, `units_in`, `units_out` and optional `designated`, and **no rates and no signature**. Optional `max_rate_in` and `max_rate_out` are ceilings: an ask above one is left out, and a side with no ceiling is unbounded. The answer is `402` with `candidates` only: every live ask within the ceilings that meets the other conditions above, ranked the same way, with no quote. An unpinned probe advances the rotation like an open-bid quote does.

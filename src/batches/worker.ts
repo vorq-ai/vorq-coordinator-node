@@ -111,7 +111,7 @@ export const MAX_LINES_PER_TRANSACTION = 50;
 export const GAS_PER_LINE = 350_000n;
 
 /** Intrinsic cost, calldata and the loop itself, on top of {@link GAS_PER_LINE}. */
-const GAS_OVERHEAD = 150_000n;
+export const GAS_OVERHEAD = 150_000n;
 
 /**
  * How many containers are filed at once.
@@ -602,7 +602,7 @@ async function takeBackRefused(
  * one cause reads the same however it was met. `"unknown"` for revert data no ABI
  * decodes, which is the honest answer and never a guess.
  */
-function errorNameOf(data: Hex): string {
+export function errorNameOf(data: Hex): string {
   try {
     return decodeErrorResult({ abi: jobRegistryAbi, data }).errorName;
   } catch {

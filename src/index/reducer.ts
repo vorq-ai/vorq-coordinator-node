@@ -117,6 +117,9 @@ export async function applyEvent(
       // not this statement's — `GREATEST` makes the guarantee local, so a
       // re-applied `Posted` cannot date a row back behind the `Claimed` that
       // already advanced it.
+      //
+      // The two signatures are cleared: a held order (`match/held.ts`) that the
+      // chain now has is no longer held.
       await db.query(
         `INSERT INTO jobs (job_id, owner, c, model_id, sla_secs, designated,
                            rate_in, rate_out, units_in, units_out, expires_at,
@@ -129,6 +132,7 @@ export async function applyEvent(
            units_in = EXCLUDED.units_in, units_out = EXCLUDED.units_out,
            expires_at = EXCLUDED.expires_at, task_cid = EXCLUDED.task_cid,
            posted_block = EXCLUDED.posted_block, gas_fee = EXCLUDED.gas_fee,
+           order_sig = NULL, auth_sig = NULL,
            as_of_block = GREATEST(jobs.as_of_block, EXCLUDED.as_of_block)`,
         [
           bytea(a.jobId),

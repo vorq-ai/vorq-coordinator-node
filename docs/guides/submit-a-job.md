@@ -89,6 +89,8 @@ The answer is `201`:
 { "job_id": "0x…", "task_cid": "bafy…", "tx_hash": "0x…" }
 ```
 
+If no live provider's ask clears your rates, the answer is `202` with the same body and no `tx_hash`. The coordinator holds the order and posts it when a provider takes it. Poll the job the same way.
+
 ## 6. Handle a changed price
 
 If the node's `gas_fee` or the protocol `fee_bps` changed after your quote, `amount` no longer matches and the answer is `409` with a fresh `{quote, candidates, accepts}` body. Sign a new payment for the new `amount` and submit again. The order signature stays valid.

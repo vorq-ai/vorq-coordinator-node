@@ -7,6 +7,7 @@ import { decodeRevert, isVerdict } from "../../chain/revert.js";
 import type { Address } from "../../config.js";
 import {
   authorizationTypedData,
+  cancelTypedData,
   capOf,
   CapOverflowError,
   feeOf,
@@ -18,6 +19,7 @@ import {
   tokenDomain,
   type Terms,
 } from "../../orders.js";
+import { cancelHeld, holdOrder } from "../../match/held.js";
 import { markAssigned, rankProviders, type Candidate } from "../../match/rank.js";
 import { repairOnRefusal } from "../../index/reconcile.js";
 import { UNCONFIRMED, writePostedRows } from "../../index/write-through.js";
@@ -166,6 +168,8 @@ import { attachFile, findUpload } from "./files.js";
  *
  * ```
  * 201 {job_id, task_cid, tx_hash}       relayed and mined
+ * 202 {job_id, task_cid}                held: no live ask clears it; posted
+ *                                       when a provider's poll takes it
  * 200 {job_id, tx_hash}                 the same, for cancel (R16)
  * 402 {quote, accepts}                  sign this and come back        not retryable
  *                                       NEVER for a body with content
@@ -347,7 +351,8 @@ const JobBody = Type.Unsafe<MarketProbe | Submission>({
     "**Probe** (neither `rate_in` nor `rate_out`): the ranked live asks for the model and window, " +
     "within `max_rate_in` / `max_rate_out` where set, unsigned, answered `402 {candidates}`. **Challenge** (a signed order, no `auth_sig`): " +
     "answered `402` with the quote to sign. **Submission** (order, `auth_sig`, `amount` and " +
-    "exactly one of `container`/`container_cid`): relayed, `201`.",
+    "exactly one of `container`/`container_cid`): relayed, `201`; or held, `202`, when no live " +
+    "ask clears it, and posted once a provider takes it.",
   if: PROBE_TEST,
   then: MarketProbe,
   else: Submission,
@@ -391,6 +396,11 @@ const Posted = Type.Object({
   tx_hash: HexOut(),
 });
 
+const Held = Type.Object({
+  job_id: HexOut(),
+  task_cid: Type.String({ description: "The name this node filed the container under." }),
+});
+
 export function postRoutes(app: App, deps: RouteDeps): void {
   const pinner = pinnerFor(deps.config, deps.db);
   const serialized = subjectQueue("posts");
@@ -431,6 +441,7 @@ export function postRoutes(app: App, deps: RouteDeps): void {
         body: JobBody,
         response: {
           201: Posted,
+          202: Held,
           402: Type.Union([Quote, Type.Object({ candidates: Type.Array(Candidate) })]),
           409: Type.Union([ErrorEnvelope, Quote]),
           ...errors(400, 413, 429, 503, 504),
@@ -830,6 +841,28 @@ export function postRoutes(app: App, deps: RouteDeps): void {
         if (!attached) throw unknownContainer(content.cid);
       }
 
+      // An order no live ask clears is held, not posted: the relayer is repaid
+      // for a post only at claim, and nobody claims this one yet. It becomes an
+      // open row carrying its signatures and goes on chain when a provider's
+      // poll leases it (`match/held.ts`).
+      const clearing = await rankProviders(deps.db, terms, {
+        livenessMs: deps.config.match.livenessMs,
+        limit: 1,
+      });
+      if (clearing.length === 0) {
+        const held = await holdOrder(deps.db, {
+          jobId,
+          owner,
+          terms,
+          taskCid,
+          gasFee,
+          orderSig: signature,
+          authSig,
+        });
+        if (!held) throw duplicateJob();
+        return reply.code(202).send({ job_id: jobId, task_cid: taskCid });
+      }
+
       // `task_cid` on the success body, and only there: the caller cannot
       // compute this name and has nothing to read it from until the post is
       // indexed. A failed relay keeps the failure envelope it already had.
@@ -868,7 +901,10 @@ export function postRoutes(app: App, deps: RouteDeps): void {
           signature: Sig65(),
         }),
         response: {
-          200: Type.Object({ job_id: HexOut(), tx_hash: HexOut() }),
+          200: Type.Object({
+            job_id: HexOut(),
+            tx_hash: Type.Optional(HexOut("Absent for a held order: nothing was on chain to cancel.")),
+          }),
           409: ErrorEnvelope,
           ...errors(400, 413, 429, 503, 504),
         },
@@ -887,6 +923,20 @@ export function postRoutes(app: App, deps: RouteDeps): void {
     if (issuedAt + JOB_OP_WINDOW_SECONDS < now || issuedAt > now + JOB_OP_WINDOW_SECONDS) {
       throw refusal({ reason: "StaleOp", raw: null });
     }
+
+    // A held order is not on chain, so there is nothing to relay: the row's own
+    // owner is the party to check the signature against, and the row is the
+    // whole cancellation. A leased one is being posted right now and takes the
+    // chain path below.
+    const { chainId, jobRegistry } = deps.config.addresses;
+    const held = await cancelHeld(deps.db, jobId, (signer) =>
+      recovers(cancelTypedData(chainId, jobRegistry, jobId, issuedAt), signer, signature),
+    );
+    if (held === "not_owner") {
+      throw new ApiError(409, "invalid_request",
+        "signature does not recover to the owner of this job", "signature", "NotTheOwner");
+    }
+    if (held === "cancelled") return reply.code(200).send({ job_id: jobId });
 
     // Deliberately **not** recovered and compared here. The owner of a job is on
     // chain, not in this request, and `cancel` is the one entry point — there is

@@ -31,7 +31,7 @@ The job book, filtered. With `free=N` it is also the provider's poll.
 
 `state` and `ended_because` are as in [Job lifecycle](../concepts/job-lifecycle.md#states); an open job past `expires_at` reads as `3` / `5`. `provider_id`, `claimed_at` and `completion_tok` are `"0"` until claimed or settled. `gas_fee` is the relay gas fee in USD that the `JobRegistry` fixed for the job when it was posted; the treasury keeps it when a claimed job settles, fails or is reclaimed. `fee` is the protocol fee in USD that settlement took on top of the charge, `"0"` for a job that did not settle.
 
-**Provider poll.** `free=N` needs a provider session, `state=Open` and a `model` in the catalog. The node records the provider as live for that model with `N` free slots, leases it up to `N` of the oldest matching jobs it may claim (open bids, or designated to it) for `MATCH_LEASE_MS`, counting leases it already holds, and returns only the jobs it holds. See [Matching and leases](../concepts/matching-and-leases.md). Without `free`, the session is ignored.
+**Provider poll.** `free=N` needs a provider session, `state=Open` and a `model` in the catalog. The node records the provider as live for that model with `N` free slots, leases it up to `N` of the oldest matching jobs it may claim (open bids, or designated to it) for `MATCH_LEASE_MS`, counting leases it already holds, and returns only the jobs it holds. [Held orders](../concepts/matching-and-leases.md#held-orders) among them are posted on chain before the poll answers. See [Matching and leases](../concepts/matching-and-leases.md). Without `free`, the session is ignored.
 
 On a coordinator whose escrow has lost keys, open undesignated jobs posted before its current key custody are left out of the book.
 

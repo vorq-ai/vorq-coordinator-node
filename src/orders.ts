@@ -124,10 +124,8 @@ export function jobIdOf(owner: Address, c: Hex): Hex {
  * handshake's `1`, which is an off-chain namespace on purpose so a captured
  * login can never be replayed as an order.
  *
- * `Cancel(bytes32 jobId,uint64 issuedAt)` lives in this same domain and has no
- * builder here: the cancel door does not recover that signature locally (the
- * owner is on chain, and the mandatory simulate asks the party that knows), so a
- * second copy of the type string would be a restatement nothing checks.
+ * `Cancel(bytes32 jobId,uint64 issuedAt)` lives in this same domain; see
+ * {@link cancelTypedData}.
  */
 /**
  * Each registry declares its **own** EIP-712 domain name.
@@ -149,6 +147,27 @@ export const EIP712_NAMES = {
 
 const vorqDomain = (chainId: number, verifyingContract: Address) =>
   ({ name: EIP712_NAMES.job, version: "2", chainId, verifyingContract }) as const;
+
+/**
+ * `Cancel(bytes32 jobId,uint64 issuedAt)` — `JobRegistry.CANCEL_TYPEHASH`.
+ *
+ * Recovered here only for a held order (`match/held.ts`), whose owner is in this
+ * node's row and not on chain. A posted job's cancel is still checked by the
+ * contract, in the simulate.
+ */
+export function cancelTypedData(chainId: number, jobRegistry: Address, jobId: Hex, issuedAt: bigint) {
+  return {
+    domain: vorqDomain(chainId, jobRegistry),
+    types: {
+      Cancel: [
+        { name: "jobId", type: "bytes32" },
+        { name: "issuedAt", type: "uint64" },
+      ],
+    },
+    primaryType: "Cancel",
+    message: { jobId, issuedAt },
+  } as const;
+}
 
 /**
  * `Order(bytes32 c,uint32 modelId,uint32 slaSecs,uint128 rateIn,uint128 rateOut,`

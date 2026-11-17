@@ -90,6 +90,8 @@ Quote or submit an order. The same body, sent without and then with a payment, f
 
 **Response `201`**: the job was posted. `task_cid` is the IPFS CID the container was stored under. The job is normally readable at [`GET /v1/jobs/{id}`](#get-v1jobsid) as soon as this returns.
 
+**Response `202`**: `{job_id, task_cid}`, with no `tx_hash`. No live provider's ask clears the order, so the coordinator holds it instead of posting it. It reads as `queued` like any open job and is posted on chain when a provider takes it. See [Held orders](../concepts/matching-and-leases.md#held-orders).
+
 **Errors**
 
 | Status | `code` | Cause |
@@ -132,7 +134,7 @@ Cancel an open job. See [Cancel a job](../guides/cancel-a-job.md).
 
 `signature` is the owner's [`Cancel`](./signed-messages.md#cancel) signature over `(id, issued_at)`, with `issued_at` within ±600 seconds of the coordinator's clock.
 
-Cancelling a job that has already settled or ended succeeds and changes nothing.
+Cancelling a job that has already settled or ended succeeds and changes nothing. Cancelling a [held order](../concepts/matching-and-leases.md#held-orders) answers `200 {job_id}` with no `tx_hash`: nothing was on chain to cancel.
 
 **Errors**
 

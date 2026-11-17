@@ -620,6 +620,8 @@ describe.skipIf(!TEST_DATABASE_URL)("reduceRange", () => {
         as_of_block: 3n,
         gas_fee: GAS_FEE,
         fee: FEE,
+        order_sig: null,
+        auth_sig: null,
       });
       expect(await cursorBlock()).toBe(3n);
     });

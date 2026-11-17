@@ -201,7 +201,11 @@ export async function reconcileJob(
     // that a row nothing will ever move again needs removing, because no replay
     // will delete it: a rebuild rebuilds what the logs say, and these logs are
     // gone.
-    const { rowCount } = await db.query("DELETE FROM jobs WHERE job_id = $1", [key]);
+    // A held order (`match/held.ts`) is not on chain by design, and stays.
+    const { rowCount } = await db.query(
+      "DELETE FROM jobs WHERE job_id = $1 AND auth_sig IS NULL",
+      [key],
+    );
     return { found: false, action: rowCount === 1 ? "deleted" : "absent", block };
   }
 
