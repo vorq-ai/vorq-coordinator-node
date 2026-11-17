@@ -18,7 +18,7 @@ Every key is required:
 
 ```json
 {
-  "chainId": 84532,
+  "chainId": 8453,
   "deployBlock": 12345678,
   "jobRegistry": "0x…",
   "providerRegistry": "0x…",

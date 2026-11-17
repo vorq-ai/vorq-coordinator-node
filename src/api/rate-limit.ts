@@ -10,7 +10,7 @@ export const JOB_RATE_WINDOW_MS = 86_400_000;
  * construction: a restart forgets every count, and two instances each count
  * their own. That is the trade — no table, no read on the request path — and it
  * is the right one for what this bounds, which is how much relay gas one wallet
- * can spend on a testnet, not anything a contract depends on.
+ * can spend, not anything a contract depends on.
  */
 export interface JobLimiter {
   /** Refuses `429` when the wallet has no slot left for the model. Counts nothing. */

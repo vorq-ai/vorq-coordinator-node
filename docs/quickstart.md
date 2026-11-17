@@ -49,7 +49,7 @@ curl -s "$VORQ/evm/chain" | tee chain.json | jq
 
 ```json
 {
-  "chain_id": 84532,
+  "chain_id": 8453,
   "contracts": { "job_registry": "0x…", "provider_registry": "0x…", "ask_registry": "0x…", "usdc": "0x…" },
   "decimals": 6,
   "token_domain": { "name": "…", "version": "…" },
@@ -162,12 +162,12 @@ EOF
   "quote": {
     "cap": "0.000007", "fee_bps": 100, "fee": "0", "gas_fee": "0.002", "amount": "0.002007",
     "authorization": {
-      "domain": { "name": "…", "version": "…", "chainId": 84532, "verifyingContract": "0x…" },
+      "domain": { "name": "…", "version": "…", "chainId": 8453, "verifyingContract": "0x…" },
       "to": "0x…", "value": 2007, "valid_after": 0, "valid_before": 1786086401, "nonce": "0x…"
     }
   },
   "candidates": [{ "provider_id": 7, "box_key": "0x…", "rate_in": "0.0012", "rate_out": "0.005" }],
-  "accepts": [{ "scheme": "eip3009", "network": "eip155:84532" }]
+  "accepts": [{ "scheme": "eip3009", "network": "eip155:8453" }]
 }
 ```
 

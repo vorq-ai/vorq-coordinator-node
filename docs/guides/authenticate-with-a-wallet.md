@@ -12,7 +12,7 @@ curl -s "$VORQ/auth/nonce?address=$ADDR"
 ```
 
 ```json
-{ "nonce": "3f9c0e1d2a4b5c6d7e8f901a2b3c4d5e", "expires_at": 1786000000, "chain_id": 84532 }
+{ "nonce": "3f9c0e1d2a4b5c6d7e8f901a2b3c4d5e", "expires_at": 1786000000, "chain_id": 8453 }
 ```
 
 The nonce is single-use and expires after 300 seconds. Use the returned `chain_id` in the next step.

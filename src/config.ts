@@ -369,8 +369,8 @@ export const NUMERIC = {
   // relay would ever land; above the doors' own 60 s receipt budget it would
   // stop bounding anything the caller can still be waiting for.
   RELAY_QUEUE_TIMEOUT_MS: { fallback: 10_000, min: 1, max: 600_000 },
-  // 0.05 ETH, which is weeks of testnet traffic. A mainnet node sets its own:
-  // the watch reads once a day, so the floor has to hold several days of gas.
+  // 0.05 ETH. Size it to the relayer float: the watch reads once a day, so the
+  // floor has to hold several days of gas.
   RELAYER_LOW_BALANCE_GWEI: { fallback: 50_000_000, min: 1, max: 1_000_000_000_000 },
   // The image's release ordinal (P19). `0` is admissible — an ordinal is a
   // counter and a first release may well be numbered from zero — and the ceiling

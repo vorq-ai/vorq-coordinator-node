@@ -69,7 +69,7 @@ Quote or submit an order. The same body, sent without and then with a payment, f
     "gas_fee": "0.002",
     "amount": "0.011696",
     "authorization": {
-      "domain": { "name": "…", "version": "…", "chainId": 84532, "verifyingContract": "0x…" },
+      "domain": { "name": "…", "version": "…", "chainId": 8453, "verifyingContract": "0x…" },
       "to": "0x…",
       "value": 11696,
       "valid_after": 0,
@@ -78,7 +78,7 @@ Quote or submit an order. The same body, sent without and then with a payment, f
     }
   },
   "candidates": [{ "provider_id": 7, "box_key": "0x…", "rate_in": "0.0015", "rate_out": "0.006" }],
-  "accepts": [{ "scheme": "eip3009", "network": "eip155:84532" }]
+  "accepts": [{ "scheme": "eip3009", "network": "eip155:8453" }]
 }
 ```
 

@@ -70,7 +70,7 @@ import {
 // ---------------------------------------------------------------------------
 
 /**
- * Anvil key **#2**, which `Deploy.s.sol` assigns as curation and which
+ * Anvil key **#2**, which the fork bootstrap passes to `Deploy.s.sol` as curation and which
  * `ProviderRegistry.setAllowlistEntry` is `onlyCuration` against.
  *
  * Not a credential, for the same reason `ANVIL_KEYS` is not: anvil prints this
