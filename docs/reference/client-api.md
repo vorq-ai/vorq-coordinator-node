@@ -45,7 +45,7 @@ Quote or submit an order. The same body, sent without and then with a payment, f
 
 - `c` is the commitment to the sealed container, and `job_id` must equal `keccak256(owner ‖ c)`.
 - `owner` is the order's owner and payer; `signature` is its [`Order`](./signed-messages.md#order) signature.
-- `rate_in` and `rate_out` are USD per million units, as decimal strings; the order signature covers them as `rate × 10^decimals` (see [Conventions](conventions.md#numbers)). `units_in` and `units_out` are the most units the order pays for.
+- `rate_in` and `rate_out` are USD per million units, as decimal strings; the order signature covers them as `rate × 10^decimals` (see [Conventions](./conventions.md#numbers)). `units_in` and `units_out` are the most units the order pays for.
 - `designated` is `0` for an open bid, or the provider id the job is reserved for.
 - `sla_secs` must be an SLA the chain allows, at most `86400`.
 - `expires_at` must be in `(now, now + 86400]`.
