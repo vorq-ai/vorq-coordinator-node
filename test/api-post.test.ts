@@ -359,7 +359,13 @@ interface StoreOptions {
  * to make is a hard failure instead of an empty result set.
  */
 /** A provider whose ask clears every order this file posts. */
-const CLEARING: Candidate = { provider_id: 1n, box_key: Buffer.alloc(32, 9), rate_in: 0n, rate_out: 0n };
+const CLEARING: Candidate = {
+  provider_id: 1n,
+  box_key: Buffer.alloc(32, 9),
+  rate_in: 0n,
+  rate_out: 0n,
+  rate_in_cached: 0n,
+};
 
 function stubDb(options: StoreOptions = {}): Db {
   const models = options.models ?? new Map([[1n, true]]);
@@ -1506,15 +1512,27 @@ describe("POST /v1/jobs — relay", () => {
 
   it("names the clearing candidates on the challenge and on the drifted-quote refusal, advancing the cursor", async () => {
     const candidates: Candidate[] = [
-      { provider_id: 5n, box_key: Buffer.alloc(32, 1), rate_in: 1n, rate_out: 2n },
-      { provider_id: 6n, box_key: Buffer.alloc(32, 2), rate_in: 3n, rate_out: 4n },
+      { provider_id: 5n, box_key: Buffer.alloc(32, 1), rate_in: 1n, rate_out: 2n, rate_in_cached: 1n },
+      { provider_id: 6n, box_key: Buffer.alloc(32, 2), rate_in: 3n, rate_out: 4n, rate_in_cached: 2n },
     ];
     const bumps: unknown[][] = [];
     const { app, setGasFee } = harness({ candidates, bumps }, { gasFee: 5n });
     const t = terms();
     const onTheWire = [
-      { provider_id: 5, box_key: `0x${"01".repeat(32)}`, rate_in: "0.000001", rate_out: "0.000002" },
-      { provider_id: 6, box_key: `0x${"02".repeat(32)}`, rate_in: "0.000003", rate_out: "0.000004" },
+      {
+        provider_id: 5,
+        box_key: `0x${"01".repeat(32)}`,
+        rate_in: "0.000001",
+        rate_out: "0.000002",
+        rate_in_cached: "0.000001",
+      },
+      {
+        provider_id: 6,
+        box_key: `0x${"02".repeat(32)}`,
+        rate_in: "0.000003",
+        rate_out: "0.000004",
+        rate_in_cached: "0.000002",
+      },
     ];
 
     const challenge = await post(app, wire(t, await signOrder(t)));
@@ -1536,7 +1554,7 @@ describe("POST /v1/jobs — relay", () => {
     // Otherwise anyone could sign `designated = X` challenges in a loop and
     // push provider X to the back of every equal-price ranking.
     const candidates: Candidate[] = [
-      { provider_id: 5n, box_key: Buffer.alloc(32, 1), rate_in: 1n, rate_out: 2n },
+      { provider_id: 5n, box_key: Buffer.alloc(32, 1), rate_in: 1n, rate_out: 2n, rate_in_cached: 1n },
     ];
     const bumps: unknown[][] = [];
     const { app } = harness({ candidates, bumps });
@@ -1551,7 +1569,7 @@ describe("POST /v1/jobs — relay", () => {
 
   it("answers a body with no rates with the market: unsigned, candidates only, cursor advanced", async () => {
     const candidates: Candidate[] = [
-      { provider_id: 5n, box_key: Buffer.alloc(32, 1), rate_in: 1n, rate_out: 2n },
+      { provider_id: 5n, box_key: Buffer.alloc(32, 1), rate_in: 1n, rate_out: 2n, rate_in_cached: 1n },
     ];
     const bumps: unknown[][] = [];
     const { app } = harness({ candidates, bumps });
@@ -1560,14 +1578,22 @@ describe("POST /v1/jobs — relay", () => {
 
     expect(probe.statusCode).toBe(402);
     expect(probe.json()).toEqual({
-      candidates: [{ provider_id: 5, box_key: `0x${"01".repeat(32)}`, rate_in: "0.000001", rate_out: "0.000002" }],
+      candidates: [
+        {
+          provider_id: 5,
+          box_key: `0x${"01".repeat(32)}`,
+          rate_in: "0.000001",
+          rate_out: "0.000002",
+          rate_in_cached: "0.000001",
+        },
+      ],
     });
     expect(bumps).toEqual([["5", "3"]]);
   });
 
   it("never advances the cursor for a pinned market probe", async () => {
     const candidates: Candidate[] = [
-      { provider_id: 5n, box_key: Buffer.alloc(32, 1), rate_in: 1n, rate_out: 2n },
+      { provider_id: 5n, box_key: Buffer.alloc(32, 1), rate_in: 1n, rate_out: 2n, rate_in_cached: 1n },
     ];
     const bumps: unknown[][] = [];
     const { app } = harness({ candidates, bumps });
@@ -1617,7 +1643,7 @@ describe("POST /v1/jobs — relay", () => {
 
     it("still answers a probe: it reads the ask book, never the chain", async () => {
       const candidates: Candidate[] = [
-        { provider_id: 5n, box_key: Buffer.alloc(32, 1), rate_in: 1n, rate_out: 2n },
+        { provider_id: 5n, box_key: Buffer.alloc(32, 1), rate_in: 1n, rate_out: 2n, rate_in_cached: 1n },
       ];
       const probe = await post(chainless({ candidates }), {
         model_id: 3, sla_secs: 86400, units_in: 10, units_out: 20,

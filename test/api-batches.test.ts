@@ -266,7 +266,14 @@ describe.skipIf(!TEST_DATABASE_URL)("/v1/batches", () => {
             lines: 3,
             // effectiveCap 2: two of the three lines fit, and the client refuses the batch.
             allocation: [
-              { provider_id: 4, box_key: `0x${"04".repeat(32)}`, rate_in: "0.00001", rate_out: "0.00002", lines: 2 },
+              {
+                provider_id: 4,
+                box_key: `0x${"04".repeat(32)}`,
+                rate_in: "0.00001",
+                rate_out: "0.00002",
+                rate_in_cached: "0.00001",
+                lines: 2,
+              },
             ],
           },
         ],

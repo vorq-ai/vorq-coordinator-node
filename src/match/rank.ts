@@ -1,3 +1,4 @@
+import { CACHED_RATE_SQL } from "../asks/push.js";
 import type { Queryable } from "../db/db.js";
 
 /**
@@ -40,6 +41,8 @@ export interface Candidate {
   /** The published ask (R15). */
   rate_in: bigint;
   rate_out: bigint;
+  /** Listed beside the ask, unsigned: see `CACHED_RATE_SQL`. */
+  rate_in_cached: bigint;
 }
 
 /** `bytes32(0)`: a withdrawn identity stores 32 zero bytes, not NULL. */
@@ -57,10 +60,11 @@ export async function rankProviders(
        SELECT provider_id, count(*) AS n FROM job_leases
         WHERE expires_at > now() GROUP BY provider_id
      )
-     SELECT p.provider_id, p.box_key, a.rate_in, a.rate_out
+     SELECT p.provider_id, p.box_key, a.rate_in, a.rate_out, ${CACHED_RATE_SQL} AS rate_in_cached
        FROM providers p
        JOIN provider_presence pr ON pr.provider_id = p.provider_id AND pr.model_id = $1
        JOIN asks_chain a ON a.provider_id = p.provider_id AND a.model_id = $1 AND a.sla = $2
+       LEFT JOIN quotes_live q ON q.provider_id = a.provider_id
        LEFT JOIN live l ON l.provider_id = p.provider_id
       WHERE p.listed
         AND (p.allow_all_models OR $1 = ANY(p.allowed_models))

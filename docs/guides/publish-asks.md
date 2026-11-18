@@ -14,7 +14,7 @@ You need a [session](./authenticate-with-a-wallet.md). The coordinator relays th
   "provider_id": 7,
   "signed_at": 1786000000,
   "quotes": [
-    { "model_id": 3, "sla": 3600, "rate_in": "0.0015", "rate_out": "0.006" },
+    { "model_id": 3, "sla": 3600, "rate_in": "0.0015", "rate_out": "0.006", "rate_in_cached": "0.00075" },
     { "model_id": 3, "sla": 86400, "rate_in": "0.0009", "rate_out": "0.0036" }
   ]
 }
@@ -23,6 +23,7 @@ You need a [session](./authenticate-with-a-wallet.md). The coordinator relays th
 - At most 64 quotes.
 - A quote with `rate_in` and `rate_out` both `"0"` withdraws the ask for that `(model_id, sla)`.
 - `signed_at` must be newer than your last published snapshot, and at most one hour ahead of the coordinator's clock. Use the current time.
+- `rate_in_cached` is optional and not signed: the cached input rate listed with the ask, at most `rate_in`. Absent lists `rate_in`.
 - Rates are USD per million units, as decimal strings. See [Job lifecycle](../concepts/job-lifecycle.md#what-a-job-costs).
 
 ## 2. Sign it

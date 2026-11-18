@@ -1,3 +1,4 @@
+import { CACHED_RATE_SQL } from "../asks/push.js";
 import type { Queryable } from "../db/db.js";
 import { OPEN } from "../api/routes/jobs.js";
 import { markAssigned } from "./rank.js";
@@ -36,6 +37,7 @@ export interface Allotment {
   box_key: Buffer;
   rate_in: bigint;
   rate_out: bigint;
+  rate_in_cached: bigint;
   lines: bigint;
 }
 
@@ -44,6 +46,7 @@ interface Budget {
   box_key: Buffer;
   rate_in: bigint;
   rate_out: bigint;
+  rate_in_cached: bigint;
   free: bigint;
 }
 
@@ -62,12 +65,13 @@ async function budgets(
        SELECT designated AS provider_id, count(*) AS n FROM jobs
         WHERE ${OPEN} AND designated <> 0 GROUP BY designated
      )
-     SELECT p.provider_id, p.box_key, a.rate_in, a.rate_out,
+     SELECT p.provider_id, p.box_key, a.rate_in, a.rate_out, ${CACHED_RATE_SQL} AS rate_in_cached,
             GREATEST(1, p.reputation * LEAST(p.capacity_requested, p.capacity_ceiling) / 1000)
               - COALESCE(h.n, 0) - COALESCE(o.n, 0) AS free
        FROM providers p
        JOIN provider_presence pr ON pr.provider_id = p.provider_id AND pr.model_id = $1
        JOIN asks_chain a ON a.provider_id = p.provider_id AND a.model_id = $1 AND a.sla = $2
+       LEFT JOIN quotes_live q ON q.provider_id = a.provider_id
        LEFT JOIN held h ON h.provider_id = p.provider_id
        LEFT JOIN pinned o ON o.provider_id = p.provider_id
       WHERE p.listed
@@ -124,6 +128,7 @@ export async function planBatch(
         box_key: budget.box_key,
         rate_in: budget.rate_in,
         rate_out: budget.rate_out,
+        rate_in_cached: budget.rate_in_cached,
         lines,
       });
       spent.set(pid, (spent.get(pid) ?? 0n) + lines);

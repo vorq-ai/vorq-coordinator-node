@@ -77,7 +77,9 @@ Quote or submit an order. The same body, sent without and then with a payment, f
       "nonce": "0x…"
     }
   },
-  "candidates": [{ "provider_id": 7, "box_key": "0x…", "rate_in": "0.0015", "rate_out": "0.006" }],
+  "candidates": [
+    { "provider_id": 7, "box_key": "0x…", "rate_in": "0.0015", "rate_out": "0.006", "rate_in_cached": "0.00075" }
+  ],
   "accepts": [{ "scheme": "eip3009", "network": "eip155:8453" }]
 }
 ```
@@ -85,7 +87,7 @@ Quote or submit an order. The same body, sent without and then with a payment, f
 - `quote.cap` is the escrow ceiling in USD: `(rate_in·units_in + rate_out·units_out) / 10^6`, rounded up to the token's smallest unit and never below one (`"0.000001"` for USDC).
 - `quote.fee` is `cap · fee_bps / 10000`, rounded down to the smallest unit; `quote.gas_fee` is the flat relay charge, read from the `JobRegistry`; `quote.amount` is `cap + fee + gas_fee`.
 - `quote.authorization` is the payment to sign: the token domain, `to` the `JobRegistry`, `value` = `amount` in atomic token units (`amount × 10^decimals`, a JSON integer), `valid_after` `0`, `valid_before` = `expires_at + 1`, `nonce` = `job_id`.
-- `candidates` lists up to `MATCH_CANDIDATES` live providers whose ask clears the order, cheapest first, with the ask's rates; empty when none match. See [Matching and leases](../concepts/matching-and-leases.md).
+- `candidates` lists up to `MATCH_CANDIDATES` live providers whose ask clears the order, cheapest first, with the ask's rates and its listed `rate_in_cached` (at most `rate_in`, not signed); empty when none match. See [Matching and leases](../concepts/matching-and-leases.md).
 - `accepts` names the payment scheme and CAIP-2 network.
 
 **Response `201`**: the job was posted. `task_cid` is the IPFS CID the container was stored under. The job is normally readable at [`GET /v1/jobs/{id}`](#get-v1jobsid) as soon as this returns.
@@ -225,7 +227,7 @@ Create a batch from an uploaded `batch` file.
 `units_in` and `units_out` are the totals over that entry's lines. An entry may add `max_rate_in` and `max_rate_out` (USD per 1M units); only providers asking at or under them are planned. An entry may add `providers`, 1 to 64 distinct provider ids (absent for the whole market); its lines are planned onto those providers alone, cheapest first, and get fewer or none when they cannot take them. Entries may repeat a `model_id` with different `providers`, up to 16 entries. The answer is `402` with, per entry, the providers to seal to, their ask and how many lines each takes:
 
 ```json
-{ "plan": [{ "model_id": 3, "lines": 120, "allocation": [{ "provider_id": 1, "box_key": "0x…", "rate_in": "2.1184", "rate_out": "10.6264", "lines": 120 }] }] }
+{ "plan": [{ "model_id": 3, "lines": 120, "allocation": [{ "provider_id": 1, "box_key": "0x…", "rate_in": "2.1184", "rate_out": "10.6264", "rate_in_cached": "2.1184", "lines": 120 }] }] }
 ```
 
 Each live provider's share is at most its on-chain capacity less what it already holds: claimed jobs and open orders designated to it. Providers are filled cheapest first for the model's unit mix, and equal prices take turns. Nothing is reserved. When the `allocation` lines add up to fewer than `lines`, the network cannot take the batch in that window now; the SDKs refuse it before sealing.

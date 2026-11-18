@@ -363,6 +363,7 @@ const Candidate = Type.Object({
   box_key: HexOut("The key to seal to."),
   rate_in: UsdOut(),
   rate_out: UsdOut(),
+  rate_in_cached: UsdOut("USD per 1M cached input units, at most `rate_in`. Not signed."),
 });
 
 const Quote = Type.Object({
@@ -1025,6 +1026,7 @@ const candidateOf = (candidate: Candidate, decimals: number) => ({
   box_key: candidate.box_key,
   rate_in: formatUsd(candidate.rate_in, decimals),
   rate_out: formatUsd(candidate.rate_out, decimals),
+  rate_in_cached: formatUsd(candidate.rate_in_cached, decimals),
 });
 
 // ---------------------------------------------------------------------------

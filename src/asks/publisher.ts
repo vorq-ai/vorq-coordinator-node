@@ -206,17 +206,19 @@ export async function storeSnapshot(
   snapshotText: string,
   signature: Buffer,
   signedAt: bigint,
+  cachedText: string,
 ): Promise<void> {
   await db.query(
-    `INSERT INTO quotes_live (provider_id, snapshot, signature, signed_at)
-          VALUES ($1, $2::jsonb, $3, $4)
+    `INSERT INTO quotes_live (provider_id, snapshot, signature, signed_at, rates_in_cached)
+          VALUES ($1, $2::jsonb, $3, $4, $5::jsonb)
      ON CONFLICT (provider_id) DO UPDATE
           SET snapshot = EXCLUDED.snapshot,
               signature = EXCLUDED.signature,
               signed_at = EXCLUDED.signed_at,
+              rates_in_cached = EXCLUDED.rates_in_cached,
               received_at = now()
         WHERE quotes_live.signed_at <= EXCLUDED.signed_at`,
-    [providerId, snapshotText, signature, signedAt],
+    [providerId, snapshotText, signature, signedAt, cachedText],
   );
 }
 

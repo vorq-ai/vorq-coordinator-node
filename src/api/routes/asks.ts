@@ -6,7 +6,13 @@ import {
   storeSnapshot,
   type StoredSnapshot,
 } from "../../asks/publisher.js";
-import { askSnapshotTypedData, PushBody, pushOf, SKEW_SECONDS } from "../../asks/push.js";
+import {
+  askSnapshotTypedData,
+  CACHED_RATE_SQL,
+  PushBody,
+  pushOf,
+  SKEW_SECONDS,
+} from "../../asks/push.js";
 import type { Db } from "../../db/db.js";
 import {
   chainGate,
@@ -74,7 +80,8 @@ import { formatUsd } from "../../money.js";
  * stamped with `as_of_block`, and served **straight from `asks_chain`**. The
  * chain is the one quote surface — `quotes_live` is what the node has promised
  * to publish, `asks_chain` is what the chain actually holds, and only the second
- * is something a client may act on.
+ * is something a client may act on. The one value read from `quotes_live` is the
+ * unsigned `rate_in_cached` listed beside each ask, held to the chain's `rate_in`.
  */
 
 /**
@@ -246,7 +253,14 @@ export function askRoutes(app: App, deps: RouteDeps): void {
     // This way the crash window leaves a row `startPublisher` finds.
     // The write is monotonic and lives beside `markPublished`, the other writer
     // of this row's monotonic pair (B-8).
-    await storeSnapshot(deps.db, providerId, push.snapshotText, push.signature, push.signedAt);
+    await storeSnapshot(
+      deps.db,
+      providerId,
+      push.snapshotText,
+      push.signature,
+      push.signedAt,
+      push.cachedText,
+    );
 
     // Deliberately the object that was just stored, not a re-read of it:
     // `push.snapshotText` is `JSON.stringify` of this same object, so the row
@@ -351,6 +365,9 @@ export function askBookRoutes(
                 sla: Int("The window, in seconds."),
                 rate_in: UsdOut("USD per 1M input units."),
                 rate_out: UsdOut("USD per 1M output units."),
+                rate_in_cached: UsdOut(
+                  "USD per 1M cached input units, at most `rate_in`; equals `rate_in` when the provider lists no discount.",
+                ),
               }),
             ),
             as_of_block: AsOfBlock,
@@ -371,15 +388,18 @@ export function askBookRoutes(
       sla: bigint;
       rate_in: bigint;
       rate_out: bigint;
+      rate_in_cached: bigint;
     }>(
       // Listed providers only: an unlisted provider cannot be claimed against,
       // so quoting its prices would be advertising work nobody can take. The
       // rows themselves are never filtered by rate — a withdrawn slot is
       // `rateOut == 0` on chain, which the reducer applies as a DELETE (R35),
       // so `asks_chain` never holds one.
-      `SELECT a.provider_id, a.model_id, a.sla, a.rate_in, a.rate_out
+      `SELECT a.provider_id, a.model_id, a.sla, a.rate_in, a.rate_out,
+              ${CACHED_RATE_SQL} AS rate_in_cached
          FROM asks_chain a
          JOIN providers p ON p.provider_id = a.provider_id
+         LEFT JOIN quotes_live q ON q.provider_id = a.provider_id
         WHERE p.listed AND ($1::bigint IS NULL OR a.model_id = $1)
         ORDER BY a.provider_id, a.model_id, a.sla
         LIMIT $2 OFFSET $3`,
@@ -397,6 +417,7 @@ export function askBookRoutes(
         sla: row.sla,
         rate_in: formatUsd(row.rate_in, decimals),
         rate_out: formatUsd(row.rate_out, decimals),
+        rate_in_cached: formatUsd(row.rate_in_cached, decimals),
       })),
       as_of_block: asOf,
     };

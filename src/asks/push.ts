@@ -84,7 +84,21 @@ export interface Push {
   signedAt: bigint;
   /** The canonical JSON text written to `quotes_live.snapshot`. */
   snapshotText: string;
+  /** The JSON text written to `quotes_live.rates_in_cached`: see {@link CACHED_RATE_SQL}. */
+  cachedText: string;
 }
+
+/**
+ * The cached input rate an `asks_chain a` row lists, read beside
+ * `LEFT JOIN quotes_live q ON q.provider_id = a.provider_id`.
+ *
+ * Unsigned and off chain: the provider pushes it beside each quote and settle
+ * signs the rate actually charged. Held to the chain's `rate_in`, because the
+ * stored snapshot may be newer or older than the one the chain holds; a slot
+ * with no entry lists `rate_in` (no discount).
+ */
+export const CACHED_RATE_SQL =
+  "LEAST(COALESCE((q.rates_in_cached ->> (a.model_id || ':' || a.sla))::numeric, a.rate_in), a.rate_in)";
 
 /** The EIP-712 types, spelled as `SNAPSHOT_TYPEHASH` spells them. */
 export const ASK_SNAPSHOT_TYPES = {
@@ -191,6 +205,12 @@ export const PushBody = Type.Object({
         sla: Uint32({ description: "The window, in seconds." }),
         rate_in: Usd({ description: "USD per 1M input units." }),
         rate_out: Usd({ description: "USD per 1M output units." }),
+        rate_in_cached: Type.Optional(
+          Usd({
+            description:
+              "USD per 1M cached input units, at most `rate_in`. Not signed. Absent lists `rate_in`.",
+          }),
+        ),
       }),
       {
         // R19: the chain skips a snapshot with more than `MAX_QUOTES`, so
@@ -228,15 +248,25 @@ function quotesArray(value: unknown): unknown[] {
  * rates become the atomic rates the snapshot signature covers.
  */
 export function pushOf(body: Static<typeof PushBody>, decimals: number): Push {
+  const cached: Record<string, string> = {};
   const snapshot: Snapshot = {
     provider_id: String(body.snapshot.provider_id),
     signed_at: String(body.snapshot.signed_at),
     quotes: body.snapshot.quotes.map((quote, index) => {
       const at = `snapshot.quotes[${index}]`;
+      const rateIn = usdParam(quote.rate_in, decimals, `${at}.rate_in`, true);
+      const rateInCached =
+        quote.rate_in_cached === undefined
+          ? rateIn
+          : usdParam(quote.rate_in_cached, decimals, `${at}.rate_in_cached`, true);
+      if (rateInCached > rateIn) {
+        throw badRequest(`${at}.rate_in_cached must not exceed ${at}.rate_in`, `${at}.rate_in_cached`);
+      }
+      cached[`${quote.model_id}:${quote.sla}`] = rateInCached.toString();
       return {
         model_id: String(quote.model_id),
         sla: String(quote.sla),
-        rate_in: usdParam(quote.rate_in, decimals, `${at}.rate_in`, true).toString(),
+        rate_in: rateIn.toString(),
         rate_out: usdParam(quote.rate_out, decimals, `${at}.rate_out`, true).toString(),
       };
     }),
@@ -252,6 +282,7 @@ export function pushOf(body: Static<typeof PushBody>, decimals: number): Push {
     // member to a decimal string loses nothing that was signed and gains the one
     // property the publisher needs: reading this text back can round nothing.
     snapshotText: JSON.stringify(snapshot),
+    cachedText: JSON.stringify(cached),
   };
 }
 

@@ -82,6 +82,7 @@ interface WireQuote {
   sla: number;
   rate_in: string;
   rate_out: string;
+  rate_in_cached?: string;
 }
 interface WireSnapshot {
   provider_id: number;
@@ -237,6 +238,7 @@ interface QuoteRow {
   signature: Buffer;
   signed_at: bigint;
   published_signed_at: bigint;
+  rates_in_cached?: string;
 }
 
 interface AskRow {
@@ -246,6 +248,8 @@ interface AskRow {
   rate_in: bigint;
   rate_out: bigint;
   listed?: boolean;
+  /** What the `quotes_live` join answers; the stub defaults it to `rate_in`. */
+  rate_in_cached?: bigint;
 }
 
 interface StoreOptions {
@@ -309,11 +313,12 @@ function stubDb(options: StoreOptions = {}): Store {
     }
 
     if (text.includes("INSERT INTO quotes_live")) {
-      const [providerId, snapshotText, signature, signedAt] = params as [
+      const [providerId, snapshotText, signature, signedAt, cachedText] = params as [
         bigint,
         string,
         Buffer,
         bigint,
+        string,
       ];
       const previous = quotes.get(providerId);
       quotes.set(providerId, {
@@ -322,6 +327,7 @@ function stubDb(options: StoreOptions = {}): Store {
         signature,
         signed_at: signedAt,
         published_signed_at: previous?.published_signed_at ?? 0n,
+        rates_in_cached: cachedText,
       });
       return { rows: [] };
     }
@@ -358,7 +364,11 @@ function stubDb(options: StoreOptions = {}): Store {
         );
       const limit = Number(params[params.length - 2] as number);
       const offset = Number(params[params.length - 1] as number);
-      return { rows: rows.slice(offset, offset + limit) };
+      return {
+        rows: rows
+          .slice(offset, offset + limit)
+          .map((row) => ({ ...row, rate_in_cached: row.rate_in_cached ?? row.rate_in })),
+      };
     }
 
     if (text.includes("FROM cursor")) return { rows: [{ block_number: 9n }] };
@@ -776,6 +786,45 @@ describe("PUT /evm/asks", () => {
     expect(stub.requests).toEqual([]);
   });
 
+  it("stores each quote's unsigned rate_in_cached beside the snapshot, rate_in when absent", async () => {
+    const s = snapshot({
+      quotes: [quote({ rate_in_cached: "0.003" }), quote({ model_id: 2, rate_in: "0.05" })],
+    });
+    const { app, stub, store } = harness(
+      {},
+      { receiptLogs: () => [asksPublishedLog(PROVIDER_ID, BigInt(s.signed_at), s.quotes)] },
+    );
+
+    // Signed over the Ask members alone: the extra field changes no signed byte.
+    expect((await push(app, await body(s))).statusCode).toBe(200);
+    const row = store.quotes.get(PROVIDER_ID);
+    expect(JSON.parse(row?.rates_in_cached ?? "null")).toEqual({ "1:3600": "3000", "2:3600": "50000" });
+    // Neither the stored snapshot nor the calldata carries it.
+    expect(JSON.parse(row?.snapshot ?? "{}")).toEqual(stored(s));
+    const [batch] = relayedBatch(stub);
+    expect(batch[0]).toMatchObject({
+      quotes: [
+        { modelId: 1, sla: 3600, rateIn: 30_000n, rateOut: 90_000n },
+        { modelId: 2, sla: 3600, rateIn: 50_000n, rateOut: 90_000n },
+      ],
+    });
+  });
+
+  it.each([
+    ["above the quote's rate_in", "0.030001"],
+    ["more fraction digits than the token has", "0.0000001"],
+    ["negative", "-0.01"],
+  ])("400s a rate_in_cached %s, naming it", async (_, rate) => {
+    const { app, stub, store } = harness();
+    const quotes = [quote(), quote({ rate_in_cached: rate })];
+    const res = await push(app, { snapshot: snapshot({ quotes }), signature: `0x${"11".repeat(65)}` });
+
+    expect(res.statusCode).toBe(400);
+    expect(res.json().error).toMatchObject({ param: "snapshot.quotes[1].rate_in_cached" });
+    expect(stub.requests).toEqual([]);
+    expect(store.quotes.size).toBe(0);
+  });
+
   it("401s a malformed push with no session: the gate answers before the shape", async () => {
     const { app } = harness();
     const res = await app.inject({ method: "PUT", url: "/evm/asks", payload: { snapshot: 1 } });
@@ -1099,7 +1148,14 @@ describe("startPublisher", () => {
 
 describe("GET /evm/asks", () => {
   const asks: AskRow[] = [
-    { provider_id: 7n, model_id: 1n, sla: 3600n, rate_in: 30000n, rate_out: 90000n },
+    {
+      provider_id: 7n,
+      model_id: 1n,
+      sla: 3600n,
+      rate_in: 30000n,
+      rate_out: 90000n,
+      rate_in_cached: 3000n,
+    },
     { provider_id: 8n, model_id: 2n, sla: 3600n, rate_in: 10000n, rate_out: 20000n },
     {
       provider_id: 9n,
@@ -1124,6 +1180,7 @@ describe("GET /evm/asks", () => {
           sla: 3600,
           rate_in: "0.03",
           rate_out: "0.09",
+          rate_in_cached: "0.003",
         },
         {
           provider_id: 8,
@@ -1131,6 +1188,7 @@ describe("GET /evm/asks", () => {
           sla: 3600,
           rate_in: "0.01",
           rate_out: "0.02",
+          rate_in_cached: "0.01",
         },
       ],
       as_of_block: 9,
@@ -1306,7 +1364,8 @@ describe.skipIf(!TEST_DATABASE_URL)("the ask door against a real Postgres (R54a)
     snapshotText: string,
     signature: Buffer,
     signedAt: bigint,
-  ): Promise<void> => storeSnapshot(db, providerId, snapshotText, signature, signedAt);
+    cachedText = "{}",
+  ): Promise<void> => storeSnapshot(db, providerId, snapshotText, signature, signedAt, cachedText);
 
   it("never lets an older push walk signed_at back (B-8)", async () => {
     // The interleave: the door reads the stored `signed_at`, refuses a stale
@@ -1395,6 +1454,44 @@ describe.skipIf(!TEST_DATABASE_URL)("the ask door against a real Postgres (R54a)
       published_signed_at: BigInt(s.signed_at),
     });
     expect(typeof rows[0]?.published_signed_at).toBe("bigint");
+  });
+
+  it("lists the stored rate_in_cached on GET /evm/asks, held to the chain's rate_in", async () => {
+    for (const table of ["asks_chain", "providers"]) await db.query(`DELETE FROM ${table}`);
+    for (const id of [7, 8]) {
+      await db.query(
+        "INSERT INTO providers (provider_id, operator, box_key, listed) VALUES ($1, $2, $3, true)",
+        [id, Buffer.alloc(20, id), Buffer.alloc(32, id)],
+      );
+    }
+    await db.query(
+      `INSERT INTO asks_chain (provider_id, model_id, sla, rate_in, rate_out)
+       VALUES (7, 1, 3600, 30000, 90000), (7, 2, 3600, 20000, 90000),
+              (7, 3, 3600, 40000, 90000), (8, 1, 3600, 10000, 20000)`,
+    );
+    // Slot 2 was pushed against a higher rate_in than the chain now holds; slot 3
+    // has no entry; provider 8 has no quotes_live row at all.
+    await insert(PROVIDER_ID, JSON.stringify(stored(snapshot())), Buffer.alloc(65), now(),
+      JSON.stringify({ "1:3600": "3000", "2:3600": "25000" }));
+
+    const cfg = testConfig();
+    const app = buildApp({ db, indexer: stubIndexer(), config: cfg, chain: stubChain(cfg).chain });
+    open.push(app);
+    const res = await app.inject({ method: "GET", url: "/evm/asks" });
+
+    expect(res.statusCode).toBe(200);
+    expect(
+      res.json().asks.map((a: { provider_id: number; model_id: number; rate_in_cached: string }) => [
+        a.provider_id,
+        a.model_id,
+        a.rate_in_cached,
+      ]),
+    ).toEqual([
+      [7, 1, "0.003"],
+      [7, 2, "0.02"],
+      [7, 3, "0.04"],
+      [8, 1, "0.01"],
+    ]);
   });
 
   it("never walks published_signed_at back, in the statement rather than in a stub", async () => {

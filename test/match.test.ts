@@ -51,7 +51,7 @@ describe.skipIf(!TEST_DATABASE_URL)("the matcher", () => {
   });
 
   beforeEach(async () => {
-    for (const table of ["job_leases", "provider_presence", "asks_chain", "jobs", "providers"]) {
+    for (const table of ["job_leases", "provider_presence", "asks_chain", "jobs", "providers", "quotes_live"]) {
       await db.query(`DELETE FROM ${table}`);
     }
   });
@@ -569,6 +569,23 @@ describe.skipIf(!TEST_DATABASE_URL)("the matcher", () => {
       firsts.push(...split(plan!).map(([id]) => id!));
     }
     expect(firsts).toEqual([2, 3, 2]);
+  });
+
+  it("lists each candidate's and allotment's cached rate from its pushed quote, rate_in without one", async () => {
+    await seedFleet([1, 2]);
+    await insert("quotes_live", {
+      provider_id: 1,
+      snapshot: "{}",
+      signature: Buffer.alloc(65),
+      signed_at: 1,
+      rates_in_cached: JSON.stringify({ [`${MODEL}:${SLA}`]: "3000" }),
+    });
+    const cached = (rows: { provider_id: bigint; rate_in_cached: bigint }[]) =>
+      new Map(rows.map((row) => [Number(row.provider_id), row.rate_in_cached]));
+
+    expect(cached(await rank())).toEqual(new Map([[1, 3000n], [2, 30000n]]));
+    const [plan] = await planOf([{ lines: 20n }]);
+    expect(cached(plan!)).toEqual(new Map([[1, 3000n], [2, 30000n]]));
   });
 
   it("caps the candidate list at the requested size", async () => {

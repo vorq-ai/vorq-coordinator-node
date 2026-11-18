@@ -122,7 +122,9 @@ A missing session answers `401` before the body is validated.
   "snapshot": {
     "provider_id": 7,
     "signed_at": 1786000000,
-    "quotes": [{ "model_id": 3, "sla": 3600, "rate_in": "0.0015", "rate_out": "0.006" }]
+    "quotes": [
+      { "model_id": 3, "sla": 3600, "rate_in": "0.0015", "rate_out": "0.006", "rate_in_cached": "0.00075" }
+    ]
   },
   "signature": "0x…"
 }
@@ -131,6 +133,7 @@ A missing session answers `401` before the body is validated.
 - `snapshot.provider_id` must be the signer's provider id.
 - `snapshot.signed_at` must be newer than the provider's latest snapshot and at most one hour ahead of the node's clock.
 - Each quote sets the ask for its `(model_id, sla)`; both rates `0` withdraws it.
+- `rate_in_cached` is optional and not signed: the cached input rate listed with the ask, at most `rate_in`. Absent lists `rate_in`.
 - `signature` is the provider wallet's [`AskSnapshot`](./signed-messages.md#asksnapshot) signature.
 
 **Response `200`:** after the publication is mined and confirmed.
@@ -154,6 +157,18 @@ A missing session answers `401` before the body is validated.
 Published asks of listed providers.
 
 **Auth:** public · **Index-backed:** yes · **Paged:** yes
+
+```json
+{
+  "asks": [
+    { "provider_id": 7, "model_id": 3, "sla": 3600, "rate_in": "0.0015", "rate_out": "0.006", "rate_in_cached": "0.00075" }
+  ],
+  "as_of_block": 123456
+}
+```
+
+- `rate_in`, `rate_out` are the on-chain ask.
+- `rate_in_cached` is the provider's listed rate for cached input, at most `rate_in`; equal to `rate_in` when it lists no discount. Settle signs the rate charged.
 
 ## Providers and catalog
 

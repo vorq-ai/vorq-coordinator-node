@@ -188,6 +188,7 @@ const PlanResponse = Type.Object({
           box_key: HexOut("The key to seal this provider's lines to."),
           rate_in: UsdOut(),
           rate_out: UsdOut(),
+          rate_in_cached: UsdOut("USD per 1M cached input units, at most `rate_in`. Not signed."),
           lines: Int(),
         }),
         { description: "Cheapest first. Fewer lines than asked means the network cannot take them now." },
@@ -264,6 +265,7 @@ export function batchCreateRoute(app: App, deps: RouteDeps): void {
               ...a,
               rate_in: formatUsd(a.rate_in, decimals),
               rate_out: formatUsd(a.rate_out, decimals),
+              rate_in_cached: formatUsd(a.rate_in_cached, decimals),
             })),
           })),
         });
