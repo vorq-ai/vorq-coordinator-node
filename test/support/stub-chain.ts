@@ -135,6 +135,11 @@ export interface StubOptions {
    */
   transactionCount?: number;
   /**
+   * A lagging load-balanced endpoint: `eth_getTransactionCount` keeps answering
+   * `transactionCount` and never counts the broadcasts this stub has taken.
+   */
+  staleTransactionCount?: boolean;
+  /**
    * Called **per broadcast**: return an error to refuse that one,
    * `undefined` to let it through (R66). Nothing is recorded in
    * {@link StubChain.broadcasts} for a refused send — the endpoint refused the
@@ -440,7 +445,10 @@ export function stubChain(config: Config, options: StubOptions = {}): StubChain 
           // does on a real endpoint. A constant here cannot express a nonce
           // collision at all: two concurrent relays both read it, both sign the
           // same nonce, and the suite sees two happy 201s (R66).
-          return hexQuantity((options.transactionCount ?? 7) + broadcasts.length);
+          return hexQuantity(
+            (options.transactionCount ?? 7) +
+              (options.staleTransactionCount === true ? 0 : broadcasts.length),
+          );
 
         case "eth_getBlockByNumber": {
           const [tag] = params as [string, boolean];

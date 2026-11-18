@@ -25,6 +25,13 @@ import { causeChain } from "./revert.js";
  */
 export const CHAIN_PARAMS_TTL_MS = 60_000;
 
+/**
+ * How long the relayer trusts its own next-nonce over a lower `pending` count from
+ * the RPC. Long enough to cover a load-balanced endpoint's lag between nodes (a
+ * few blocks), short enough that a dropped transaction's gap heals on its own.
+ */
+export const NONCE_HINT_MS = 30_000;
+
 /** The header fields the indexer reads. */
 export interface Header {
   number: bigint;
@@ -283,6 +290,14 @@ export function makeChain(config: Config, transport?: Transport): Chain {
   // signing, so serialising only the broadcast would leave the collision exactly
   // where it was.
   let tail: Promise<unknown> = Promise.resolve();
+  // The nonce after the last transaction this process broadcast, and when. A
+  // load-balanced RPC can answer the next send's `pending` count from a node that
+  // has not seen the previous broadcast yet; it then signs a nonce already used
+  // and the endpoint refuses it ("nonce too low"), measured on Base mainnet
+  // 2026-11-18 on two concurrent posts. So the send takes the higher of this and
+  // the RPC's count. The hint expires after NONCE_HINT_MS: a transaction the
+  // network dropped would otherwise leave every later send stuck behind its gap.
+  let nextNonce: { value: number; at: number } | undefined;
   // Entries admitted and still owned by a caller. Decremented on every exit —
   // sent, refused or abandoned — so a burst cannot leak the queue shut (R76).
   let depth = 0;
@@ -333,13 +348,24 @@ export function makeChain(config: Config, transport?: Transport): Chain {
       // broadcast or refused. A tail that stalls on the first failure would wedge
       // every later relay, and a rejected tail nobody handles takes the process
       // down.
-      const send = (): Promise<Hex> | undefined => {
+      const send = async (): Promise<Hex | undefined> => {
         // The abandoned entry still takes its turn and sends nothing, so the
         // ordering of everything behind it is untouched and no nonce is spent.
         if (state === "abandoned") return undefined;
         state = "sending";
         clearTimeout(timer);
-        return walletClient.sendTransaction({ account, chain, to, data, gas });
+        const pending = await publicClient.getTransactionCount({
+          address: account.address,
+          blockTag: "pending",
+        });
+        const hint =
+          nextNonce !== undefined && Date.now() - nextNonce.at < NONCE_HINT_MS ? nextNonce.value : 0;
+        const nonce = Math.max(pending, hint);
+        const hash = await walletClient.sendTransaction({ account, chain, to, data, gas, nonce });
+        // Advanced only once the endpoint took the transaction: a send refused
+        // before broadcast spent no nonce.
+        nextNonce = { value: nonce + 1, at: Date.now() };
+        return hash;
       };
       const run = tail.then(send, send);
       tail = run.then(

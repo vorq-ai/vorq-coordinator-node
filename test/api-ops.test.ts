@@ -2,11 +2,12 @@ import { createHash } from "node:crypto";
 import type { FastifyInstance } from "fastify";
 import { decodeFunctionData, encodeErrorResult, parseTransaction, type Hex } from "viem";
 import { privateKeyToAccount, type PrivateKeyAccount } from "viem/accounts";
-import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
+import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import { jobRegistryAbi } from "../src/abi/jobRegistry.js";
 import { providerRegistryAbi } from "../src/abi/providerRegistry.js";
 import { buildApp } from "../src/api/app.js";
 import { MAX_OP_QUEUE_DEPTH } from "../src/api/routes/ops.js";
+import { NONCE_HINT_MS } from "../src/chain/client.js";
 import { MAX_BODY_BYTES } from "../src/api/limits.js";
 import type { Db } from "../src/db/db.js";
 import type { Indexer, IndexerStatus } from "../src/index/indexer.js";
@@ -323,6 +324,7 @@ describe("POST /evm/ops", () => {
     callError?: () => unknown;
     partBytes?: number;
     logger?: Parameters<typeof buildApp>[0]["logger"];
+    staleTransactionCount?: boolean;
   } = {}): Harness {
     // The addresses every signature above is made against, with the pinning
     // service pointed at this file's stub store: a `settle` files its result
@@ -337,6 +339,7 @@ describe("POST /evm/ops", () => {
       simulate: options.simulate === undefined ? undefined : () => options.simulate!(() => stub),
       sendError: options.sendError,
       callError: options.callError,
+      staleTransactionCount: options.staleTransactionCount,
     });
     app = buildApp({
       db: stubDb({
@@ -1086,6 +1089,45 @@ describe("POST /evm/ops", () => {
     // The stub's count starts at 7 and advances per broadcast, exactly as a
     // `pending` count does, so the second relay must have read the first one's.
     expect([...nonces].sort()).toEqual([7, 8]);
+  });
+
+  it("signs distinct nonces when the RPC's pending count lags its own broadcasts", async () => {
+    // A load-balanced endpoint can answer `pending` from a node that has not seen
+    // the previous broadcast: on Base mainnet two concurrent posts read the same
+    // count and the second was refused "nonce too low". The relayer's own
+    // next-nonce covers that lag.
+    const { server, stub } = build({ staleTransactionCount: true });
+
+    const [a, b] = await twoJobs(server);
+
+    expect([a.statusCode, b.statusCode]).toEqual([201, 201]);
+    const nonces = stub.broadcasts.map((raw) => parseTransaction(raw as Hex).nonce);
+    expect([...nonces].sort()).toEqual([7, 8]);
+  });
+
+  it("trusts the RPC's count again once the nonce hint has expired", async () => {
+    // A transaction the network dropped leaves a gap below the hint; expiring it
+    // is what lets the next send fill the gap instead of queueing behind it.
+    const { server, stub } = build({ staleTransactionCount: true });
+    const issuedAt = now();
+    await push(server, {
+      op: "claim",
+      job_id: JOB_ID, issued_at: Number(issuedAt),
+      signature: await signClaim(provider, JOB_ID, issuedAt),
+    });
+    const later = Date.now() + NONCE_HINT_MS + 1;
+    const clock = vi.spyOn(Date, "now").mockReturnValue(later);
+    try {
+      await push(server, {
+        op: "claim",
+        job_id: OTHER_JOB, issued_at: Number(issuedAt),
+        signature: await signClaim(provider, OTHER_JOB, issuedAt),
+      });
+    } finally {
+      clock.mockRestore();
+    }
+    const nonces = stub.broadcasts.map((raw) => parseTransaction(raw as Hex).nonce);
+    expect(nonces).toEqual([7, 7]);
   });
 
   it("serialises two identical settles, so the node does not pay for its own duplicate", async () => {
