@@ -466,6 +466,21 @@ export const jobRegistryAbi = [
             "internalType": "uint32"
           },
           {
+            "name": "promptTok",
+            "type": "uint32",
+            "internalType": "uint32"
+          },
+          {
+            "name": "cachedTok",
+            "type": "uint32",
+            "internalType": "uint32"
+          },
+          {
+            "name": "rateInCached",
+            "type": "uint128",
+            "internalType": "uint128"
+          },
+          {
             "name": "slaSecs",
             "type": "uint32",
             "internalType": "uint32"
@@ -745,9 +760,31 @@ export const jobRegistryAbi = [
         "internalType": "bytes32"
       },
       {
-        "name": "completionTok",
-        "type": "uint32",
-        "internalType": "uint32"
+        "name": "usage",
+        "type": "tuple",
+        "internalType": "struct Usage",
+        "components": [
+          {
+            "name": "promptTok",
+            "type": "uint32",
+            "internalType": "uint32"
+          },
+          {
+            "name": "cachedTok",
+            "type": "uint32",
+            "internalType": "uint32"
+          },
+          {
+            "name": "completionTok",
+            "type": "uint32",
+            "internalType": "uint32"
+          },
+          {
+            "name": "rateInCached",
+            "type": "uint128",
+            "internalType": "uint128"
+          }
+        ]
       },
       {
         "name": "resultCid",
@@ -972,10 +1009,28 @@ export const jobRegistryAbi = [
         "internalType": "bytes32"
       },
       {
+        "name": "promptTok",
+        "type": "uint32",
+        "indexed": false,
+        "internalType": "uint32"
+      },
+      {
+        "name": "cachedTok",
+        "type": "uint32",
+        "indexed": false,
+        "internalType": "uint32"
+      },
+      {
         "name": "completionTok",
         "type": "uint32",
         "indexed": false,
         "internalType": "uint32"
+      },
+      {
+        "name": "rateInCached",
+        "type": "uint128",
+        "indexed": false,
+        "internalType": "uint128"
       },
       {
         "name": "fee",

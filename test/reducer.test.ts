@@ -213,8 +213,16 @@ const posted = (over: PostedOverrides = {}): Emit =>
 const claimed = (jobId: Hex, provider = 3, claimedAt = 1_700_000_000n): Emit =>
   job(encodeLog(jobRegistryAbi, "Claimed", { jobId, provider, claimedAt }));
 
-const settled = (jobId: Hex, completionTok = 1500, fee = FEE, resultCid: Hex = RESULT_CID): Emit =>
-  job(encodeLog(jobRegistryAbi, "Settled", { jobId, completionTok, fee, resultCid }));
+/** The metered input a `Settled` carries besides `completionTok`. */
+const USAGE = { promptTok: 900, cachedTok: 300, rateInCached: 3000n };
+
+const settled = (
+  jobId: Hex,
+  completionTok = 1500,
+  fee = FEE,
+  resultCid: Hex = RESULT_CID,
+  usage: { promptTok: number; cachedTok: number; rateInCached: bigint } = USAGE,
+): Emit => job(encodeLog(jobRegistryAbi, "Settled", { jobId, ...usage, completionTok, fee, resultCid }));
 
 const ended = (jobId: Hex, cause: number): Emit =>
   job(encodeLog(jobRegistryAbi, "Ended", { jobId, cause }));
@@ -588,6 +596,9 @@ describe.skipIf(!TEST_DATABASE_URL)("reduceRange", () => {
         provider_id: bigint;
         claimed_at: bigint;
         completion_tok: bigint;
+        prompt_tok: bigint;
+        cached_tok: bigint;
+        rate_in_cached: bigint;
         task_cid: Buffer;
         result_cid: Buffer;
         posted_block: bigint;
@@ -622,6 +633,9 @@ describe.skipIf(!TEST_DATABASE_URL)("reduceRange", () => {
         fee: FEE,
         order_sig: null,
         auth_sig: null,
+        prompt_tok: 900n,
+        cached_tok: 300n,
+        rate_in_cached: 3000n,
       });
       expect(await cursorBlock()).toBe(3n);
     });
@@ -727,7 +741,7 @@ describe.skipIf(!TEST_DATABASE_URL)("reduceRange", () => {
       ]);
     });
 
-    it("stores the fee Settled carries, and leaves every other ending at 0", async () => {
+    it("stores the fee and usage Settled carries, and leaves every other ending at 0", async () => {
       await reduceRange(
         db,
         stream([
@@ -735,18 +749,38 @@ describe.skipIf(!TEST_DATABASE_URL)("reduceRange", () => {
           posted({ jobId: JOB_B, c: word("c2") }),
           claimed(JOB_A, 3),
           claimed(JOB_B, 3),
-          settled(JOB_A, 1500, UINT128_RATE),
+          settled(JOB_A, 1500, UINT128_RATE, RESULT_CID, {
+            promptTok: 4_294_967_295,
+            cachedTok: 7,
+            rateInCached: UINT128_RATE,
+          }),
           ended(JOB_B, 2),
         ]),
         6n,
       );
 
-      const { rows } = await db.query<{ job_id: Buffer; gas_fee: bigint; fee: bigint }>(
-        "SELECT job_id, gas_fee, fee FROM jobs ORDER BY job_id",
+      const { rows } = await db.query<{
+        job_id: Buffer;
+        gas_fee: bigint;
+        fee: bigint;
+        prompt_tok: bigint;
+        cached_tok: bigint;
+        rate_in_cached: bigint;
+      }>(
+        `SELECT job_id, gas_fee, fee, prompt_tok, cached_tok, rate_in_cached
+           FROM jobs ORDER BY job_id`,
       );
+      // uint32 max and uint128 max survive exactly: BIGINT and NUMERIC, never a double.
       expect(rows).toEqual([
-        { job_id: bytes(JOB_A), gas_fee: GAS_FEE, fee: UINT128_RATE },
-        { job_id: bytes(JOB_B), gas_fee: GAS_FEE, fee: 0n },
+        {
+          job_id: bytes(JOB_A),
+          gas_fee: GAS_FEE,
+          fee: UINT128_RATE,
+          prompt_tok: 4_294_967_295n,
+          cached_tok: 7n,
+          rate_in_cached: UINT128_RATE,
+        },
+        { job_id: bytes(JOB_B), gas_fee: GAS_FEE, fee: 0n, prompt_tok: 0n, cached_tok: 0n, rate_in_cached: 0n },
       ]);
     });
   });

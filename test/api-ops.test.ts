@@ -203,22 +203,29 @@ const CLAIM_TYPES = {
 } as const;
 
 /**
- * `Settle(bytes32 jobId,uint32 completionTok,uint64 issuedAt)`.
+ * `Settle(bytes32 jobId,uint32 promptTok,uint32 cachedTok,uint32 completionTok,uint128 rateInCached,uint64 issuedAt)`.
  *
  * `resultCid` is **not** a member. The claimant hands the result bytes to this
  * node, which pins them and learns the name from the store — a name that does not
- * exist when the op is signed. `submitAndSettle` still takes the CID and its
- * selector is unchanged, so regenerating the ABI carries none of this and the
- * type string is the whole difference. Written out here from the contract source
- * rather than imported, so a wrong member list cannot agree with itself (R32).
+ * exist when the op is signed. `submitAndSettle` takes the CID outside the signed
+ * `Usage` tuple, so regenerating the ABI carries none of this and the type string
+ * is the whole difference. Written out here from the contract source rather than
+ * imported, so a wrong member list cannot agree with itself (R32).
  */
 const SETTLE_TYPES = {
   Settle: [
     { name: "jobId", type: "bytes32" },
+    { name: "promptTok", type: "uint32" },
+    { name: "cachedTok", type: "uint32" },
     { name: "completionTok", type: "uint32" },
+    { name: "rateInCached", type: "uint128" },
     { name: "issuedAt", type: "uint64" },
   ],
 } as const;
+
+/** The metered input every settle below signs, and the same on the wire (6 decimals). */
+const SIGNED_USAGE = { promptTok: 900, cachedTok: 300, rateInCached: 3000n };
+const WIRE_USAGE = { prompt_tok: 900, cached_tok: 300, rate_in_cached: "0.003" };
 
 const REQUEST_CAPACITY_TYPES = {
   RequestCapacity: [
@@ -250,12 +257,13 @@ const signSettle = (
   jobId: Hex,
   completionTok: number,
   issuedAt: bigint,
+  usage: typeof SIGNED_USAGE = SIGNED_USAGE,
 ) =>
   account.signTypedData({
     domain: jobDomain,
     types: SETTLE_TYPES,
     primaryType: "Settle",
-    message: { jobId, completionTok, issuedAt },
+    message: { jobId, ...usage, completionTok, issuedAt },
   });
 
 /** The result bytes a settle carries, base64 in its body. */
@@ -446,6 +454,7 @@ describe("POST /evm/ops", () => {
     const res = await push(server, settleBody({
       op: "settle",
       job_id: JOB_ID,
+        ...WIRE_USAGE,
         completion_tok: 100,
         issued_at: Number(issuedAt),
       signature: await signSettle(provider, JOB_ID, 100, issuedAt),
@@ -465,7 +474,62 @@ describe("POST /evm/ops", () => {
       data: parseTransaction(stub.broadcasts[0] as Hex).data as Hex,
     });
     expect(call.functionName).toBe("submitAndSettle");
+    // The signed usage, as the `Usage` tuple, with `rate_in_cached` in atomic units.
+    expect(call.args?.[1]).toEqual({ promptTok: 900, cachedTok: 300, completionTok: 100, rateInCached: 3000n });
     expect(call.args?.[2]).toBe(`0x${Buffer.from(minted, "utf8").toString("hex")}`);
+  });
+
+  it("403s a settle whose metered input disagrees with its signature", async () => {
+    // Each usage member is signed: a relayer, or anyone holding the body, cannot
+    // move the input count, the cached share or the cached rate the charge uses.
+    for (const tampered of [
+      { prompt_tok: 901 },
+      { cached_tok: 0 },
+      { rate_in_cached: "0.004" },
+    ]) {
+      const { server, stub } = build({ views: { idOf: 0 } });
+      const issuedAt = now();
+      const res = await push(server, settleBody({
+        op: "settle",
+        job_id: JOB_ID,
+        ...WIRE_USAGE,
+        completion_tok: 100,
+        ...tampered,
+        issued_at: Number(issuedAt),
+        signature: await signSettle(provider, JOB_ID, 100, issuedAt),
+      }));
+
+      expect(res.statusCode, JSON.stringify(tampered)).toBe(403);
+      expect(stub.broadcasts).toEqual([]);
+      await server.close();
+    }
+  });
+
+  it("400s a settle whose usage fields are missing or malformed, naming the field", async () => {
+    const issuedAt = now();
+    const signature = await signSettle(provider, JOB_ID, 100, issuedAt);
+    const base = { op: "settle", job_id: JOB_ID, ...WIRE_USAGE, completion_tok: 100, issued_at: Number(issuedAt), signature };
+    const { prompt_tok: _p, ...noPrompt } = base;
+    const { rate_in_cached: _r, ...noRate } = base;
+    const cases: [Record<string, unknown>, string][] = [
+      [noPrompt, "prompt_tok"],
+      [noRate, "rate_in_cached"],
+      [{ ...base, cached_tok: -1 }, "cached_tok"],
+      [{ ...base, prompt_tok: 4_294_967_296 }, "prompt_tok"],
+      // A USD string, never an atomic number.
+      [{ ...base, rate_in_cached: 3000 }, "rate_in_cached"],
+      [{ ...base, rate_in_cached: "1e-3" }, "rate_in_cached"],
+      // Past the payment token's 6 decimals: refused, never rounded.
+      [{ ...base, rate_in_cached: "0.0000001" }, "rate_in_cached"],
+    ];
+    for (const [body, param] of cases) {
+      const { server, stub } = build();
+      const res = await push(server, settleBody(body));
+      expect(res.statusCode, JSON.stringify(body)).toBe(400);
+      expect(res.json().error.param, JSON.stringify(body)).toBe(param);
+      expect(stub.broadcasts).toEqual([]);
+      await server.close();
+    }
   });
 
   it("relays nothing when the result cannot be filed", async () => {
@@ -479,6 +543,7 @@ describe("POST /evm/ops", () => {
       const res = await push(broken.server, settleBody({
         op: "settle",
         job_id: JOB_ID,
+          ...WIRE_USAGE,
           completion_tok: 100,
           issued_at: Number(issuedAt),
         signature: await signSettle(provider, JOB_ID, 100, issuedAt),
@@ -506,6 +571,7 @@ describe("POST /evm/ops", () => {
     const res = await push(server, settleBody({
       op: "settle",
       job_id: JOB_ID,
+        ...WIRE_USAGE,
         completion_tok: 100,
         issued_at: Number(issuedAt),
       signature: await signSettle(provider, JOB_ID, 100, issuedAt),
@@ -528,6 +594,7 @@ describe("POST /evm/ops", () => {
     const res = await push(server, settleBody({
       op: "settle",
       job_id: JOB_ID,
+        ...WIRE_USAGE,
         completion_tok: 200,
         issued_at: Number(issuedAt),
       signature,
@@ -1038,6 +1105,7 @@ describe("POST /evm/ops", () => {
     const body = settleBody({
       op: "settle",
       job_id: JOB_ID,
+      ...WIRE_USAGE,
       completion_tok: 100,
       issued_at: Number(issuedAt),
       signature: await signSettle(provider, JOB_ID, 100, issuedAt),
@@ -1645,6 +1713,7 @@ describe("POST /evm/ops", () => {
     const res = await push(server, settleBody({
       op: "settle",
       job_id: JOB_ID,
+      ...WIRE_USAGE,
       completion_tok: 100,
       issued_at: Number(issuedAt),
       signature: await signSettle(provider, JOB_ID, 100, issuedAt),
@@ -1671,6 +1740,7 @@ describe("POST /evm/ops", () => {
       const res = await push(server, settleBody({
         op: "settle",
         job_id: JOB_ID,
+        ...WIRE_USAGE,
         completion_tok: 100,
         issued_at: Number(issuedAt),
         signature: await signSettle(provider, JOB_ID, 100, issuedAt),
@@ -1700,6 +1770,7 @@ describe("POST /evm/ops", () => {
     const res = await push(server, settleBody({
       op: "settle",
       job_id: JOB_ID,
+      ...WIRE_USAGE,
       completion_tok: 100,
       issued_at: Number(issuedAt),
       signature: await signSettle(provider, JOB_ID, 100, issuedAt),
@@ -1717,6 +1788,7 @@ describe("POST /evm/ops", () => {
     const res = await push(server, settleBody({
       op: "settle",
       job_id: JOB_ID,
+      ...WIRE_USAGE,
       completion_tok: 100,
       issued_at: Number(issuedAt),
       signature: await signSettle(provider, JOB_ID, 100, issuedAt),
@@ -1736,6 +1808,7 @@ describe("POST /evm/ops", () => {
     const res = await push(server, {
       op: "settle",
       job_id: JOB_ID,
+      ...WIRE_USAGE,
       completion_tok: 100,
       issued_at: Number(issuedAt),
       signature: await signSettle(provider, JOB_ID, 100, issuedAt),
@@ -1755,6 +1828,7 @@ describe("POST /evm/ops", () => {
     const res = await push(server, settleBody({
       op: "settle",
       job_id: JOB_ID,
+      ...WIRE_USAGE,
       completion_tok: 100,
       issued_at: Number(issuedAt),
       signature: await signSettle(provider, JOB_ID, 100, issuedAt),
@@ -1808,6 +1882,7 @@ describe("POST /evm/ops", () => {
       return {
         op: "settle",
         job_id: JOB_ID,
+        ...WIRE_USAGE,
         completion_tok: 100,
         issued_at: Number(issuedAt),
         signature: await signSettle(provider, JOB_ID, 100, issuedAt),

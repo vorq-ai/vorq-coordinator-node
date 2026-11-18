@@ -42,7 +42,7 @@ Rates are USD per million units. The order's ceiling, in USD, is
 cap = (rate_in × units_in + rate_out × units_out) / 10^6
 ```
 
-rounded up to the payment token's smallest unit ($0.000001 for USDC), and never below one such unit. The client authorises
+rounded up to the payment token's smallest unit ($0.000001 for USDC), and never below one such unit. `units_in` and `units_out` are ceilings: settlement bills what was used. The client authorises
 
 ```
 amount = cap + fee + gas_fee,   fee = cap × fee_bps / 10000, rounded down to the smallest unit
@@ -54,7 +54,13 @@ amount = cap + fee + gas_fee,   fee = cap × fee_bps / 10000, rounded down to th
 
 - **Post, cancel, expiry.** Nothing moves. The payment authorization is only used at claim.
 - **Claim.** The contract pulls `amount` from the owner.
-- **Settle.** The provider is paid `min(cap, (rate_in × units_in + rate_out × completion_tok) / 10^6)`, the charge rounded up to the smallest unit, where `completion_tok` is the output units it reports, clamped to `units_out`. The protocol fee on that charge and the `gas_fee` go to the treasury. The rest goes back to the owner.
+- **Settle.** The provider is paid
+
+  ```
+  charge = (rate_in × (prompt_tok − cached_tok) + rate_in_cached × cached_tok + rate_out × completion_tok) / 10^6
+  ```
+
+  rounded up to the smallest unit and never below one, at most `cap`. `prompt_tok`, `cached_tok` and `completion_tok` are the counts the provider's backend reported; `rate_in_cached` is the provider's rate for cached prompt tokens. The contract clamps `prompt_tok` to `units_in`, `cached_tok` to `prompt_tok`, `completion_tok` to `units_out` and `rate_in_cached` to `rate_in`. For media jobs `prompt_tok` is `units_in` and `cached_tok` is `0`. The protocol fee on that charge and the `gas_fee` go to the treasury. The rest goes back to the owner.
 - **Fail or reclaim.** The owner gets back `cap` and the fee. The `gas_fee` goes to the treasury, because the gas was already spent.
 
 A provider that fails a job within 300 seconds of claiming it takes no reputation penalty. Later fails, and reclaims, lower its reputation.

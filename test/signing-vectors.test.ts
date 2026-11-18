@@ -286,10 +286,13 @@ describe("api/routes/ops.ts", () => {
     expect(vector("claim").digest).not.toBe(vector("fail").digest);
   });
 
-  it("Settle attests a count and names no result CID", () => {
+  it("Settle attests the metered usage and names no result CID", () => {
     expect(OP_TYPES.Settle.Settle.map((m) => m.name)).toEqual([
       "jobId",
+      "promptTok",
+      "cachedTok",
       "completionTok",
+      "rateInCached",
       "issuedAt",
     ]);
     for (const table of Object.values(OP_TYPES)) {

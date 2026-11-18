@@ -125,9 +125,9 @@ describe.skipIf(!TEST_DATABASE_URL)("frozen bodies and the page byte budget", ()
       `INSERT INTO jobs (job_id, owner, c, model_id, sla_secs, designated, rate_in, rate_out,
                          units_in, units_out, expires_at, state, ended_because, provider_id,
                          claimed_at, completion_tok, task_cid, result_cid, posted_block, as_of_block,
-                         gas_fee, fee)
+                         gas_fee, fee, prompt_tok, cached_tok, rate_in_cached)
        VALUES ($1,$2,$3,7,3600,0,'30000','90000',1000,2000,4102444800,2,1,9,
-               1700000000,4294967295,$4,$5,11,12,'30000','2500')`,
+               1700000000,4294967295,$4,$5,11,12,'30000','2500',1000,250,'15000')`,
       [
         bytes(0x04),
         bytes(0xaa, 20),
@@ -160,7 +160,10 @@ describe.skipIf(!TEST_DATABASE_URL)("frozen bodies and the page byte budget", ()
           ended_because: 1,
           provider_id: 9,
           claimed_at: 1700000000,
+          prompt_tok: 1000,
+          cached_tok: 250,
           completion_tok: 4294967295,
+          rate_in_cached: "0.015",
           task_cid: "bafkreitaskcid",
           result_cid: "bafkreiresultcid",
           posted_block: 11,

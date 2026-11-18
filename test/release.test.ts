@@ -118,6 +118,9 @@ const jobView = (over: Partial<JobView>): JobView =>
     unitsIn: 0,
     unitsOut: 0,
     completionTok: 0,
+    promptTok: 0,
+    cachedTok: 0,
+    rateInCached: 0n,
     slaSecs: 3600,
     // Far past the epoch used below, so nothing is orphaned unless a test says so.
     expiresAt: BigInt(NOW_SECONDS + 86_400),

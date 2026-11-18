@@ -1290,18 +1290,21 @@ export const CLAIM_TYPES = {
 } as const;
 
 /**
- * `Settle(bytes32 jobId,uint32 completionTok,uint64 issuedAt)`.
+ * `Settle(bytes32 jobId,uint32 promptTok,uint32 cachedTok,uint32 completionTok,uint128 rateInCached,uint64 issuedAt)`.
  *
  * `resultCid` is not a member. The provider hands the result bytes to the node,
  * which pins them and learns the name from the store — a name that does not exist
- * when the op is signed. `submitAndSettle` still takes the CID and its selector
- * is unchanged, so the ABI carries none of this and the type string is the whole
+ * when the op is signed. `submitAndSettle` takes the CID outside the signed
+ * `Usage` tuple, so the ABI carries none of this and the type string is the whole
  * difference.
  */
 export const SETTLE_TYPES = {
   Settle: [
     { name: "jobId", type: "bytes32" },
+    { name: "promptTok", type: "uint32" },
+    { name: "cachedTok", type: "uint32" },
     { name: "completionTok", type: "uint32" },
+    { name: "rateInCached", type: "uint128" },
     { name: "issuedAt", type: "uint64" },
   ],
 } as const;

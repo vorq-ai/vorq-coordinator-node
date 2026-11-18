@@ -128,7 +128,10 @@ describe.skipIf(!TEST_DATABASE_URL)("write-through from a post's receipt", () =>
     const skipped = eventLog(JOB_REGISTRY, "PostSkipped", { index: 1n, reason: "0x12345678" });
     const settled = eventLog(JOB_REGISTRY, "Settled", {
       jobId: JOB_A,
+      promptTok: 1,
+      cachedTok: 0,
       completionTok: 1,
+      rateInCached: 0n,
       fee: 2_500n,
       resultCid: stringToHex("bafkreiresult"),
     });

@@ -15,6 +15,7 @@ import {
   RECONCILABLE_REVERTS,
   reconcileJob,
   repairOnRefusal,
+  settledCharge,
   storedState,
   tryReconcileJob,
 } from "../src/index/reconcile.js";
@@ -61,6 +62,9 @@ function jobView(overrides: Record<string, unknown> = {}) {
     unitsIn: 10,
     unitsOut: 20,
     completionTok: 0,
+    promptTok: 0,
+    cachedTok: 0,
+    rateInCached: 0n,
     slaSecs: 3600,
     expiresAt: 1_900_000_000n,
     claimedAt: 0n,
@@ -130,7 +134,15 @@ function postedLogOf(view: ReturnType<typeof jobView>, blockNumber: bigint): Log
 function settledLogOf(view: ReturnType<typeof jobView>, fee: bigint, blockNumber: bigint): Log {
   return registryLog(
     "Settled",
-    { jobId: view.jobId, completionTok: view.completionTok, fee, resultCid: view.resultCid },
+    {
+      jobId: view.jobId,
+      promptTok: view.promptTok,
+      cachedTok: view.cachedTok,
+      completionTok: view.completionTok,
+      rateInCached: view.rateInCached,
+      fee,
+      resultCid: view.resultCid,
+    },
     blockNumber,
   );
 }
@@ -169,6 +181,39 @@ function exceptBlocks(row: Record<string, unknown>): Record<string, unknown> {
   const { posted_block: _posted, as_of_block: _asOf, ...rest } = row;
   return rest;
 }
+
+describe("settledCharge — the metered charge, as `_meter` prices it", () => {
+  const terms = { rateIn: 1_000_000n, rateOut: 3_000_000n, unitsIn: 1000, unitsOut: 2000 };
+
+  it("bills uncached prompt at rate_in, cached at rate_in_cached, completion at rate_out", () => {
+    // (1e6·(900−300) + 250000·300 + 3e6·1500) / 1e6 = 600 + 75 + 4500.
+    expect(
+      settledCharge({ ...terms, promptTok: 900, cachedTok: 300, rateInCached: 250_000n, completionTok: 1500 }),
+    ).toBe(5175n);
+  });
+
+  it("rounds up, and floors at one atomic unit", () => {
+    // 1·1 + 0 + 0 = 1 raw → ceil(1/1e6) = 1.
+    expect(
+      settledCharge({ rateIn: 1n, rateOut: 0n, unitsIn: 10, unitsOut: 10, promptTok: 1, cachedTok: 0, rateInCached: 0n, completionTok: 0 }),
+    ).toBe(1n);
+    // Nothing metered at all still charges the floor, as the cap does.
+    expect(
+      settledCharge({ ...terms, promptTok: 0, cachedTok: 0, rateInCached: 0n, completionTok: 0 }),
+    ).toBe(1n);
+    // 1e6·1 + 3e6·1 + 1 raw over the scale → rounds up to 5.
+    expect(
+      settledCharge({ ...terms, rateOut: 3_000_001n, promptTok: 1, cachedTok: 0, rateInCached: 0n, completionTok: 1 }),
+    ).toBe(5n);
+  });
+
+  it("never exceeds the cap", () => {
+    // The view's counts are already clamped; at the ceiling the charge is the cap.
+    expect(
+      settledCharge({ ...terms, promptTok: 1000, cachedTok: 0, rateInCached: 0n, completionTok: 2000 }),
+    ).toBe(1000n + 6000n);
+  });
+});
 
 describe("storedState — the openness mapping (R3, R43)", () => {
   it("maps getJob's expired-but-open pair back to 0/0", () => {
@@ -288,6 +333,7 @@ describe("reconcileJob — shape, over the stub chain", () => {
       [
         "as_of_block",
         "c",
+        "cached_tok",
         "claimed_at",
         "completion_tok",
         "designated",
@@ -298,8 +344,10 @@ describe("reconcileJob — shape, over the stub chain", () => {
         "job_id",
         "model_id",
         "owner",
+        "prompt_tok",
         "provider_id",
         "rate_in",
+        "rate_in_cached",
         "rate_out",
         "result_cid",
         "sla_secs",
@@ -309,7 +357,7 @@ describe("reconcileJob — shape, over the stub chain", () => {
         "units_out",
       ].sort(),
     );
-    // One bind per column, and every one supplied: a `$22` or a missing `$7` is
+    // One bind per column, and every one supplied: a `$25` or a missing `$7` is
     // a statement Postgres refuses, and the DB half would be the only place that
     // showed up.
     expect(db.statements[0].params).toHaveLength(columns.length);
@@ -350,6 +398,9 @@ describe("reconcileJob — shape, over the stub chain", () => {
       endedBecause: 1,
       rateIn: 100_000_000n,
       rateOut: 200_000_000n,
+      promptTok: 10,
+      cachedTok: 4,
+      rateInCached: 50_000_000n,
       completionTok: 12,
     });
     const stub = stubChain(config, { latestBlock: 4242n, views: { getJob: settled, feeBps: 250 } });
@@ -362,8 +413,8 @@ describe("reconcileJob — shape, over the stub chain", () => {
     for (const call of calls) {
       expect((call.params as [unknown, string])[1]).toBe(`0x${(4242n).toString(16)}`);
     }
-    // 100·10 + 200·12 = 3400 atomic charged, and 2.5% of it.
-    expect(db.statements[0].params[20]).toBe("85");
+    // 100·(10−4) + 50·4 + 200·12 = 3200 atomic charged, and 2.5% of it.
+    expect(db.statements[0].params[20]).toBe("80");
 
     for (const state of [0, 1, 3]) {
       const other = stubChain(config, { views: { getJob: jobView({ state }) } });
@@ -550,6 +601,9 @@ describe.skipIf(!TEST_DATABASE_URL)("reconcileJob — against Postgres", () => {
           endedBecause: 1,
           providerId: 4,
           claimedAt: 1_800_000_500n,
+          promptTok: 9,
+          cachedTok: 3,
+          rateInCached: 500n,
           completionTok: 12,
           resultCid: "0x646566",
         }),
@@ -566,6 +620,9 @@ describe.skipIf(!TEST_DATABASE_URL)("reconcileJob — against Postgres", () => {
       ended_because: 1,
       provider_id: 4n,
       claimed_at: 1_800_000_500n,
+      prompt_tok: 9n,
+      cached_tok: 3n,
+      rate_in_cached: 500n,
       completion_tok: 12n,
       as_of_block: 900n,
       // Untouched by reconcile: the reducer owns it, and Plan 3's orphan filter
@@ -724,6 +781,7 @@ describe.skipIf(!TEST_DATABASE_URL)("reconcileJob — against Postgres", () => {
       claimedAt: 1_800_000_500n,
       rateIn: 100_000_000n,
       rateOut: 200_000_000n,
+      promptTok: 10,
       completionTok: 12,
       resultCid: "0x646566",
     });

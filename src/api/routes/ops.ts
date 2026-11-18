@@ -40,7 +40,9 @@ import {
   SafeUint,
   Sig65,
   Uint32,
+  Usd,
 } from "../schemas/common.js";
+import { usdParam } from "../usd.js";
 import { attachFile, findUpload } from "./files.js";
 
 /**
@@ -78,7 +80,8 @@ import { attachFile, findUpload } from "./files.js";
  *
  * Every body on this door is flat JSON. `result_cid` as the caller's own choice
  * of name is gone: a `settle` carries the op's fields — `op`, `job_id`,
- * `completion_tok`, `issued_at`, `signature` — plus exactly one of
+ * `prompt_tok`, `cached_tok`, `completion_tok`, `rate_in_cached`, `issued_at`,
+ * `signature` — plus exactly one of
  *
  *   * `result` — the sealed bytes, base64, which this node files itself;
  *   * `result_cid` — the cid of a `POST /v1/files` upload with `purpose=result`
@@ -261,7 +264,10 @@ export const OP_TYPES = {
   Settle: {
     Settle: [
       { name: "jobId", type: "bytes32" },
+      { name: "promptTok", type: "uint32" },
+      { name: "cachedTok", type: "uint32" },
       { name: "completionTok", type: "uint32" },
+      { name: "rateInCached", type: "uint128" },
       { name: "issuedAt", type: "uint64" },
     ],
   },
@@ -342,7 +348,13 @@ const ClaimOp = Type.Object({ op: Type.Literal("claim"), job_id: JobId, issued_a
 const SettleOp = Type.Object({
   op: Type.Literal("settle"),
   job_id: JobId,
+  // The backend's own counts, never estimates. The chain clamps each:
+  // prompt_tok to units_in, cached_tok to prompt_tok, completion_tok to
+  // units_out, rate_in_cached to rate_in.
+  prompt_tok: Uint32({ description: "The backend's prompt tokens (media: the order's units_in)." }),
+  cached_tok: Uint32({ description: "The cached share of prompt_tok; 0 when the backend reports none." }),
   completion_tok: Uint32({ description: "The delivered output units." }),
+  rate_in_cached: Usd({ description: "USD per 1M cached prompt tokens; at most the job's rate_in." }),
   // Bounded at the width a name this node put on chain can have: a longer one
   // is not a cid any upload of this node's carries, so it can only miss.
   result: Type.Optional(
@@ -416,7 +428,7 @@ const SimulateResult = Type.Union([
  *
  * The type strings are the contracts' typehash strings, member for member:
  * `Claim(bytes32 jobId,uint64 issuedAt)`,
- * `Settle(bytes32 jobId,uint32 completionTok,uint64 issuedAt)`,
+ * `Settle(bytes32 jobId,uint32 promptTok,uint32 cachedTok,uint32 completionTok,uint128 rateInCached,uint64 issuedAt)`,
  * `Fail(bytes32 jobId,uint64 issuedAt)`,
  * `SetIdentity(bytes32 boxKey,bytes evidence,uint64 issuedAt)`,
  * `RequestCapacity(uint32 n,uint64 issuedAt)`. A member renamed or reordered
@@ -425,16 +437,18 @@ const SimulateResult = Type.Union([
  * source, not from memory.
  *
  * **`resultCid` is not a member of `Settle` any more**, and the ABI cannot tell
- * you that: `submitAndSettle` still takes the CID and its selector is unchanged,
- * so regenerating the ABI carries none of this. The provider hands the result to
+ * you that: `submitAndSettle` takes the CID outside the signed `Usage` tuple, so
+ * regenerating the ABI carries none of this. The provider hands the result to
  * this node, which pins it and learns the name from the storage service — a name
  * that does not exist when the op is signed. The consequence is stated rather
  * than glossed: unlike the task side there is **no commitment standing behind the
  * result**, no `c` to check the bytes against, and this door invents none. The
- * settle signature attests the delivered count and nothing about which bytes
+ * settle signature attests the metered usage and nothing about which bytes
  * produced it.
+ *
+ * `decimals` converts `rate_in_cached` from USD to the atomic rate it is signed as.
  */
-function parseOp(body: OpBody): ParsedOp {
+function parseOp(body: OpBody, decimals: number): ParsedOp {
   const issuedAt = BigInt(body.issued_at);
 
   switch (body.op) {
@@ -461,14 +475,17 @@ function parseOp(body: OpBody): ParsedOp {
 
     case "settle": {
       const hex = body.job_id.toLowerCase() as Hex;
+      const promptTok = BigInt(body.prompt_tok);
+      const cachedTok = BigInt(body.cached_tok);
       const completionTok = BigInt(body.completion_tok);
+      const rateInCached = usdParam(body.rate_in_cached, decimals, "rate_in_cached", true);
       const { toPin, resultCid } = parseResult(body);
       return {
         name: body.op,
         registry: "job",
         primaryType: "Settle",
         types: OP_TYPES.Settle,
-        message: { jobId: hex, completionTok, issuedAt },
+        message: { jobId: hex, promptTok, cachedTok, completionTok, rateInCached, issuedAt },
         issuedAt,
         jobId: hex,
         toPin,
@@ -483,7 +500,18 @@ function parseOp(body: OpBody): ParsedOp {
           return encodeFunctionData({
             abi: jobRegistryAbi,
             functionName: "submitAndSettle",
-            args: [hex, Number(completionTok), cidHex, issuedAt, signature],
+            args: [
+              hex,
+              {
+                promptTok: Number(promptTok),
+                cachedTok: Number(cachedTok),
+                completionTok: Number(completionTok),
+                rateInCached,
+              },
+              cidHex,
+              issuedAt,
+              signature,
+            ],
           });
         },
       };
@@ -610,7 +638,7 @@ export function opsRoutes(app: App, deps: RouteDeps): void {
     const chain = requireChain(deps.chain);
     const session = sessionOf(request);
     const { signature } = request.body;
-    const op = parseOp(request.body);
+    const op = parseOp(request.body, deps.config.addresses.decimals);
 
     const registryAddress =
       op.registry === "job"

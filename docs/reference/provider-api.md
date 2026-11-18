@@ -29,7 +29,7 @@ The job book, filtered. With `free=N` it is also the provider's poll.
 
 `state=Cancelled` matches every ended job: cancelled, expired, failed or reclaimed. `provider` matches the jobs claimed by that provider. `min_rate_in` and `min_rate_out` keep jobs at or above those rates; `posted_before` keeps jobs posted at or before that block. The default `order` is `oldest`, by posting block.
 
-`state` and `ended_because` are as in [Job lifecycle](../concepts/job-lifecycle.md#states); an open job past `expires_at` reads as `3` / `5`. `provider_id`, `claimed_at` and `completion_tok` are `"0"` until claimed or settled. `gas_fee` is the relay gas fee in USD that the `JobRegistry` fixed for the job when it was posted; the treasury keeps it when a claimed job settles, fails or is reclaimed. `fee` is the protocol fee in USD that settlement took on top of the charge, `"0"` for a job that did not settle.
+`state` and `ended_because` are as in [Job lifecycle](../concepts/job-lifecycle.md#states); an open job past `expires_at` reads as `3` / `5`. `provider_id`, `claimed_at`, `prompt_tok`, `cached_tok`, `completion_tok` and `rate_in_cached` are `"0"` until claimed or settled; the four usage fields are what settlement billed, after the contract's clamps. `gas_fee` is the relay gas fee in USD that the `JobRegistry` fixed for the job when it was posted; the treasury keeps it when a claimed job settles, fails or is reclaimed. `fee` is the protocol fee in USD that settlement took on top of the charge, `"0"` for a job that did not settle.
 
 **Provider poll.** `free=N` needs a provider session, `state=Open` and a `model` in the catalog. The node records the provider as live for that model with `N` free slots, leases it up to `N` of the oldest matching jobs it may claim (open bids, or designated to it) for `MATCH_LEASE_MS`, counting leases it already holds, and returns only the jobs it holds. [Held orders](../concepts/matching-and-leases.md#held-orders) among them are posted on chain before the poll answers. See [Matching and leases](../concepts/matching-and-leases.md). Without `free`, the session is ignored.
 
@@ -80,7 +80,7 @@ A missing session answers `401` before the body is validated.
 { "op": "claim", "job_id": "0x…", "issued_at": 1786000000, "signature": "0x…" }
 ```
 
-- `settle` takes exactly one of `result` (the sealed result, base64, non-empty) and `result_cid` (the `vorq.cid` of a `result` upload by this session's address).
+- `settle` takes `prompt_tok`, `cached_tok` and `completion_tok` (integers) and `rate_in_cached` (USD per 1M, a decimal string), all signed, and exactly one of `result` (the sealed result, base64, non-empty) and `result_cid` (the `vorq.cid` of a `result` upload by this session's address).
 - `claim`, `settle` and `fail` need `issued_at` within ±600 seconds of the node's clock. `set_identity` and `request_capacity` need `issued_at` greater than the last accepted one for that op and at most one hour ahead.
 
 **Response `201`:** after the receipt. On `settle` only, `result_cid` is the IPFS CID the result was stored under.

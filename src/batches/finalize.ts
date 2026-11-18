@@ -65,8 +65,11 @@ interface LineRow {
   state: number | null;
   ended_because: number | null;
   provider_id: string | null;
+  prompt_tok: string | null;
+  cached_tok: string | null;
   completion_tok: string | null;
   rate_in: bigint | null;
+  rate_in_cached: bigint | null;
   rate_out: bigint | null;
   gas_fee: bigint | null;
   fee: bigint | null;
@@ -117,8 +120,9 @@ export async function finalizeBatch(
   const now = nowSeconds();
   const { rows: lines } = await deps.db.query<LineRow>(
     `SELECT bl.line_no, bl.job_id, bl.skip_reason,
-            j.state, j.ended_because, j.provider_id, j.completion_tok,
-            j.rate_in, j.rate_out, j.gas_fee, j.fee,
+            j.state, j.ended_because, j.provider_id,
+            j.prompt_tok, j.cached_tok, j.completion_tok,
+            j.rate_in, j.rate_in_cached, j.rate_out, j.gas_fee, j.fee,
             j.result_cid, j.expires_at
        FROM batch_lines bl LEFT JOIN jobs j ON j.job_id = bl.job_id
       WHERE bl.batch_id = $1
@@ -157,9 +161,12 @@ export async function finalizeBatch(
             result_cid: (line.result_cid ?? Buffer.alloc(0)).toString("utf8"),
             provider: Number(line.provider_id ?? 0),
             rate_in: formatUsd(line.rate_in ?? 0n, deps.config.addresses.decimals),
+            rate_in_cached: formatUsd(line.rate_in_cached ?? 0n, deps.config.addresses.decimals),
             rate_out: formatUsd(line.rate_out ?? 0n, deps.config.addresses.decimals),
             gas_fee: formatUsd(line.gas_fee ?? 0n, deps.config.addresses.decimals),
             fee: formatUsd(line.fee ?? 0n, deps.config.addresses.decimals),
+            prompt_tok: Number(line.prompt_tok ?? 0),
+            cached_tok: Number(line.cached_tok ?? 0),
             completion_tok: Number(line.completion_tok ?? 0),
           },
         }),

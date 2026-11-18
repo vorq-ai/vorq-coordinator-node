@@ -387,7 +387,10 @@ const FAIL_TYPES = {
 const SETTLE_TYPES = {
   Settle: [
     { name: "jobId", type: "bytes32" },
+    { name: "promptTok", type: "uint32" },
+    { name: "cachedTok", type: "uint32" },
     { name: "completionTok", type: "uint32" },
+    { name: "rateInCached", type: "uint128" },
     { name: "issuedAt", type: "uint64" },
   ],
 } as const;
@@ -427,19 +430,19 @@ export async function resolveOutstandingClaims(): Promise<void> {
       if ((await jobStateOf(addresses, jobId)) !== 1) continue;
       const provider = providerAccount();
       const issuedAt = nowSecondsBigInt();
-      const completionTok = 1;
+      const usage = { promptTok: 1, cachedTok: 0, completionTok: 1, rateInCached: 0n };
       const signature = await provider.signTypedData({
         domain: opDomain(addresses.chainId, addresses.jobRegistry),
         types: SETTLE_TYPES,
         primaryType: "Settle",
-        message: { jobId, completionTok, issuedAt },
+        message: { jobId, ...usage, issuedAt },
       });
       const wallet = relayerWallet(addresses.chainId);
       const hash = await wallet.writeContract({
         address: addresses.jobRegistry,
         abi: jobRegistryAbi,
         functionName: "submitAndSettle",
-        args: [jobId, completionTok, toHex(Buffer.from(`cleanup-${jobId}`, "utf8")), issuedAt, signature],
+        args: [jobId, usage, toHex(Buffer.from(`cleanup-${jobId}`, "utf8")), issuedAt, signature],
         chain: devnetChain(addresses.chainId),
         account: wallet.account,
       });

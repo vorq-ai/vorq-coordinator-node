@@ -99,20 +99,36 @@ export function storedState(view: Pick<JobView, "state" | "endedBecause">): {
 }
 
 /**
- * What settlement charged: `_atomicCharge` over the settled count, at most the
- * cap. The count was clamped to `unitsOut` before it was stored, so the cap
+ * What settlement charged: `_meter` over the stored (already clamped) usage,
+ * `max(1, ceil((rateIn·(promptTok−cachedTok) + rateInCached·cachedTok +
+ * rateOut·completionTok) / 1e6))`, at most the cap. The clamps mean the cap
  * never bites; the `min` restates the contract rather than relying on that.
+ *
+ * Exported for its own test.
  */
-function settledCharge(
-  view: Pick<JobView, "rateIn" | "unitsIn" | "rateOut" | "unitsOut" | "completionTok">,
+export function settledCharge(
+  view: Pick<
+    JobView,
+    | "rateIn"
+    | "unitsIn"
+    | "rateOut"
+    | "unitsOut"
+    | "promptTok"
+    | "cachedTok"
+    | "completionTok"
+    | "rateInCached"
+  >,
 ): bigint {
-  const atomic = (unitsOut: number): bigint => {
-    const raw = view.rateIn * BigInt(view.unitsIn) + view.rateOut * BigInt(unitsOut);
+  const scaled = (raw: bigint): bigint => {
     const ceiling = (raw + RATE_SCALE - 1n) / RATE_SCALE;
     return ceiling === 0n ? 1n : ceiling;
   };
-  const metered = atomic(view.completionTok);
-  const cap = atomic(view.unitsOut);
+  const metered = scaled(
+    view.rateIn * BigInt(view.promptTok - view.cachedTok) +
+      view.rateInCached * BigInt(view.cachedTok) +
+      view.rateOut * BigInt(view.completionTok),
+  );
+  const cap = scaled(view.rateIn * BigInt(view.unitsIn) + view.rateOut * BigInt(view.unitsOut));
   return metered > cap ? cap : metered;
 }
 
@@ -245,14 +261,17 @@ export async function reconcileJob(
        job_id, owner, c, model_id, sla_secs, designated,
        rate_in, rate_out, units_in, units_out, expires_at,
        state, ended_because, provider_id, claimed_at, completion_tok,
-       task_cid, result_cid, as_of_block, gas_fee, fee
+       task_cid, result_cid, as_of_block, gas_fee, fee,
+       prompt_tok, cached_tok, rate_in_cached
      )
      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11,
-             $12, $13, $14, $15, $16, $17, $18, $19, $20, $21)
+             $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24)
      ON CONFLICT (job_id) DO UPDATE SET
        state = EXCLUDED.state, ended_because = EXCLUDED.ended_because,
        provider_id = EXCLUDED.provider_id, claimed_at = EXCLUDED.claimed_at,
        completion_tok = EXCLUDED.completion_tok, result_cid = EXCLUDED.result_cid,
+       prompt_tok = EXCLUDED.prompt_tok, cached_tok = EXCLUDED.cached_tok,
+       rate_in_cached = EXCLUDED.rate_in_cached,
        fee = EXCLUDED.fee,
        model_id = EXCLUDED.model_id, c = EXCLUDED.c,
        as_of_block = GREATEST(jobs.as_of_block, EXCLUDED.as_of_block)
@@ -281,6 +300,9 @@ export async function reconcileJob(
       block, // $19 as_of_block
       view.gasFee.toString(), // $20 gas_fee
       fee.toString(), // $21 fee
+      view.promptTok, // $22 prompt_tok
+      view.cachedTok, // $23 cached_tok
+      view.rateInCached.toString(), // $24 rate_in_cached
     ],
   );
 

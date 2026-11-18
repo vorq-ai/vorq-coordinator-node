@@ -118,7 +118,7 @@ The client view of one job, by `job_id`.
 
 **Auth:** public · **Index-backed:** yes
 
-`status` is `queued`, `in_progress`, `completed`, `failed` or `cancelled`; see [Job lifecycle](../concepts/job-lifecycle.md#states). `in_progress_at` is the claim time, `null` before a claim. `result_cid` is the sealed result's IPFS CID once settled, else `null`. `model` is `null` if the catalog does not know the model. `vorq.gas_fee` is the relay gas fee in USD fixed for the job when it was posted: paid once the job is claimed, whether it then settles, fails or is reclaimed, and never by a job cancelled or expired while open. `vorq.fee` is the protocol fee in USD that settlement took on top of the charge; `"0"` for a job that did not settle.
+`status` is `queued`, `in_progress`, `completed`, `failed` or `cancelled`; see [Job lifecycle](../concepts/job-lifecycle.md#states). `in_progress_at` is the claim time, `null` before a claim. `result_cid` is the sealed result's IPFS CID once settled, else `null`. `model` is `null` if the catalog does not know the model. `vorq.gas_fee` is the relay gas fee in USD fixed for the job when it was posted: paid once the job is claimed, whether it then settles, fails or is reclaimed, and never by a job cancelled or expired while open. `vorq.fee` is the protocol fee in USD that settlement took on top of the charge; `"0"` for a job that did not settle. `vorq.prompt_tok`, `vorq.cached_tok`, `vorq.completion_tok` and `vorq.rate_in_cached` are what settlement billed (see [When funds move](../concepts/job-lifecycle.md#when-funds-move)), `0` until settled.
 
 **Errors:** `400` for a malformed id; `404` until the coordinator has a record of the job.
 
@@ -286,7 +286,7 @@ Both files are JSONL, read with [`GET /v1/files/{id}/content`](#get-v1filesidcon
 **Output file**: one line per settled job.
 
 ```json
-{"id":"batch_req_5e2a…_1","custom_id":null,"response":{"status_code":200,"request_id":"0x<job_id>","body":null},"error":null,"vorq":{"job_id":"0x…","result_cid":"bafy…","provider":7,"rate_in":"0.0015","rate_out":"0.006","gas_fee":"0.03","fee":"0","completion_tok":800}}
+{"id":"batch_req_5e2a…_1","custom_id":null,"response":{"status_code":200,"request_id":"0x<job_id>","body":null},"error":null,"vorq":{"job_id":"0x…","result_cid":"bafy…","provider":7,"rate_in":"0.0015","rate_in_cached":"0.00075","rate_out":"0.006","gas_fee":"0.03","fee":"0","prompt_tok":412,"cached_tok":0,"completion_tok":800}}
 ```
 
 Results are sealed to the owner, so `body` is always `null`: fetch each result by `result_cid`. Your own request ids travel inside the sealed payload and result.

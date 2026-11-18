@@ -874,17 +874,21 @@ describe("a permanently misconfigured object store", () => {
         chainId: testConfig().addresses.chainId,
         verifyingContract: testConfig().addresses.jobRegistry,
       },
-      // `Settle(bytes32 jobId,uint32 completionTok,uint64 issuedAt)` — written
-      // out from `JobRegistry.sol`, and `resultCid` is not one of its members.
+      // `Settle(bytes32 jobId,uint32 promptTok,uint32 cachedTok,uint32 completionTok,
+      // uint128 rateInCached,uint64 issuedAt)` — written out from `JobRegistry.sol`,
+      // and `resultCid` is not one of its members.
       types: {
         Settle: [
           { name: "jobId", type: "bytes32" },
+          { name: "promptTok", type: "uint32" },
+          { name: "cachedTok", type: "uint32" },
           { name: "completionTok", type: "uint32" },
+          { name: "rateInCached", type: "uint128" },
           { name: "issuedAt", type: "uint64" },
         ],
       },
       primaryType: "Settle",
-      message: { jobId, completionTok: 12, issuedAt },
+      message: { jobId, promptTok: 30, cachedTok: 0, completionTok: 12, rateInCached: 0n, issuedAt },
     });
     return server.inject({
       method: "POST",
@@ -893,7 +897,10 @@ describe("a permanently misconfigured object store", () => {
       payload: {
         op: "settle",
         job_id: jobId,
+        prompt_tok: 30,
+        cached_tok: 0,
         completion_tok: 12,
+        rate_in_cached: "0",
         issued_at: Number(issuedAt),
         signature,
         result: Buffer.from("bytes that are fine").toString("base64"),

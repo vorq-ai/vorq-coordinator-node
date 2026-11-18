@@ -47,10 +47,10 @@ Signed by the provider wallet. `op: "claim"` on [`POST /evm/ops`](./provider-api
 ### Settle
 
 ```
-Settle(bytes32 jobId,uint32 completionTok,uint64 issuedAt)
+Settle(bytes32 jobId,uint32 promptTok,uint32 cachedTok,uint32 completionTok,uint128 rateInCached,uint64 issuedAt)
 ```
 
-Signed by the provider wallet. `op: "settle"`. `resultCid` is not signed: the coordinator mints it when it stores the result. `issuedAt` within ±600 seconds.
+Signed by the provider wallet. `op: "settle"`. The four usage members are the backend's prompt, cached and completion counts and the cached input rate in atomic units; the body carries them as `prompt_tok`, `cached_tok`, `completion_tok` and `rate_in_cached` (USD per 1M). The contract clamps them; see [When funds move](../concepts/job-lifecycle.md#when-funds-move). `resultCid` is not signed: the coordinator mints it when it stores the result. `issuedAt` within ±600 seconds.
 
 ### Fail
 

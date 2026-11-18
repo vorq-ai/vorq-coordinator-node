@@ -174,9 +174,19 @@ export async function applyEvent(
       await updateOne(
         db,
         `UPDATE jobs SET state = 2, ended_because = 1, completion_tok = $2,
-                         result_cid = $3, fee = $5, as_of_block = GREATEST(as_of_block, $4)
+                         result_cid = $3, fee = $5, prompt_tok = $6, cached_tok = $7,
+                         rate_in_cached = $8, as_of_block = GREATEST(as_of_block, $4)
          WHERE job_id = $1`,
-        [bytea(a.jobId), a.completionTok, bytea(a.resultCid), blockNumber, numeric(a.fee)],
+        [
+          bytea(a.jobId),
+          a.completionTok,
+          bytea(a.resultCid),
+          blockNumber,
+          numeric(a.fee),
+          a.promptTok,
+          a.cachedTok,
+          numeric(a.rateInCached),
+        ],
         `Settled for job ${a.jobId}`,
       );
       return;

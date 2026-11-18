@@ -112,9 +112,10 @@ describe.skipIf(!TEST_DATABASE_URL)("freezing a batch's output", () => {
     await db.query(
       `INSERT INTO jobs (job_id, owner, c, model_id, sla_secs, designated, rate_in, rate_out,
                          units_in, units_out, expires_at, state, ended_because, provider_id,
-                         completion_tok, task_cid, result_cid, as_of_block, gas_fee, fee)
+                         completion_tok, task_cid, result_cid, as_of_block, gas_fee, fee,
+                         prompt_tok, cached_tok, rate_in_cached)
        VALUES ($1, $2, $3, 7, 3600, 0, 30000, 90000, 100, 200, $4, $5, $6, $7, $8, $9, $10, 1,
-               $11, $12)`,
+               $11, $12, 96, 32, 15000)`,
       [
         jobId,
         OWNER,
@@ -384,9 +385,12 @@ describe.skipIf(!TEST_DATABASE_URL)("freezing a batch's output", () => {
       result_cid: "bafyresult1",
       provider: 7,
       rate_in: "0.03",
+      rate_in_cached: "0.015",
       rate_out: "0.09",
       gas_fee: "0.045",
       fee: "0.0025",
+      prompt_tok: 96,
+      cached_tok: 32,
       completion_tok: 128,
     });
   });

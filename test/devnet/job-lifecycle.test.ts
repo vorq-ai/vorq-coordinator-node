@@ -146,6 +146,9 @@ describe("job lifecycle", () => {
     // member of `Settle` any more.
     const resultBytes = Buffer.from(`result-${Date.now()}-${Math.random()}`, "utf8");
     const completionTok = 1500;
+    // Within the order's units_in (1000), and a cached share at half the input rate.
+    const promptTok = 900;
+    const cachedTok = 300;
     const settleIssuedAt = nowSeconds();
     const settleSig = await provider.signTypedData({
       domain,
@@ -153,7 +156,10 @@ describe("job lifecycle", () => {
       primaryType: "Settle",
       message: {
         jobId: posted.jobId,
+        promptTok,
+        cachedTok,
         completionTok,
+        rateInCached: 15_000n,
         issuedAt: settleIssuedAt,
       },
     });
@@ -168,7 +174,10 @@ describe("job lifecycle", () => {
         {
           op: "settle",
           job_id: posted.jobId,
+          prompt_tok: promptTok,
+          cached_tok: cachedTok,
           completion_tok: completionTok,
+          rate_in_cached: "0.015",
           result: resultBytes.toString("base64"),
           issued_at: Number(settleIssuedAt),
           signature: settleSig,
@@ -188,7 +197,10 @@ describe("job lifecycle", () => {
     expect(completed.vorq).toMatchObject({
       state: 2,
       ended_because: 1,
+      prompt_tok: promptTok,
+      cached_tok: cachedTok,
       completion_tok: Number(completionTok),
+      rate_in_cached: "0.015",
     });
     expect(completed).toMatchObject({ result_cid: resultCid });
 

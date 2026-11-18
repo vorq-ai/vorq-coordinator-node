@@ -62,7 +62,14 @@ The claim collects the client's payment. A `409` body names the contract's reaso
 
 ## 5. Settle
 
-Seal the result to the client and sign `Settle(bytes32 jobId,uint32 completionTok,uint64 issuedAt)`. `completionTok` is the number of output units you delivered; the contract charges for at most the order's `units_out`.
+Seal the result to the client and sign `Settle(bytes32 jobId,uint32 promptTok,uint32 cachedTok,uint32 completionTok,uint128 rateInCached,uint64 issuedAt)` with the counts your backend reported, never estimates:
+
+- `promptTok`: the backend's prompt tokens. For media jobs, the order's `units_in`.
+- `cachedTok`: the cached share of `promptTok`, `0` when the backend reports none.
+- `completionTok`: the output units you delivered.
+- `rateInCached`: your rate for cached prompt tokens in atomic units, at most the job's `rate_in`. With no cached discount, sign the job's `rate_in`.
+
+The contract clamps `promptTok` to `units_in`, `cachedTok` to `promptTok`, `completionTok` to `units_out` and `rateInCached` to `rate_in`, then charges `rate_in × (promptTok − cachedTok) + rateInCached × cachedTok + rate_out × completionTok`. See [What a job costs](../concepts/job-lifecycle.md#when-funds-move).
 
 Send the sealed result inline as base64:
 
@@ -73,8 +80,10 @@ curl -s -X POST "$VORQ/evm/ops" \
 ```
 
 ```json
-{ "op": "settle", "job_id": "0x…", "completion_tok": 800, "issued_at": 1786000100, "signature": "0x…", "result": "<base64>" }
+{ "op": "settle", "job_id": "0x…", "prompt_tok": 912, "cached_tok": 512, "completion_tok": 800, "rate_in_cached": "0.0006", "issued_at": 1786000100, "signature": "0x…", "result": "<base64>" }
 ```
+
+`rate_in_cached` is a USD string per 1M tokens, like `rate_in`; the signature covers it as `rate × 10^decimals`.
 
 For a result larger than the 20 MiB request body allows, upload it first with `POST /v1/files` and `purpose=result` under the same session, and send `result_cid` instead of `result`.
 

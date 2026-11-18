@@ -69,7 +69,8 @@ const JOB_COLUMNS = `
   units_in, units_out, expires_at,
   CASE WHEN ${EXPIRED} THEN 3 ELSE state END AS state,
   CASE WHEN ${EXPIRED} THEN 5 ELSE ended_because END AS ended_because,
-  provider_id, claimed_at, completion_tok, task_cid, result_cid, posted_block, gas_fee, fee`;
+  provider_id, claimed_at, prompt_tok, cached_tok, completion_tok, rate_in_cached,
+  task_cid, result_cid, posted_block, gas_fee, fee`;
 
 /**
  * Per R45, every row type here is derived from the column's SQL type and not
@@ -92,7 +93,10 @@ interface JobRow {
   ended_because: number;
   provider_id: bigint;
   claimed_at: bigint;
+  prompt_tok: bigint;
+  cached_tok: bigint;
   completion_tok: bigint;
+  rate_in_cached: bigint;
   task_cid: Buffer;
   result_cid: Buffer;
   posted_block: bigint;
@@ -124,7 +128,10 @@ const evmJob = (row: JobRow, decimals: number) => ({
   ended_because: row.ended_because,
   provider_id: row.provider_id,
   claimed_at: row.claimed_at,
+  prompt_tok: row.prompt_tok,
+  cached_tok: row.cached_tok,
   completion_tok: row.completion_tok,
+  rate_in_cached: formatUsd(row.rate_in_cached, decimals),
   task_cid: cid(row.task_cid),
   result_cid: cid(row.result_cid),
   posted_block: row.posted_block,
@@ -175,7 +182,10 @@ const clientJob = (row: JobRow, decimals: number, model: string | null, asOfBloc
     provider_id: row.provider_id,
     expires_at: row.expires_at,
     task_cid: cid(row.task_cid),
+    prompt_tok: row.prompt_tok,
+    cached_tok: row.cached_tok,
     completion_tok: row.completion_tok,
+    rate_in_cached: formatUsd(row.rate_in_cached, decimals),
     state: row.state,
     ended_because: row.ended_because,
     gas_fee: formatUsd(row.gas_fee, decimals),
@@ -243,7 +253,10 @@ const EvmJob = Type.Object({
   }),
   provider_id: Int(),
   claimed_at: Int(),
+  prompt_tok: Int("The backend's prompt tokens settlement billed, clamped to units_in; 0 until settled."),
+  cached_tok: Int("The cached share of prompt_tok, billed at rate_in_cached; 0 until settled."),
   completion_tok: Int(),
+  rate_in_cached: UsdOut("USD per 1M cached prompt tokens settlement used, at most rate_in; 0 until settled."),
   task_cid: Cid,
   result_cid: Cid,
   posted_block: Int("0 when not yet known."),
@@ -693,7 +706,10 @@ export function jobRoutes(
               provider_id: Int(),
               expires_at: Int(),
               task_cid: Cid,
+              prompt_tok: Int(),
+              cached_tok: Int(),
               completion_tok: Int(),
+              rate_in_cached: UsdOut(),
               state: Type.Integer(),
               ended_because: Type.Integer(),
               gas_fee: UsdOut(),
