@@ -295,8 +295,9 @@ export function makeChain(config: Config, transport?: Transport): Chain {
   // has not seen the previous broadcast yet; it then signs a nonce already used
   // and the endpoint refuses it ("nonce too low"), measured on Base mainnet
   // 2026-11-18 on two concurrent posts. So the send takes the higher of this and
-  // the RPC's count. The hint expires after NONCE_HINT_MS: a transaction the
-  // network dropped would otherwise leave every later send stuck behind its gap.
+  // the RPC's count. The hint expires after NONCE_HINT_MS, and is cleared when a
+  // receipt wait fails: a transaction the network dropped would otherwise leave
+  // every later send stuck behind its gap.
   let nextNonce: { value: number; at: number } | undefined;
   // Entries admitted and still owned by a caller. Decremented on every exit —
   // sent, refused or abandoned — so a burst cannot leak the queue shut (R76).
@@ -404,7 +405,13 @@ export function makeChain(config: Config, transport?: Transport): Chain {
     floor: () => floor,
     saw,
     receipt: async (hash, timeoutMs) => {
-      const receipt = await publicClient.waitForTransactionReceipt({ hash, timeout: timeoutMs });
+      let receipt;
+      try {
+        receipt = await publicClient.waitForTransactionReceipt({ hash, timeout: timeoutMs });
+      } catch (err) {
+        nextNonce = undefined;
+        throw err;
+      }
       saw(receipt.blockNumber);
       return receipt;
     },
