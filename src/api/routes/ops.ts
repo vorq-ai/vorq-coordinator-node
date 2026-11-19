@@ -1,15 +1,24 @@
 import type { FastifyReply } from "fastify";
 import { Type, type Static } from "typebox";
-import { encodeFunctionData, erc20Abi, recoverTypedDataAddress, type Abi, type Hex } from "viem";
+import {
+  encodeFunctionData,
+  recoverTypedDataAddress,
+  type Abi,
+  type Hex,
+  type TransactionReceipt,
+} from "viem";
 import { jobRegistryAbi } from "../../abi/jobRegistry.js";
 import { providerRegistryAbi } from "../../abi/providerRegistry.js";
-import { atFloor, chainParams, floorMemo, type Chain, type ChainParams } from "../../chain/client.js";
+import { atFloor, floorMemo, type Chain } from "../../chain/client.js";
 // `atFloor` pins the `/evm/ops` simulate (see `simulateThenRelay`); `floorMemo`
-// serves `/evm/simulate/claim`'s state reads.
+// serves the claim gates' state reads.
 import { decodeRevert, isVerdict } from "../../chain/revert.js";
 import type { Address } from "../../config.js";
+import type { Db } from "../../db/db.js";
+import { decodeLog } from "../../index/decode.js";
+import { applyEvent } from "../../index/reducer.js";
 import { repairOnRefusal } from "../../index/reconcile.js";
-import { dropUnconfirmed } from "../../index/write-through.js";
+import { dropLease, HELD, takeForClaim, type ClaimableOrder } from "../../match/held.js";
 import { pinnerFor, put, type Pinner } from "../../pin/pinner.js";
 import { sendFailure, viewRead } from "../chain-failure.js";
 import { ApiError } from "../errors.js";
@@ -26,7 +35,14 @@ import {
 } from "../deps.js";
 import { throughPinner } from "../pin-failure.js";
 import { subjectQueue } from "../queue.js";
-import { capOf, EIP712_NAMES, feeOf } from "../../orders.js";
+import {
+  EIP712_NAMES,
+  lockOf,
+  readExitTerms,
+  taskCidHex,
+  type ExitTerms,
+  type Terms,
+} from "../../orders.js";
 import {
   Address as AddressIn,
   Base64,
@@ -63,16 +79,24 @@ import { attachFile, findUpload } from "./files.js";
  * because comparing them would imply the session carried an authority it does
  * not have. What refuses a forged op is the same thing that refuses it on chain.
  *
+ * ## What the node adds to an op
+ *
+ * The bodies a daemon sends carry the op's own signed fields and nothing else.
+ * The node supplies the rest from the job's row: `claim` carries the client's
+ * signed order, which only this node holds until the claim puts it on chain
+ * (`match/held.ts`), and `submitAndSettle` and `fail` carry the job's
+ * {@link ExitTerms}, which the contract checks against the hash it stored at
+ * claim, including the relayer `Claimed` named. A claim on an order this node
+ * does not hold is refused `NotOpen`; a settle or fail on a job it has no row
+ * for, or whose `Claimed` it has not indexed, `NotClaimed`.
+ *
  * ## Simulate before every relay
  *
  * Every op is `eth_call`ed **as the exact transaction that would be sent, from
  * the relayer's own address**, before a single wei of gas is spent. A revert
  * answers `409 {ok:false, reason:"<contract error name>"}` and relays nothing.
  * This is not the same check as `/evm/simulate/claim`: that one reads views and
- * is advisory, and it cannot see the escrow pull — a payment-token failure
- * inside `claim` reverts with an error in neither of this node's ABIs, which is
- * exactly the `409 {ok:false, reason:"unknown", raw:"0x…"}` case. Neither check
- * is ever removed for the other.
+ * is advisory. Neither check is ever removed for the other.
  *
  * ## What this door answers, and what each answer promises (R57, R72)
  *
@@ -217,13 +241,28 @@ interface ParsedOp {
   /**
    * Builds the calldata once the signature is known to be well-formed.
    *
-   * `mintedCid` is the name the pin returned, and `null` for every op that pins
-   * nothing. `settle` throws on a `null` rather than encoding an empty `bytes`:
-   * the contract's `EmptyResultCid` would refuse it anyway, and paying an
-   * `eth_call` to be told so would mean this node had built a transaction it knew
-   * was wrong.
+   * Each builder throws on a context member it needs and was not handed, rather
+   * than encoding an empty one: the contract would refuse it anyway, and paying
+   * an `eth_call` to be told so would mean this node had built a transaction it
+   * knew was wrong.
    */
-  calldata: (signature: Hex, mintedCid: string | null) => Hex;
+  calldata: (signature: Hex, context: OpContext) => Hex;
+}
+
+/** What the node supplies to an op's calldata beyond the op's own fields. */
+interface OpContext {
+  /** The name the pin returned; `null` for every op that pins nothing. */
+  mintedCid: string | null;
+  /** `claim`'s held order. */
+  order: ClaimableOrder | null;
+  /** The exit terms `submitAndSettle` and `fail` pass back. */
+  terms: ExitTerms | null;
+}
+
+/** One built-op context member, or a loud failure when the route forgot it. */
+function needed<T>(value: T | null, what: string): T {
+  if (value === null) throw new Error(`${what} calldata was built without it`);
+  return value;
 }
 
 /**
@@ -464,12 +503,14 @@ function parseOp(body: OpBody, decimals: number): ParsedOp {
         jobId: hex,
         toPin: null,
         resultCid: null,
-        calldata: (signature) =>
-          encodeFunctionData({
+        calldata: (signature, { order }) => {
+          const held = needed(order, "the held order: claim");
+          return encodeFunctionData({
             abi: jobRegistryAbi,
             functionName: "claim",
-            args: [hex, issuedAt, signature],
-          }),
+            args: [orderArg(held), held.owner, held.orderSig, issuedAt, signature],
+          });
+        },
       };
     }
 
@@ -490,7 +531,7 @@ function parseOp(body: OpBody, decimals: number): ParsedOp {
         jobId: hex,
         toPin,
         resultCid,
-        calldata: (signature, mintedCid) => {
+        calldata: (signature, { mintedCid, terms }) => {
           if (mintedCid === null) {
             throw new Error("settle calldata was built before the result was pinned");
           }
@@ -502,6 +543,7 @@ function parseOp(body: OpBody, decimals: number): ParsedOp {
             functionName: "submitAndSettle",
             args: [
               hex,
+              needed(terms, "the exit terms: settle"),
               {
                 promptTok: Number(promptTok),
                 cachedTok: Number(cachedTok),
@@ -529,11 +571,11 @@ function parseOp(body: OpBody, decimals: number): ParsedOp {
         jobId: hex,
         toPin: null,
         resultCid: null,
-        calldata: (signature) =>
+        calldata: (signature, { terms }) =>
           encodeFunctionData({
             abi: jobRegistryAbi,
             functionName: "fail",
-            args: [hex, issuedAt, signature],
+            args: [hex, needed(terms, "the exit terms: fail"), issuedAt, signature],
           }),
       };
     }
@@ -589,16 +631,88 @@ function parseOp(body: OpBody, decimals: number): ParsedOp {
 
 const ABIS: readonly Abi[] = [jobRegistryAbi as Abi, providerRegistryAbi as Abi];
 
+/**
+ * How long a claim holds its order's lease while it is relayed: the relayer
+ * queue's wait, the simulate, the send and the receipt, with room to spare. The
+ * lease is what `cancelHeld` reads to refuse a cancel under a claim in flight.
+ */
+const CLAIM_HOLD_MS = 2 * RECEIPT_TIMEOUT_MS;
+
+/** The `Order` struct `claim` takes, from a held order. */
+const orderArg = (held: ClaimableOrder) => ({
+  c: held.terms.c,
+  modelId: Number(held.terms.modelId),
+  slaSecs: Number(held.terms.slaSecs),
+  rateIn: held.terms.rateIn,
+  rateOut: held.terms.rateOut,
+  unitsIn: Number(held.terms.unitsIn),
+  unitsOut: Number(held.terms.unitsOut),
+  designated: Number(held.terms.designated),
+  expiresAt: held.terms.expiresAt,
+  taskCid: taskCidHex(held.taskCid),
+});
+
+/**
+ * The locks of the claims this node is relaying right now, per owner.
+ *
+ * `balanceOf` at the floor does not yet show a claim that is broadcast and not
+ * mined, so two claims on one owner's orders, relayed a moment apart, both read
+ * the same balance — and the second, short, reverts `InsufficientDeposit`
+ * **after the relayer has paid for it**. Counting the first's lock against the
+ * second's gate refuses that one for free instead. An entry lives from the
+ * gate to the receipt: by then the floor has reached the claim's block, and the
+ * balance read there is net of its lock.
+ *
+ * **The check and the entry are one synchronous step** ({@link reserve}), taken
+ * after the balance read resolves. Two concurrent claims are handed the same
+ * memoised read, so a check made before an `await` and an entry added after it
+ * would let both pass on one balance.
+ *
+ * Process memory, like the relayer's own queue: one relayer account is one
+ * process's to send from.
+ */
+class ClaimsInFlight {
+  private readonly byOwner = new Map<string, Map<Hex, bigint>>();
+
+  /** Whether `balance` covers `lock` once this owner's other claims in flight are counted. */
+  covers(owner: Address, jobId: Hex, lock: bigint, balance: bigint): boolean {
+    let pending = 0n;
+    for (const [other, held] of this.byOwner.get(owner.toLowerCase()) ?? []) {
+      if (other !== jobId) pending += held;
+    }
+    return balance - pending >= lock;
+  }
+
+  /**
+   * {@link covers}, and when it does, the lock recorded in the same step. `null`
+   * when it does not; otherwise the function that removes the entry.
+   */
+  reserve(owner: Address, jobId: Hex, lock: bigint, balance: bigint): (() => void) | null {
+    if (!this.covers(owner, jobId, lock, balance)) return null;
+    return this.add(owner, jobId, lock);
+  }
+
+  private add(owner: Address, jobId: Hex, lock: bigint): () => void {
+    const key = owner.toLowerCase();
+    const locks = this.byOwner.get(key) ?? new Map<Hex, bigint>();
+    locks.set(jobId, lock);
+    this.byOwner.set(key, locks);
+    return () => {
+      locks.delete(jobId);
+      if (locks.size === 0 && this.byOwner.get(key) === locks) this.byOwner.delete(key);
+    };
+  }
+}
+
+/** A refusal the claim gates make, in the chain's own vocabulary where it has one. */
+type GateRefusal = { reason: string };
+
 export function opsRoutes(app: App, deps: RouteDeps): void {
-  /** `/evm/simulate/claim`'s view reads, one per distinct read per floor block. */
+  /** The claim gates' view reads, one per distinct read per floor block. */
   const claimReads = floorMemo();
   const serialized = subjectQueue("ops");
   const pinner: Pinner = pinnerFor(deps.config, deps.db);
-  // Built on first use, as in `post.ts`: the app is constructible without a
-  // chain, and the cache must outlive the request.
-  let params: ChainParams | null = null;
-  const configOf = (chain: Chain): ChainParams =>
-    (params ??= chainParams(chain, deps.config.addresses));
+  const claiming = new ClaimsInFlight();
 
   // Reconcile-on-error, hung on the refusal rather than on the route (R3/R4).
   const repair = repairOnRefusal(
@@ -608,6 +722,42 @@ export function opsRoutes(app: App, deps: RouteDeps): void {
     (error, jobId, reason) =>
       app.log.error({ err: error, jobId, reason }, "reconcile-on-refusal failed"),
   );
+
+  /** A view read at the floor, remembered for the floor block, classified as a read (R77). */
+  const read = <T>(chain: Chain, abi: Abi, at: Address, functionName: string, args: unknown[]): Promise<T> =>
+    viewRead("claim_simulate_read", () =>
+      claimReads(
+        chain,
+        `${at}:${functionName}:${args.map(String).join(",")}`,
+        (pin) => chain.publicClient.readContract({ address: at, abi, functionName, args, ...pin }) as Promise<T>,
+      ),
+    );
+
+  /**
+   * The reads behind the two claim gates the chain's own state answers and the
+   * order's signature cannot: whether the gas fee this order was quoted at is
+   * the live one, and — for the caller to decide against this owner's claims in
+   * flight — its lock and the owner's balance.
+   *
+   * A different gas fee is refused rather than claimed: `claim` locks the live
+   * fee, and the client accepted the quoted one.
+   */
+  async function fundsGate(
+    chain: Chain,
+    owner: Address,
+    terms: Terms,
+    quotedGasFee: bigint,
+  ): Promise<GateRefusal | { lock: bigint; balance: bigint }> {
+    const { jobRegistry } = deps.config.addresses;
+    const [gasFee, feeBps] = await Promise.all([
+      read<bigint>(chain, jobRegistryAbi as Abi, jobRegistry, "gasFee", []),
+      read<number>(chain, jobRegistryAbi as Abi, jobRegistry, "feeBps", []),
+    ]);
+    if (BigInt(gasFee) !== quotedGasFee) return { reason: "GasFeeChanged" };
+    const lock = lockOf(terms, Number(feeBps), quotedGasFee);
+    const balance = await read<bigint>(chain, jobRegistryAbi as Abi, jobRegistry, "balanceOf", [owner]);
+    return { lock, balance: BigInt(balance) };
+  }
 
   app.post(
     "/evm/ops",
@@ -732,45 +882,86 @@ export function opsRoutes(app: App, deps: RouteDeps): void {
     const resume =
       op.jobId === null ? `GET /evm/providers/${providerId}` : `GET /v1/jobs/${op.jobId}`;
     const relay = async (): Promise<FastifyReply> => {
-      // **The bytes are filed inside the queue and immediately before the
-      // simulate**, so the ordering that matters holds: the result is stored
-      // before the transaction naming it is broadcast, and a pin that fails
-      // relays nothing.
-      //
-      // A relay that fails after a successful pin leaves an orphan object and no
-      // chain state. That is the cheap direction and it is retry-safe: the store
-      // names the same bytes the same way, so a retried settle lands on the
-      // same name and one `pins` row, and the contract's one-shot state machine
-      // refuses a second `settle` on a job that already settled. Nothing is
-      // charged twice and nothing is duplicated, which is what makes
-      // `x-vorq-retryable: true` on the failure honest (R57, R70).
-      const toPin = op.toPin;
-      let mintedCid: string | null = null;
-      if (toPin !== null) {
-        mintedCid = await throughPinner(request, () => put(pinner, toPin));
-      } else if (op.resultCid !== null) {
-        // The upload stops being storage this node owes nobody and starts being
-        // a settled job's result. `false` means the sweep's 300 s window closed
-        // on it between the lookup and here, so there is nothing left to name
-        // and nothing is relayed.
-        const attached = await attachFile(
-          deps.db,
-          { cid: op.resultCid, owner: session.address, purpose: "result" },
-          deps.config.fileRetentionSeconds,
+      const jobId = op.jobId;
+      const context: OpContext = { mintedCid: null, order: null, terms: null };
+      let onReceipt: ((receipt: TransactionReceipt) => Promise<void>) | undefined;
+      let settled = (): void => undefined;
+
+      try {
+        // ---- what the node adds: the held order, or the exit terms ----------
+
+        if (op.name === "claim" && jobId !== null) {
+          // Locked, and the claimant's lease written over it, so an owner's cancel
+          // cannot end the row under a claim in flight (`cancelHeld`).
+          const order = await takeForClaim(deps.db, jobId, providerId, CLAIM_HOLD_MS);
+          if (order === null) return refused(reply, { reason: "NotOpen", raw: null });
+          const gate = await fundsGate(chain, order.owner, order.terms, order.gasFee);
+          // The check against the claims in flight and this claim's entry, in one
+          // step with no `await` between them; released in the `finally` below.
+          const reserved =
+            "reason" in gate ? null : claiming.reserve(order.owner, jobId, gate.lock, gate.balance);
+          if (reserved === null) {
+            await dropLease(deps.db, jobId, providerId);
+            return refused(reply, { reason: "reason" in gate ? gate.reason : "InsufficientDeposit", raw: null });
+          }
+          settled = reserved;
+          context.order = order;
+          // The row takes the claim from the receipt, before the answer goes out:
+          // the owner's `reserved` stops counting this order the moment its lock
+          // is on chain, and the book stops offering it.
+          onReceipt = (receipt) => markClaimed(deps.db, deps.config.addresses.jobRegistry, receipt);
+        } else if ((op.name === "settle" || op.name === "fail") && jobId !== null) {
+          context.terms = await readExitTerms(deps.db, jobId);
+          if (context.terms === null) return refused(reply, { reason: "NotClaimed", raw: null });
+        }
+
+        // ---- the result, for a settle ----------------------------------------
+
+        // **The bytes are filed inside the queue and immediately before the
+        // simulate**, so the ordering that matters holds: the result is stored
+        // before the transaction naming it is broadcast, and a pin that fails
+        // relays nothing.
+        //
+        // A relay that fails after a successful pin leaves an orphan object and no
+        // chain state. That is the cheap direction and it is retry-safe: the store
+        // names the same bytes the same way, so a retried settle lands on the
+        // same name and one `pins` row, and the contract's one-shot state machine
+        // refuses a second `settle` on a job that already settled. Nothing is
+        // charged twice and nothing is duplicated, which is what makes
+        // `x-vorq-retryable: true` on the failure honest (R57, R70).
+        const toPin = op.toPin;
+        if (toPin !== null) {
+          context.mintedCid = await throughPinner(request, () => put(pinner, toPin));
+        } else if (op.resultCid !== null) {
+          // The upload stops being storage this node owes nobody and starts being
+          // a settled job's result. `false` means the sweep's 300 s window closed
+          // on it between the lookup and here, so there is nothing left to name
+          // and nothing is relayed.
+          const attached = await attachFile(
+            deps.db,
+            { cid: op.resultCid, owner: session.address, purpose: "result" },
+            deps.config.fileRetentionSeconds,
+          );
+          if (!attached) throw unknownResult(op.resultCid);
+          context.mintedCid = op.resultCid;
+        }
+        const data = op.calldata(signature as Hex, context);
+        return await simulateThenRelay(
+          chain,
+          registryAddress,
+          data,
+          reply,
+          resume,
+          async (reason) => {
+            if (op.name === "claim" && jobId !== null) await dropLease(deps.db, jobId, providerId);
+            await repair(jobId)(reason);
+          },
+          context.mintedCid === null ? {} : { result_cid: context.mintedCid },
+          onReceipt,
         );
-        if (!attached) throw unknownResult(op.resultCid);
-        mintedCid = op.resultCid;
+      } finally {
+        settled();
       }
-      const data = op.calldata(signature as Hex, mintedCid);
-      return simulateThenRelay(
-        chain,
-        registryAddress,
-        data,
-        reply,
-        resume,
-        repair(op.jobId),
-        mintedCid === null ? {} : { result_cid: mintedCid },
-      );
     };
 
     // `(op, job_id)` for a job op, `(op, provider_id)` for a registry op — the
@@ -798,9 +989,11 @@ export function opsRoutes(app: App, deps: RouteDeps): void {
         tags: ["ops"],
         summary: "Would a claim land?",
         description:
-          "The advisory gate a daemon consults before it signs: chain view reads only, so it " +
-          "answers during the finality lag. The escrow pull is checked against the owner's " +
-          "balance (`InsufficientFunds`); `/evm/ops` simulates the pull itself.",
+          "The advisory gate a daemon consults before it signs: the held order from this node, the " +
+          "gates from chain view reads at the node's floor, in the contract's own order. The funds " +
+          "gate answers `InsufficientDeposit` when the owner's balance, less its other claims in " +
+          "flight, does not cover the lock; `GasFeeChanged` when the order was quoted at another gas " +
+          "fee. `/evm/ops` simulates the claim itself.",
         body: Type.Object({ job_id: Hex32(), address: AddressIn({ description: "The operator." }) }),
         response: { 200: SimulateResult, ...errors(400, 503) },
       },
@@ -809,166 +1002,138 @@ export function opsRoutes(app: App, deps: RouteDeps): void {
     const chain = requireChain(deps.chain);
     const jobId = request.body.job_id.toLowerCase() as Hex;
     const address = addressOf(Buffer.from(request.body.address.slice(2), "hex"));
+    const { jobRegistry, providerRegistry } = deps.config.addresses;
+    const job = (abi: Abi, at: Address, name: string, args: unknown[]) => read(chain, abi, at, name, args);
 
-    // **R77, on the door a provider daemon hits hardest.** Every one of the six
-    // reads below is a view read, and every one of them was bare: a dead
-    // endpoint, a rate limit, a bare revert and a decoded revert all answered
-    // `500 internal_error` with `x-vorq-retryable: false`, which under R57 is the
-    // promise that the identical request can never succeed — false the moment the
-    // RPC comes back. Wrapping the helper rather than the call sites is the point:
-    // a seventh gate added below this line cannot be written unwrapped.
-    //
-    // Through `claimReads`: a batch's lines are claimed in a burst, and each
-    // answer would otherwise re-read the same owner balance and provider gates
-    // at the same block. Remembered per floor block, so every answer is still
-    // the chain's own at that block.
-    const read = <T>(abi: Abi, at: Address, functionName: string, args: unknown[]): Promise<T> =>
-      viewRead("claim_simulate_read", () =>
-        claimReads(
-          chain,
-          `${at}:${functionName}:${args.map(String).join(",")}`,
-          (pin) =>
-            chain.publicClient.readContract({ address: at, abi, functionName, args, ...pin }) as Promise<T>,
-        ),
-      );
-
-    const jobRegistry = deps.config.addresses.jobRegistry;
-    const providerRegistry = deps.config.addresses.providerRegistry;
-
-    // **Chain `eth_call`s only, no index reads** (R22). That is what makes this
-    // answer meaningful during the finality lag, which is precisely when a
-    // daemon is deciding whether to sign — an index-backed answer would be
-    // stale in exactly the window the caller cares about.
+    // **The order from this node, every gate from the chain.** An unclaimed
+    // order exists only in this node's database, so that is where its terms are
+    // read; every verdict on them is a view read at the node's floor, remembered
+    // per floor block — a batch's lines are claimed in a burst, and each answer
+    // would otherwise re-read the same balance and provider gates. Every read is
+    // a `viewRead` (R77), so a dead endpoint answers `503`, never a verdict.
     //
     // The gates are evaluated in the contract's own order, so the reason this
-    // returns is the reason `claim` would revert with, and not merely *a* reason
-    // it would fail.
-    const job = await read<{
-      found: boolean;
-      state: number;
-      owner: Address;
-      providerId: number;
-      designated: number;
-      modelId: number;
-      rateIn: bigint;
-      rateOut: bigint;
-      unitsIn: number;
-      unitsOut: number;
-      gasFee: bigint;
-    }>(jobRegistryAbi as Abi, jobRegistry, "getJob", [jobId]);
+    // returns is the reason `claim` would revert with.
+    const order = await heldOrder(deps.db, jobId);
+    if (order === null) return { ok: false, reason: "NotOpen" };
+    const { terms } = order;
 
-    if (!job.found) {
-      // **The one repair this route does make, and it costs no chain method.**
-      // A `jobs` row for a job `getJob` does not have is a write-through row
-      // whose post was orphaned (`index/write-through.ts`), and this is where
-      // that is discovered: the daemon simulates before it signs and treats a
-      // refusal as a skip, so it never reaches the `/evm/ops` door where
-      // `repairOnRefusal` lives, and a phantom nobody deletes keeps being
-      // advertised — and keeps taking a lease slot on every poll — until its
-      // own `expires_at`.
-      //
-      // R22 is not bent by it. The ruling pins this route's *answer* to chain
-      // `eth_call`s, and `api-relay.test.ts` enforces it by asserting on the
-      // methods issued; a `DELETE` issues none, reads nothing, and changes no
-      // answer. What the comment below rightly refuses is a full `reconcileJob`,
-      // which would add an `eth_blockNumber` and a second `getJob` for a verdict
-      // this branch already holds. `dropUnconfirmed` is guarded to rows ahead of
-      // the cursor, so a lagging endpoint cannot make it delete the indexer's
-      // work.
-      //
-      // Awaited, so the answer is deterministic and a test can assert on the
-      // row; swallowed, because a repair bolted to somebody else's request must
-      // not turn that request's answer into a `500`.
-      try {
-        if (await dropUnconfirmed(deps.db, Buffer.from(jobId.slice(2), "hex"))) {
-          app.log.warn({ jobId }, "dropped a job row the chain does not have");
-        }
-      } catch (err) {
-        app.log.error({ err, jobId }, "phantom row cleanup failed");
-      }
-      return { ok: false, reason: "UnknownJob" };
+    // The order's gates. The signature and the expiry ceiling were checked when
+    // the order was accepted and cannot change since.
+    if (!(await job(jobRegistryAbi as Abi, jobRegistry, "allowedSla", [Number(terms.slaSecs)]))) {
+      return { ok: false, reason: "SlaNotAllowed" };
     }
-    // `getJob` already renders an expired-but-open job as `state 3 / cause 5`
-    // (R3), so this one comparison covers both "resolved" and "abandoned" —
-    // exactly as `claim`'s own `state != Open || now > expiresAt` does.
-    // **Reconcile is deliberately NOT wired here, and R22 is the reason.** This
-    // route is the earliest and most-hit place the node learns that a job the
-    // book still advertises is gone, so repairing the row here is tempting and
-    // would be genuinely useful — and for the branch above, where the chain has
-    // no such job at all, the repair is a bare `DELETE` cheap enough to make.
-    // Not this one: a `NotOpen` job is one the chain *has*, so putting the row
-    // right means reading its 20 fields back, which is the reconcile R22
-    // refuses. R22 pins this route to chain `eth_call`s and
-    // nothing else, and the guard that enforces it (`api-relay.test.ts`) asserts
-    // on the *methods issued*, not only on where the answer came from — a
-    // reconcile adds an `eth_blockNumber` and a write, and turning that guard
-    // down to accommodate a repair would cost more than the repair is worth.
-    // The pre-relay simulate inside `POST /evm/ops` covers the same revert on the
-    // path that actually spends something.
-    if (job.state !== 0) return { ok: false, reason: "NotOpen" };
+    if (BigInt(Math.floor(Date.now() / 1000)) > terms.expiresAt) {
+      return { ok: false, reason: "AlreadyExpired" };
+    }
+    if (!(await job(providerRegistryAbi as Abi, providerRegistry, "modelExists", [Number(terms.modelId)]))) {
+      return { ok: false, reason: "UnknownModel" };
+    }
+    if (!(await job(providerRegistryAbi as Abi, providerRegistry, "modelEnabled", [Number(terms.modelId)]))) {
+      return { ok: false, reason: "ModelDisabled" };
+    }
+    // An id the chain has a row for is spent: claimed through a relay this node
+    // has not indexed yet, or cancelled on chain by its owner.
+    const view = await job(jobRegistryAbi as Abi, jobRegistry, "getJob", [jobId]) as { found: boolean };
+    if (view.found) return { ok: false, reason: "NotOpen" };
 
-    const providerId = await read<number>(
-      providerRegistryAbi as Abi,
-      providerRegistry,
-      "idOf",
-      [address],
-    );
+    const providerId = Number(await job(providerRegistryAbi as Abi, providerRegistry, "idOf", [address]));
     // Before anything `_rec`-gated: `isListed`, `modelAllowed` and
     // `effectiveCap` all revert `UnknownProviderId` on id 0, so asking them
     // first would turn a clean answer into a decode failure.
     if (providerId === 0) return { ok: false, reason: "UnknownProvider" };
-
-    const listed = await read<boolean>(providerRegistryAbi as Abi, providerRegistry, "isListed", [
-      providerId,
-    ]);
-    if (!listed) return { ok: false, reason: "NotListed" };
-
-    const modelAllowed = await read<boolean>(
-      providerRegistryAbi as Abi,
-      providerRegistry,
-      "modelAllowed",
-      [providerId, job.modelId],
-    );
-    if (!modelAllowed) return { ok: false, reason: "ModelNotAllowed" };
-
+    if (!(await job(providerRegistryAbi as Abi, providerRegistry, "isListed", [providerId]))) {
+      return { ok: false, reason: "NotListed" };
+    }
+    if (
+      !(await job(providerRegistryAbi as Abi, providerRegistry, "modelAllowed", [
+        providerId,
+        Number(terms.modelId),
+      ]))
+    ) {
+      return { ok: false, reason: "ModelNotAllowed" };
+    }
     // Designation is matched against the signer's provider id, never an address.
-    if (job.designated !== 0 && job.designated !== providerId) {
+    if (terms.designated !== 0n && terms.designated !== BigInt(providerId)) {
       return { ok: false, reason: "NotDesignated" };
     }
-
-    // Both from the chain (R21). The SQL pair on `/evm/providers` is for display
-    // and would be answering from the index, which this route does not do.
+    // Both from the chain (R21). The SQL pair on `/evm/providers` is for display.
     const [active, cap] = await Promise.all([
-      read<number>(jobRegistryAbi as Abi, jobRegistry, "activeJobs", [providerId]),
-      read<number>(providerRegistryAbi as Abi, providerRegistry, "effectiveCap", [providerId]),
+      job(jobRegistryAbi as Abi, jobRegistry, "activeJobs", [providerId]),
+      job(providerRegistryAbi as Abi, providerRegistry, "effectiveCap", [providerId]),
     ]);
-    if (active >= cap) return { ok: false, reason: "AtCapacity" };
+    if (Number(active) >= Number(cap)) return { ok: false, reason: "AtCapacity" };
 
-    // The escrow pull, last as in `claim`: the payment token refuses it when the
-    // owner holds less than `cap + feeCap + gasFeeSnap`, with a string revert
-    // the daemon could only log as a lost race and try again every sweep.
-    // From the node's 60 s cell, as `POST /v1/jobs` reads it: `feeBps` changes
-    // by governance, not per block, and this gate runs on every claim attempt.
-    const feeBps = await viewRead("claim_simulate_read", () => configOf(chain).feeBps());
-    const escrow = capOf({
-      rateIn: job.rateIn,
-      rateOut: job.rateOut,
-      unitsIn: BigInt(job.unitsIn),
-      unitsOut: BigInt(job.unitsOut),
-    });
-    const due = escrow + feeOf(escrow, feeBps) + job.gasFee;
-    const balance = await read<bigint>(erc20Abi as Abi, deps.config.addresses.usdc, "balanceOf", [
-      job.owner,
-    ]);
-    if (balance < due) {
-      return { ok: false, reason: "InsufficientFunds" };
+    // The lock, last as in `claim`.
+    const gate = await fundsGate(chain, order.owner, terms, order.gasFee);
+    if ("reason" in gate) return { ok: false, reason: gate.reason };
+    if (!claiming.covers(order.owner, jobId, gate.lock, gate.balance)) {
+      return { ok: false, reason: "InsufficientDeposit" };
     }
 
     // Advisory, and it says so by what it omits: the op signature and the
-    // ±600 s window are not evaluated here, nor an authorization the owner
-    // cancelled. The authoritative simulate is the one inside `POST /evm/ops`.
+    // ±600 s window are not evaluated here. The authoritative simulate is the
+    // one inside `POST /evm/ops`.
     return { ok: true };
   });
+}
+
+/** An open held order, read without a lock: the advisory gate decides nothing. */
+async function heldOrder(db: Db, jobId: Hex): Promise<ClaimableOrder | null> {
+  const { rows } = await db.query<{
+    owner: Buffer;
+    c: Buffer;
+    model_id: bigint;
+    sla_secs: bigint;
+    designated: bigint;
+    rate_in: bigint;
+    rate_out: bigint;
+    units_in: bigint;
+    units_out: bigint;
+    expires_at: bigint;
+    task_cid: Buffer;
+    gas_fee: bigint;
+    order_sig: Buffer;
+  }>(
+    `SELECT owner, c, model_id, sla_secs, designated, rate_in, rate_out, units_in, units_out,
+            expires_at, task_cid, gas_fee, order_sig
+       FROM jobs WHERE job_id = $1 AND state = 0 AND ${HELD}`,
+    [Buffer.from(jobId.slice(2), "hex")],
+  );
+  const row = rows[0];
+  if (row === undefined) return null;
+  const hex = (buffer: Buffer): Hex => `0x${buffer.toString("hex")}`;
+  return {
+    owner: addressOf(row.owner),
+    terms: {
+      c: hex(row.c),
+      modelId: BigInt(row.model_id),
+      slaSecs: BigInt(row.sla_secs),
+      rateIn: BigInt(row.rate_in),
+      rateOut: BigInt(row.rate_out),
+      unitsIn: BigInt(row.units_in),
+      unitsOut: BigInt(row.units_out),
+      designated: BigInt(row.designated),
+      expiresAt: BigInt(row.expires_at),
+    },
+    taskCid: row.task_cid.toString("utf8"),
+    gasFee: BigInt(row.gas_fee),
+    orderSig: hex(row.order_sig),
+  };
+}
+
+/**
+ * The claim's own `Claimed` log, applied to its row through the reducer's arm,
+ * so the row is claimed by the time the answer goes out. The indexed log that
+ * follows writes the same absolute values; `Posted` arrives with it and clears
+ * the order signature.
+ */
+async function markClaimed(db: Db, registry: Address, receipt: TransactionReceipt): Promise<void> {
+  for (const log of receipt.logs) {
+    if (log.address.toLowerCase() !== registry.toLowerCase()) continue;
+    const event = decodeLog(log);
+    if (event?.eventName === "Claimed") await applyEvent(db, event, receipt.blockNumber);
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -1020,9 +1185,7 @@ async function chainFailure(
 ): Promise<FastifyReply> {
   if (!isVerdict(error)) throw sendFailure(error);
   // Non-decodable revert data is reported as `unknown` with the bytes attached,
-  // never mapped onto the nearest familiar name: the escrow pull inside `claim`
-  // can revert inside the payment token, whose errors are in neither
-  // registry's ABI.
+  // never mapped onto the nearest familiar name.
   const revert = decodeRevert(error, ABIS);
   // Reconcile-on-error, wired to the verdict rather than to the route: this is
   // the single point every refusal on this door passes through, at either stage,
@@ -1122,22 +1285,26 @@ async function simulateThenRelay(
    * like on a door whose failure shapes are the contract.
    */
   extra: Record<string, unknown> = {},
+  /** Runs once the transaction mined, awaited before the answer; its failure is logged, never answered. */
+  onReceipt?: (receipt: TransactionReceipt) => Promise<void>,
 ): Promise<FastifyReply> {
   // **At the node's floor, and the gas estimate with it.** Every op on this door
   // follows one of this node's own receipts — a settle or a fail its claim, a
-  // claim the post — and `latest` on a load-balanced endpoint is whichever node
-  // answers. Measured on Base Sepolia 2026-10-15: a settle relayed one second
-  // after its claim's `201` was simulated on a node one block behind and refused
-  // `NotClaimed`, and the job failed with its answer in hand. The estimate is
-  // pinned too because the broadcast otherwise estimates at `latest` and meets
-  // the same stale node at the send.
+  // claim the owner's deposit — and `latest` on a load-balanced endpoint is
+  // whichever node answers. Measured on Base Sepolia 2026-10-15: a settle relayed
+  // one second after its claim's `201` was simulated on a node one block behind
+  // and refused `NotClaimed`, and the job failed with its answer in hand. The
+  // estimate is pinned too because the broadcast otherwise estimates at `latest`
+  // and meets the same stale node at the send.
   //
-  // Safe here and not on `POST /v1/jobs`: the floor trails the head by at most
-  // one indexer tick, and none of these five ops has a check that block's
-  // earlier `block.timestamp` can wrongly fail — `NotOpen`, `SlaExpired` and the
-  // fail grace only loosen, `StaleOp` has ±600 s. `post`'s `ExpiryTooFar`
-  // tightens, which is why that door simulates at `latest` (measured
-  // 2026-09-23).
+  // The floor trails the head by at most one indexer tick. `NotOpen`,
+  // `SlaExpired` and the fail grace only loosen at an older `block.timestamp`,
+  // and `StaleOp` has ±600 s. `claim`'s `ExpiryTooFar` is the one check that
+  // tightens: a 24 h order claimed within a block of its acceptance can be
+  // refused at the floor (measured 2026-09-23 on the same check, then in `post`). That
+  // refusal is transient — the daemon backs off and claims again a block later —
+  // while a claim simulated at `latest` could be refused for good against a
+  // stale node that has not seen the owner's deposit.
   let gas: bigint;
   try {
     await atFloor(chain, (pin) =>
@@ -1198,6 +1365,16 @@ async function simulateThenRelay(
       null,
       txHash,
     );
+  }
+
+  if (onReceipt !== undefined && receipt.status === "success") {
+    try {
+      await onReceipt(receipt);
+    } catch (error) {
+      // The transaction is mined; a `5xx` for an op that landed is the one
+      // answer that must never be given. The indexer writes the same row.
+      reply.log.error({ err: error, txHash }, "receipt hook failed");
+    }
   }
 
   // No `as_of_block` (R28): nothing here was read from the index.

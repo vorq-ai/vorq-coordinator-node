@@ -3,7 +3,7 @@ title: Cancel a job
 description: Cancel an open job with a signed Cancel message.
 ---
 
-The owner can cancel a job while it is still open. Once a provider has claimed it, cancelling is refused and the job runs to settlement, failure or reclaim.
+The owner can cancel a job while it is still open. An open job is an order the coordinator holds and no provider has claimed, so the cancel ends it in the coordinator and nothing is relayed. Once a provider has claimed it, cancelling is refused and the job runs to settlement, failure or reclaim.
 
 Cancelling needs no session. The authority is the owner's signature.
 
@@ -28,20 +28,19 @@ curl -s -X POST "$VORQ/v1/jobs/$JOB_ID/cancel" \
 ```
 
 ```json
-{ "job_id": "0x…", "tx_hash": "0x…" }
+{ "job_id": "0x…" }
 ```
 
-The job then reads `status: "cancelled"`. No payment was collected: funds move only at claim.
-
-Cancelling a job that has already settled or ended succeeds without changing anything, so a retry of a cancel you could not observe is safe. An open job past its `expires_at` can still be cancelled.
+The job then reads `status: "cancelled"`. Nothing was locked: funds are locked only at claim. An open job past its `expires_at` can still be cancelled.
 
 ## When it is refused
 
 | Answer | Cause |
 | --- | --- |
-| `409`, `code: "NotCancellable"` | A provider has claimed the job. |
-| `409`, `code: "NotTheOwner"` | The signature does not recover to the job's owner, or the job does not exist. |
+| `404` | No job under this id. |
+| `409`, `code: "NotOpen"` | A provider has claimed the job, or it has already settled or been cancelled. |
+| `409`, `code: "order_leased"` | A provider holds the order and may be claiming it now. Cancel again once its lease lapses unclaimed. |
+| `409`, `code: "NotTheOwner"` | The signature does not recover to the job's owner. |
 | `409`, `code: "StaleOp"` | `issued_at` is more than 600 seconds from the node's clock. Sign again. |
-| `409`, other `code` | The contract refused it; `code` is the contract error name. |
 
 See [`POST /v1/jobs/{id}/cancel`](../reference/client-api.md#post-v1jobsidcancel).

@@ -3,7 +3,7 @@ title: Quickstart
 description: Read a coordinator's deployment, sign an order, get a price quote and open a session, using curl.
 ---
 
-In this tutorial you talk to a coordinator with `curl`. You check that it is ready, read the deployment it serves, pick a model, sign an order and get a price quote for it, then open a session with your wallet. None of it moves funds: the quote is answered before any payment is signed.
+In this tutorial you talk to a coordinator with `curl`. You check that it is ready, read the deployment it serves, pick a model, sign an order and get a price quote for it, then open a session with your wallet. None of it moves funds: the quote is answered before anything is deposited or submitted.
 
 ## Before you start
 
@@ -141,7 +141,7 @@ export ORDER_SIG=$(cast wallet sign --data --from-file order.json --private-key 
 
 ## 5. Get a quote
 
-Post the order without a payment signature. The coordinator verifies the order signature and answers `402 Payment Required` with the price:
+Post the order without `amount`. The coordinator verifies the order signature and answers `402 Payment Required` with the price:
 
 ```sh
 curl -s -X POST "$VORQ/v1/jobs" \
@@ -161,18 +161,15 @@ EOF
 {
   "quote": {
     "cap": "0.000007", "fee_bps": 100, "fee": "0", "gas_fee": "0.002", "amount": "0.002007",
-    "authorization": {
-      "domain": { "name": "…", "version": "…", "chainId": 8453, "verifyingContract": "0x…" },
-      "to": "0x…", "value": 2007, "valid_after": 0, "valid_before": 1786086401, "nonce": "0x…"
-    }
+    "balance": "0", "deposit": "0.004007", "deposit_fee": "0.002"
   },
   "candidates": [{ "provider_id": 7, "box_key": "0x…", "rate_in": "0.0012", "rate_out": "0.005" }],
   "accepts": [{ "scheme": "eip3009", "network": "eip155:8453" }]
 }
 ```
 
-- `amount` is what the job would cost at most, in USD: the escrow ceiling `cap`, the protocol `fee` and the relayer `gas_fee`. `authorization.value` is the same amount in the token's smallest units, which is what the wallet signs.
-- `authorization` is the payment you would sign to submit.
+- `amount` is what the job would cost at most, in USD: the ceiling `cap`, the protocol `fee` and the relayer `gas_fee`. A claim locks it from your prepaid balance.
+- `balance` is your available prepaid balance, and `deposit` what you would deposit before submitting: the shortfall plus the flat `deposit_fee`. A new wallet has no balance.
 - `candidates` are live providers whose asks this order clears, cheapest first. To see the market before bidding, send the same body with no rates and no signature; see [Matching and leases](./concepts/matching-and-leases.md#the-market-probe).
 
 A `400` here names the field that is wrong in `error.param`. See [Errors](./reference/errors.md).
@@ -242,6 +239,6 @@ curl -s "$VORQ/v1/jobs/$SOME_JOB" | jq '{id, model, status, result_cid}'
 
 ## Next steps
 
-- [Submit a job](./guides/submit-a-job.md): seal a payload, sign the payment and post it.
+- [Submit a job](./guides/submit-a-job.md): seal a payload, deposit and post it.
 - [Job lifecycle](./concepts/job-lifecycle.md): what each state means and where funds go.
 - [Client API reference](./reference/client-api.md): every `/v1/*` route.

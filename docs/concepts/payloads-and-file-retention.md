@@ -30,10 +30,10 @@ Because `job_id` depends on `c`, a client that lost its connection mid-post can 
 
 The coordinator stores payload bytes in its object store, which pins them to IPFS. The IPFS content identifier (CID) it gets back is what goes on chain:
 
-- the input's CID becomes the job's `task_cid`, set in the same `post` transaction;
+- the input's CID becomes the job's `task_cid`, carried in the order and put on chain by the `claim` transaction;
 - the result's CID becomes `result_cid`, set in the same `settle` transaction.
 
-A job and its payload therefore land together or not at all. Anyone can fetch the bytes from an IPFS gateway by CID; they are sealed, so only the key holders can open them.
+The payload is stored before the name goes anywhere, so a job never names bytes that were not stored. Anyone can fetch the bytes from an IPFS gateway by CID; they are sealed, so only the key holders can open them.
 
 ## Inline or upload
 

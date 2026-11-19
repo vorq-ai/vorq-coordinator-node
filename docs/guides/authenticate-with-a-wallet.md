@@ -3,7 +3,7 @@ title: Authenticate with a wallet
 description: Get a session token for a client or provider wallet and use it on the routes that need one.
 ---
 
-A session token proves to one coordinator that you control an address. You need one for file uploads, batches and every provider write. Posting and cancelling jobs need none: the order and payment signatures are the authority there. See [Authentication model](../concepts/authentication-model.md).
+A session token proves to one coordinator that you control an address. You need one for file uploads, batches, the prepaid balance and every provider write. Posting and cancelling jobs need none: the order and cancel signatures are the authority there. See [Authentication model](../concepts/authentication-model.md).
 
 ## 1. Get a nonce
 

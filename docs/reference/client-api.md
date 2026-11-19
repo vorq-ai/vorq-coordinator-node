@@ -1,6 +1,6 @@
 ---
 title: Client API
-description: Every /v1/* route, for models, jobs, files and batches.
+description: Every /v1/* route, for models, jobs, the prepaid balance, files and batches.
 ---
 
 The request and response schema for every route on this page is in the [API reference](https://api.vorq.co/docs). This page covers the flow and what each refusal means.
@@ -37,14 +37,14 @@ One model by name. Names may contain `/`; send them as-is or percent-encoded.
 
 ### POST /v1/jobs
 
-Quote or submit an order. The same body, sent without and then with a payment, first returns a `402` quote and then posts the job. See [Submit a job](../guides/submit-a-job.md).
+Quote or submit an order. The same body, sent without and then with `amount`, first returns a `402` quote and then holds the job. See [Submit a job](../guides/submit-a-job.md).
 
-**Auth:** public (the order and payment signatures are the authority) · **Index-backed:** no · **Body limit:** 20 MiB
+**Auth:** public (the order signature is the authority) · **Index-backed:** no · **Body limit:** 20 MiB
 
 **Order** (every request):
 
 - `c` is the commitment to the sealed container, and `job_id` must equal `keccak256(owner ‖ c)`.
-- `owner` is the order's owner and payer; `signature` is its [`Order`](./signed-messages.md#order) signature.
+- `owner` is the order's owner, whose prepaid balance pays for it; `signature` is its [`Order`](./signed-messages.md#order) signature.
 - `rate_in` and `rate_out` are USD per million units, as decimal strings; the order signature covers them as `rate × 10^decimals` (see [Conventions](./conventions.md#numbers)). `units_in` and `units_out` are the most units the order pays for.
 - `designated` is `0` for an open bid, or the provider id the job is reserved for.
 - `sla_secs` must be an SLA the chain allows, at most `86400`.
@@ -53,12 +53,12 @@ Quote or submit an order. The same body, sent without and then with a payment, f
 
 **Submission** (second request only):
 
-- `auth_sig` is the owner's [`ReceiveWithAuthorization`](./signed-messages.md#receivewithauthorization) signature over the quoted authorization, and `amount` is the quoted `amount`.
+- `amount` is the quoted `amount`: what the claim will lock from the owner's prepaid balance.
 - Send exactly one of `container` (the sealed container, base64, up to 15 679 488 bytes decoded) and `container_cid` (the `vorq.cid` of an `input` upload by `owner`).
 
 **Market probe** (a body with neither `rate_in` nor `rate_out`): `model_id`, `sla_secs`, `units_in`, `units_out` and optional `designated`, `max_rate_in` and `max_rate_out`, unsigned. The answer is `402` with `{"candidates": [...]}` only: every live ask for the model and window at or under the ceilings named, ranked as below, with no quote. See [Matching and leases](../concepts/matching-and-leases.md#the-market-probe).
 
-**Response `402`**: the quote, when `auth_sig` is absent. `x-vorq-retryable: false`.
+**Response `402`**: the quote, when `amount` is absent. `x-vorq-retryable: false`.
 
 ```json
 {
@@ -68,14 +68,9 @@ Quote or submit an order. The same body, sent without and then with a payment, f
     "fee": "0.000096",
     "gas_fee": "0.002",
     "amount": "0.011696",
-    "authorization": {
-      "domain": { "name": "…", "version": "…", "chainId": 8453, "verifyingContract": "0x…" },
-      "to": "0x…",
-      "value": 11696,
-      "valid_after": 0,
-      "valid_before": 1786003601,
-      "nonce": "0x…"
-    }
+    "balance": "0.005",
+    "deposit": "0.008696",
+    "deposit_fee": "0.002"
   },
   "candidates": [
     { "provider_id": 7, "box_key": "0x…", "rate_in": "0.0015", "rate_out": "0.006", "rate_in_cached": "0.00075" }
@@ -84,15 +79,14 @@ Quote or submit an order. The same body, sent without and then with a payment, f
 }
 ```
 
-- `quote.cap` is the escrow ceiling in USD: `(rate_in·units_in + rate_out·units_out) / 10^6`, rounded up to the token's smallest unit and never below one (`"0.000001"` for USDC).
-- `quote.fee` is `cap · fee_bps / 10000`, rounded down to the smallest unit; `quote.gas_fee` is the flat relay charge, read from the `JobRegistry`; `quote.amount` is `cap + fee + gas_fee`.
-- `quote.authorization` is the payment to sign: the token domain, `to` the `JobRegistry`, `value` = `amount` in atomic token units (`amount × 10^decimals`, a JSON integer), `valid_after` `0`, `valid_before` = `expires_at + 1`, `nonce` = `job_id`.
+- `quote.cap` is the ceiling in USD: `(rate_in·units_in + rate_out·units_out) / 10^6`, rounded up to the token's smallest unit and never below one (`"0.000001"` for USDC).
+- `quote.fee` is `cap · fee_bps / 10000`, rounded down to the smallest unit; `quote.gas_fee` is the flat relay charge, read from the `JobRegistry`; `quote.amount` is `cap + fee + gas_fee`, what a claim locks.
+- `quote.balance` is the owner's available prepaid balance: its balance on chain less what its open orders reserve.
+- `quote.deposit` is what to [deposit](#post-v1deposits) before submitting: `"0"` when `balance` covers `amount`, otherwise `amount − balance + deposit_fee`, so the deposit credits exactly the shortfall. `quote.deposit_fee` is the flat fee the registry takes from each deposit.
 - `candidates` lists up to `MATCH_CANDIDATES` live providers whose ask clears the order, cheapest first, with the ask's rates and its listed `rate_in_cached` (at most `rate_in`, not signed); empty when none match. See [Matching and leases](../concepts/matching-and-leases.md).
-- `accepts` names the payment scheme and CAIP-2 network.
+- `accepts` names the deposit scheme and CAIP-2 network.
 
-**Response `201`**: the job was posted. `task_cid` is the IPFS CID the container was stored under. The job is normally readable at [`GET /v1/jobs/{id}`](#get-v1jobsid) as soon as this returns.
-
-**Response `202`**: `{job_id, task_cid}`, with no `tx_hash`. No live provider's ask clears the order, so the coordinator holds it instead of posting it. It reads as `queued` like any open job and is posted on chain when a provider takes it. See [Held orders](../concepts/matching-and-leases.md#held-orders).
+**Response `202`**: `{job_id, task_cid}`. The coordinator holds the order; `task_cid` is the IPFS CID the container was stored under. The job reads as `queued` at [`GET /v1/jobs/{id}`](#get-v1jobsid) as soon as this returns, and goes on chain inside the claim of the provider that takes it. See [Held orders](../concepts/matching-and-leases.md#held-orders).
 
 **Errors**
 
@@ -101,18 +95,16 @@ Quote or submit an order. The same body, sent without and then with a payment, f
 | `400` | `null` | A malformed field (`param` names it as a path); `job_id` mismatch; `expires_at` out of range; `sla_secs` over 86400 or not allowed; model not enabled. |
 | `400` | `cap_overflow` | `cap` exceeds 2^53 − 1, the largest amount the API carries. |
 | `400` | `invalid_order_signature` | `signature` does not recover to `owner`. |
-| `400` | `container_without_payment` | A container was sent without `auth_sig`. |
-| `400` | `container_required` | `auth_sig` was sent without a container. |
+| `400` | `container_without_payment` | A container was sent without `amount`. |
+| `400` | `container_required` | `amount` was sent without a container. |
 | `400` | `container_ambiguous` | Both `container` and `container_cid`. |
-| `400` | `invalid_payment_signature` | `auth_sig` does not recover to `owner` over the authorization for `amount`. |
-| `400` | `payer_has_code` | `owner` has contract code (a smart account or an EIP-7702 delegation). Pay from an account with no code. |
 | `400` | `unknown_container` | `container_cid` names no `input` upload by `owner`, or it expired. |
 | `400` | `too_short`, `bad_version`, `commitment_mismatch` | The container is malformed or does not reproduce `c`. |
-| `409` | *(quote body)* | `amount` is not the current `cap + fee + gas_fee`, usually because `gas_fee` or `fee_bps` changed. The body is a fresh `{quote, candidates, accepts}`. Sign a new payment and resubmit. |
-| `409` | contract error name | The chain refuses the post, for example `DuplicateJob` (use a fresh `c`). |
-| `429`, `503`, `504` | | See [Errors](./errors.md). |
+| `409` | *(quote body)* | `amount` is not the current `cap + fee + gas_fee` (`gas_fee` or `fee_bps` changed), or the available balance no longer covers it. The body is a fresh `{quote, candidates, accepts}`. Make its `deposit` and resubmit with its `amount`. |
+| `409` | `DuplicateJob` | This `job_id` is already taken, here or on chain. Use a fresh `c`. |
+| `429`, `503` | | See [Errors](./errors.md). |
 
-The quote is answered after the order signature is checked and before model, SLA-allowlist and payer checks, so a `402` does not guarantee the submission will pass them.
+The quote is answered after the order signature is checked and before the model, SLA-allowlist and duplicate checks, so a `402` does not guarantee the submission will pass them.
 
 ### GET /v1/jobs/{id}
 
@@ -120,7 +112,7 @@ The client view of one job, by `job_id`.
 
 **Auth:** public · **Index-backed:** yes
 
-`status` is `queued`, `in_progress`, `completed`, `failed` or `cancelled`; see [Job lifecycle](../concepts/job-lifecycle.md#states). `in_progress_at` is the claim time, `null` before a claim. `result_cid` is the sealed result's IPFS CID once settled, else `null`. `model` is `null` if the catalog does not know the model. `vorq.gas_fee` is the relay gas fee in USD fixed for the job when it was posted: paid once the job is claimed, whether it then settles, fails or is reclaimed, and never by a job cancelled or expired while open. `vorq.fee` is the protocol fee in USD that settlement took on top of the charge; `"0"` for a job that did not settle. `vorq.prompt_tok`, `vorq.cached_tok`, `vorq.completion_tok` and `vorq.rate_in_cached` are what settlement billed (see [When funds move](../concepts/job-lifecycle.md#when-funds-move)), `0` until settled.
+`status` is `queued`, `in_progress`, `completed`, `failed` or `cancelled`; see [Job lifecycle](../concepts/job-lifecycle.md#states). `in_progress_at` is the claim time, `null` before a claim. `result_cid` is the sealed result's IPFS CID once settled, else `null`. `model` is `null` if the catalog does not know the model. `vorq.gas_fee` is the relay gas fee in USD the order was quoted at, and once claimed the one the claim locked: paid once the job is claimed, whether it then settles, fails or is reclaimed, and never by a job cancelled or expired while open. `vorq.fee` is the protocol fee in USD that settlement took on top of the charge; `"0"` for a job that did not settle. `vorq.prompt_tok`, `vorq.cached_tok`, `vorq.completion_tok` and `vorq.rate_in_cached` are what settlement billed (see [When funds move](../concepts/job-lifecycle.md#when-funds-move)), `0` until settled.
 
 **Errors:** `400` for a malformed id; `404` until the coordinator has a record of the job.
 
@@ -136,16 +128,91 @@ Cancel an open job. See [Cancel a job](../guides/cancel-a-job.md).
 
 `signature` is the owner's [`Cancel`](./signed-messages.md#cancel) signature over `(id, issued_at)`, with `issued_at` within ±600 seconds of the coordinator's clock.
 
-Cancelling a job that has already settled or ended succeeds and changes nothing. Cancelling a [held order](../concepts/matching-and-leases.md#held-orders) answers `200 {job_id}` with no `tx_hash`: nothing was on chain to cancel.
+An open job is an order the coordinator holds, not yet on chain, so the cancel ends it in the coordinator and nothing is relayed. **Response `200`:** `{job_id}`.
 
 **Errors**
 
 | Status | `code` | Cause |
 | --- | --- | --- |
+| `404` | `null` | No job under this id. |
 | `409` | `StaleOp` | `issued_at` outside ±600 seconds. |
-| `409` | `NotCancellable` | The job is claimed. |
-| `409` | `NotTheOwner` | The signature does not recover to the job's owner, or the job does not exist. |
-| `409` | other contract error name | The chain refused the cancel. |
+| `409` | `NotTheOwner` | The signature does not recover to the job's owner. |
+| `409` | `NotOpen` | The job was claimed, settled or already cancelled. |
+| `409` | `order_leased` | A provider holds the order and may be claiming it. Cancel again once its lease lapses unclaimed. |
+| `503` | | See [Errors](./errors.md). |
+
+## Balance
+
+A client pays for jobs from a prepaid balance the `JobRegistry` holds for it. Every route here needs a [session](../guides/authenticate-with-a-wallet.md); the two writes are authorised by the owner's signature in the body, relayed and paid for by the coordinator, and simulated before anything is sent. All three answer the same **balance body**:
+
+```json
+{ "owner": "0x…", "balance": "0.05", "reserved": "0.01606", "available": "0.03394", "deposit_fee": "0.002" }
+```
+
+- `balance` is `JobRegistry.balanceOf(owner)`, already net of every claimed job's lock.
+- `reserved` is what the owner's open orders will lock when they are claimed.
+- `available` is `balance − reserved`, never below `0`: what a new order or a withdrawal can draw on.
+- `deposit_fee` is the flat fee the registry takes from each deposit.
+
+Deposits, withdrawals and submissions of one owner decide against its balance one at a time, and deposits plus withdrawals count against `MONEY_RATE_LIMIT` (default 24) per wallet per 24 hours.
+
+### GET /v1/balance
+
+The balance body for `?owner=0x…`.
+
+**Auth:** session · **Index-backed:** no
+
+### POST /v1/deposits
+
+Relay a deposit into the prepaid balance.
+
+**Auth:** session (the authorization signature is the authority) · **Index-backed:** no
+
+**Request**
+
+```json
+{ "owner": "0x…", "value": "0.05", "valid_before": 1786003600, "nonce": "0x…", "auth_sig": "0x…" }
+```
+
+`auth_sig` is the owner's [`ReceiveWithAuthorization`](./signed-messages.md#receivewithauthorization) to the `JobRegistry` for `value` (USD, signed as `value × 10^decimals`), with `validAfter` `0`, `valid_before` and a random 32-byte `nonce`. The registry credits `value − deposit_fee`.
+
+**Response `200`:** the balance body after the deposit. An authorization that was already used answers `200` with the current balance, and nothing is relayed.
+
+**Errors**
+
+| Status | `code` | Cause |
+| --- | --- | --- |
+| `400` | `null` | A malformed field; `value` with more fraction digits than the token has. |
+| `400` | `payer_has_code` | `owner` has contract code (a smart account or an EIP-7702 delegation). Deposit from an account with no code. |
+| `401` | `invalid_session` | No valid session. |
+| `409` | contract error name | The chain refuses the deposit, for example `BadDepositValue` (`value` at or under `deposit_fee`), or `unknown` for a refusal by the payment token. |
+| `429`, `503`, `504` | | See [Errors](./errors.md). |
+
+### POST /v1/withdrawals
+
+Relay a withdrawal from the prepaid balance to the owner's wallet.
+
+**Auth:** session (the owner's signature is the authority) · **Index-backed:** no
+
+**Request**
+
+```json
+{ "owner": "0x…", "amount": "0.01", "issued_at": 1786000000, "signature": "0x…" }
+```
+
+`signature` is the owner's [`Withdraw`](./signed-messages.md#withdraw) signature over `(amount × 10^decimals, issued_at)`. `issued_at` must be within ±600 seconds of the coordinator's clock and greater than the owner's last withdrawal's.
+
+**Response `200`:** the balance body after the withdrawal.
+
+**Errors**
+
+| Status | `code` | Cause |
+| --- | --- | --- |
+| `400` | `null` | A malformed field; `amount` of `0`. |
+| `401` | `invalid_session` | No valid session. |
+| `409` | `insufficient_balance` | `amount` is more than `available`. Open orders keep what they reserve. |
+| `409` | `StaleOp` | `issued_at` outside ±600 seconds, or not after the owner's last withdrawal. |
+| `409` | other contract error name | The chain refuses the withdrawal, for example `InvalidWithdrawSignature`. |
 | `429`, `503`, `504` | | See [Errors](./errors.md). |
 
 ## Files
@@ -260,7 +327,7 @@ One [batch object](#batch-object) plus `as_of_block`.
 
 ### POST /v1/batches/{id}/cancel
 
-Stop a batch. Lines not yet posted are not posted. Lines already on chain are not cancelled: open ones stay open until claimed or expired, and claimed ones run to completion. The owner can [cancel each job](#post-v1jobsidcancel). Repeating the call is a no-op.
+Stop a batch. Lines not yet held are not held. Lines already held are not cancelled: open ones stay open until claimed or expired, and claimed ones run to completion. The owner can [cancel each job](#post-v1jobsidcancel). Repeating the call is a no-op.
 
 **Auth:** session; only the batch's owner · **Index-backed:** yes
 
@@ -296,7 +363,7 @@ Results are sealed to the owner, so `body` is always `null`: fetch each result b
 **Error file**: one line per input line that did not settle.
 
 ```json
-{"id":"batch_req_5e2a…_2","custom_id":null,"response":null,"error":{"code":"invalid_payment_signature","message":"…"},"vorq":{"job_id":null,"line":2}}
+{"id":"batch_req_5e2a…_2","custom_id":null,"response":null,"error":{"code":"insufficient_funds","message":"…"},"vorq":{"job_id":null,"line":2}}
 ```
 
 | `error.code` | Cause |
@@ -306,9 +373,10 @@ Results are sealed to the owner, so `body` is always `null`: fetch each result b
 | `container_required`, `unknown_container`, `too_short`, `bad_version`, `commitment_mismatch` | Missing, unknown or invalid container. |
 | `order_expired`, `expiry_too_far`, `sla_too_long`, `cap_overflow` | Order terms out of range when the batch was processed. |
 | `insufficient_payment` | `amount` is not exactly `cap + fee + gas_fee`. |
-| `invalid_order_signature`, `invalid_payment_signature`, `payer_has_code` | Signature or payer checks failed. |
+| `invalid_order_signature` | The order signature does not recover to `owner`. |
+| `insufficient_funds` | The owner's available balance, after the lines before it, does not cover the line's `amount`. |
 | `duplicate_job_id` | Another line in the file has the same `job_id`. |
+| `DuplicateJob` | An order outside this batch already has the line's `job_id`. |
 | `invalid_model` | The model is not enabled. |
-| `cancelled` | The batch was cancelled before the line was posted, or the owner cancelled the job. |
-| `provider_fail`, `reclaim`, `expired` | Posted, but the provider failed it, missed its SLA, or nobody claimed it in time. |
-| contract error name | The chain refused to post the line. |
+| `cancelled` | The batch was cancelled before the line was held, or the owner cancelled the job. |
+| `provider_fail`, `reclaim`, `expired` | Held, but the provider failed it, missed its SLA, or nobody claimed it in time. |

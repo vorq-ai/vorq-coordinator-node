@@ -24,11 +24,11 @@ import type { KeyEpochStart } from "./release.js";
  * There are two orphan predicates in this codebase and they are deliberately not
  * the same function:
  *
- *   * **`isEscrowOrphan` (`release.ts`) is chain-only**, because P7 forbids
- *     `/release` from reading Postgres. `JobView` carries no posting block, so it
- *     proves the posting predates the epoch through `expiresAt < epoch.time` — an
- *     order cannot be posted with an expiry already past, so an expiry before the
- *     epoch puts the posting before it too. Sufficient, never necessary.
+ *   * **`isEscrowOrphan` (`release.ts`) reads only the order's own members**,
+ *     `designated` and `expires_at`. It proves the order predates the epoch
+ *     through `expiresAt < epoch.time` — an order cannot be accepted with an
+ *     expiry already past, so an expiry before the epoch puts the order before it
+ *     too. Sufficient, never necessary.
  *   * **this one reads `posted_block`**, because the book reads the projection
  *     anyway and the column is right there. It is the direct measurement the
  *     other one has to infer.
@@ -55,14 +55,12 @@ import type { KeyEpochStart } from "./release.js";
 /**
  * `posted_block = 0` means **unknown**, never **ancient** (I9).
  *
- * `reconcileJob` upserts a row from `getJob`, which carries no posting block, so
- * a row inserted ahead of its indexed log takes the column's `DEFAULT 0` until
- * the reducer's `Posted` corrects it. Jobs this node posts are written through
- * from their receipt with their real block, so the 0 is reached on a refusal's
- * repair of a job the index has not reduced yet — still among the newest jobs in
- * the book — and reading it as a block number would hide them, silently. `posted_block > 0` is
- * what keeps "the log has not landed yet" out of "posted before this node's
- * keys".
+ * A held order (`match/held.ts`) takes the index cursor at the moment it was
+ * accepted, and the reducer's `Posted` writes the claim's block over it. A node
+ * that has indexed nothing yet has cursor 0, and an order it accepts then reads
+ * as block 0 — the newest order in the book — so reading 0 as a block number
+ * would hide it, silently. `posted_block > 0` is what keeps "not known" out of
+ * "accepted before this node's keys".
  *
  * **Exported because it now has a second caller.** `GET /evm/jobs`'s
  * `posted_before` filter is the same question asked for a different reason —

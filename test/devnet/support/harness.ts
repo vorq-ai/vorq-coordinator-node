@@ -1,5 +1,5 @@
 import { execFileSync, spawn } from "node:child_process";
-import { formatUsd } from "../../../src/money.js";
+import { formatUsd, parseUsd } from "../../../src/money.js";
 import { createHash, randomBytes } from "node:crypto";
 import { readFileSync, statSync } from "node:fs";
 import { createServer } from "node:http";
@@ -21,7 +21,8 @@ import { makeChain, type Chain } from "../../../src/chain/client.js";
 import { loadConfig, type Address, type Config, type Env } from "../../../src/config.js";
 import { dropDerived, openDb, type Db } from "../../../src/db/db.js";
 import { startIndexer, type Indexer } from "../../../src/index/indexer.js";
-import { assertDomains, authorizationTypedData, capOf, feeOf, jobIdOf, orderTypedData, taskCidHex, type Terms } from "../../../src/orders.js";
+import { assertDomains, capOf, feeOf, jobIdOf, orderTypedData, taskCidHex, type Terms } from "../../../src/orders.js";
+import { jobRegistryAbi } from "../../../src/abi/jobRegistry.js";
 import { commitmentOf, CONTAINER_TAG, SEED_WRAP_BYTES } from "../../../src/container.js";
 import { startStubStore } from "../../support/stub-store.js";
 import { EIP712_NAMES } from "../../../src/orders.js";
@@ -1106,7 +1107,7 @@ export function freshTerms(c: Hex, overrides: Partial<Terms> = {}): Terms {
  *
  * **Flat**, because the door is: `parseOrder` reads `c`, `owner`, `job_id`, the
  * nine chain members and `signature` straight off the body, with no envelope,
- * and `auth_sig` / `amount` / `container` sit beside them. A `{ vorq: … }`
+ * and `amount` / `container` sit beside them. A `{ vorq: … }`
  * wrapper is answered `400 "c must be a string"`.
  */
 export const wireOrder = (terms: Terms, owner: ViemAddress, signature: Hex) => ({
@@ -1126,26 +1127,27 @@ export const wireOrder = (terms: Terms, owner: ViemAddress, signature: Hex) => (
 
 export interface PostedJob {
   jobId: Hex;
-  txHash: Hex;
+  /**
+   * The head when the node accepted the order. An accepted order is held, not
+   * posted — it goes on chain inside the claim — so this is the block a scenario
+   * waits past rather than the block of a transaction.
+   */
   blockNumber: bigint;
   terms: Terms;
-  /** The name the node's own pin minted, off the `201`. Nothing else knows it. */
+  /** The order's owner and signature: what `claim` carries on chain. */
+  owner: Address;
+  orderSig: Hex;
+  /** The name the node's own pin minted, off the `202`. Nothing else knows it. */
   taskCid: string;
 }
 
-/**
- * The whole client flow through the node: 402 challenge, authorization, resubmit.
- *
- * Signs with viem, exactly as a client SDK would (Anvil key #4), and **sends
- * nothing itself** — the node relays and pays.
- */
 /**
  * The half of a node a post needs: its configuration, and a way to reach it.
  *
  * Both {@link RunningNode} and {@link NodeProcess} satisfy this structurally, and
  * that is the point — Plan 3's escrow scenarios drive **spawned** instances, and a
  * `postJob` typed on the in-process node would have forced either a second copy
- * of the 402/authorization/resubmit dance or an in-process node this suite has no other
+ * of the 402/deposit/resubmit dance or an in-process node this suite has no other
  * reason to build.
  */
 export interface JobPoster {
@@ -1153,6 +1155,72 @@ export interface JobPoster {
   json<T = unknown>(path: string, init?: RequestInit): Promise<{ status: number; body: T }>;
 }
 
+const RECEIVE_WITH_AUTHORIZATION_TYPES = {
+  ReceiveWithAuthorization: [
+    { name: "from", type: "address" },
+    { name: "to", type: "address" },
+    { name: "value", type: "uint256" },
+    { name: "validAfter", type: "uint256" },
+    { name: "validBefore", type: "uint256" },
+    { name: "nonce", type: "bytes32" },
+  ],
+} as const;
+
+/**
+ * Deposits `value` atomic units — deposit fee included — into `client`'s prepaid
+ * balance: one EIP-3009 authorization the client signs under the payment token's
+ * domain, landed by the relayer. `JobRegistry.deposit` never reads `msg.sender`,
+ * so this is the same transition `POST /v1/deposits` relays.
+ */
+export async function depositOnChain(
+  addresses: Config["addresses"],
+  value: bigint,
+  client = clientAccount(),
+): Promise<void> {
+  const nonce = `0x${randomBytes(32).toString("hex")}` as Hex;
+  const validBefore = BigInt(Math.floor(Date.now() / 1000) + 3600);
+  const authSig = await client.signTypedData({
+    domain: {
+      name: addresses.tokenDomain.name,
+      version: addresses.tokenDomain.version,
+      chainId: addresses.chainId,
+      verifyingContract: addresses.usdc,
+    },
+    types: RECEIVE_WITH_AUTHORIZATION_TYPES,
+    primaryType: "ReceiveWithAuthorization",
+    message: {
+      from: client.address,
+      to: addresses.jobRegistry,
+      value,
+      validAfter: 0n,
+      validBefore,
+      nonce,
+    },
+  });
+  const wallet = createWalletClient({
+    account: privateKeyToAccount(ANVIL_KEYS.relayer),
+    chain: devnetChain(addresses.chainId),
+    transport: http(RPC_URL),
+  });
+  const hash = await wallet.writeContract({
+    address: addresses.jobRegistry,
+    abi: jobRegistryAbi,
+    functionName: "deposit",
+    args: [client.address, value, validBefore, nonce, authSig],
+    chain: devnetChain(addresses.chainId),
+    account: wallet.account,
+  });
+  const receipt = await publicClientOf(addresses.chainId).waitForTransactionReceipt({ hash });
+  if (receipt.status !== "success") throw new Error(`deposit reverted for ${client.address}`);
+}
+
+/**
+ * The whole client flow through the node: 402 challenge, the deposit it names,
+ * resubmit.
+ *
+ * Signs with viem, exactly as a client SDK would (Anvil key #4). The node holds
+ * the order; it goes on chain inside the provider's claim.
+ */
 export async function postJob(
   node: JobPoster,
   task: TaskContainer,
@@ -1168,54 +1236,43 @@ export async function postJob(
   // **The challenge carries no container**, and that is the protocol rather than
   // an economy: a body carrying the bytes is a complete submission and the node
   // refuses to answer one with a quote, precisely so this second round trip does
-  // not cost the upload twice. The 402 comes first and carries the amount to
-  // sign; it is read from the challenge rather than recomputed, because R7 makes
-  // the echoed amount the thing the node verifies against.
-  const challenge = await node.json<{ quote: { amount: string } }>("/v1/jobs", jsonBody(body));
+  // not cost the upload twice. The 402 names the amount the claim will lock and
+  // the deposit to make first; the amount is echoed, because R7 makes it the
+  // thing the node verifies against.
+  const challenge = await node.json<{ quote: { amount: string; deposit: string } }>(
+    "/v1/jobs",
+    jsonBody(body),
+  );
   if (challenge.status !== 402) {
     throw new Error(`expected 402, got ${challenge.status}: ${JSON.stringify(challenge.body)}`);
   }
-  const amount = BigInt(challenge.body.quote.amount);
+  const deposit = parseUsd(challenge.body.quote.deposit, addresses.decimals);
+  if (deposit > 0n) await depositOnChain(addresses, deposit, client);
 
-  const jobId = jobIdOf(client.address as Address, terms.c);
-  const authSig = await client.signTypedData(
-    authorizationTypedData(addresses, {
-      from: client.address as Address,
-      to: addresses.jobRegistry,
-      value: amount,
-      validBefore: terms.expiresAt + 1n,
-      jobId,
-    }) as never,
-  );
-
-  // The bytes ride with the payment, and only here.
-  const posted = await node.json<{ job_id: Hex; tx_hash: Hex; task_cid: string }>(
+  // The bytes ride with the amount, and only here.
+  const posted = await node.json<{ job_id: Hex; task_cid: string }>(
     "/v1/jobs",
     jsonBody({
       ...body,
       container: task.bytes.toString("base64"),
-      auth_sig: authSig,
-      amount: formatUsd(amount, 6),
+      amount: challenge.body.quote.amount,
     }),
   );
-  if (posted.status !== 201) {
+  if (posted.status !== 202) {
     throw new Error(`POST /v1/jobs answered ${posted.status}: ${JSON.stringify(posted.body)}`);
   }
   if (typeof posted.body.task_cid !== "string" || posted.body.task_cid === "") {
-    // The caller cannot compute this name and has nothing to read it from until
-    // the post is indexed, so a `201` without it is a job whose payload the
-    // client can never locate.
-    throw new Error(`POST /v1/jobs answered 201 without a task_cid: ${JSON.stringify(posted.body)}`);
+    // The caller cannot compute this name, so a `202` without it is a job whose
+    // payload the client can never locate.
+    throw new Error(`POST /v1/jobs answered 202 without a task_cid: ${JSON.stringify(posted.body)}`);
   }
 
-  const receipt = await publicClientOf(addresses.chainId).getTransactionReceipt({
-    hash: posted.body.tx_hash,
-  });
   return {
-    jobId,
-    txHash: posted.body.tx_hash,
-    blockNumber: receipt.blockNumber,
+    jobId: jobIdOf(client.address as Address, terms.c),
+    blockNumber: await publicClientOf(addresses.chainId).getBlockNumber(),
     terms,
+    owner: client.address as Address,
+    orderSig,
     taskCid: posted.body.task_cid,
   };
 }

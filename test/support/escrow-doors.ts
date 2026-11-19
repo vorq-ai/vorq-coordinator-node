@@ -3,6 +3,7 @@ import type { WireTypeProvider } from "../../src/api/deps.js";
 import { escrowRoutes } from "../../src/api/escrow.js";
 import { compileSchema } from "../../src/api/schemas/ajv.js";
 import type { Config } from "../../src/config.js";
+import type { Db } from "../../src/db/db.js";
 
 /** One route the escrow plugin registers, as Fastify's router reports it. */
 export interface EscrowDoor {
@@ -37,6 +38,7 @@ export async function escrowDoors(): Promise<EscrowDoor[]> {
 
   escrowRoutes(probe, {
     config: { escrow: { mode: "off" } } as unknown as Config,
+    db: {} as unknown as Db,
     keys: null,
   });
   await probe.ready();

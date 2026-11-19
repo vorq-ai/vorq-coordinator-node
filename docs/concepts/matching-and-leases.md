@@ -21,13 +21,15 @@ A `402` quote lists up to `MATCH_CANDIDATES` (default 3) providers that:
 
 They are ordered by what the order would cost at their ask, cheapest first. Among equally priced providers, the one picked least recently comes first, and each open-bid quote marks its first candidate as picked, so successive quotes rotate across them.
 
-The client seals to the first candidate and sets `designated` to its id. An empty list means no live provider currently matches; the order can still be posted as an open bid.
+The client seals to the first candidate and sets `designated` to its id. An empty list means no live provider currently matches; the order can still be submitted as an open bid.
 
 ## Held orders
 
-A paid order is posted on chain at once only when a live provider's ask clears it, by the same conditions as the candidates above. Otherwise the coordinator holds it: the order is stored with its signatures, answered `202`, and listed as an open job, but no transaction is sent.
+Every submitted order is held: the coordinator stores it with its order signature, answers `202`, and lists it as an open job, but sends no transaction.
 
-A held order goes on chain when a provider's poll leases it. The provider's own filters (`model`, `min_rate_in`, `min_rate_out`) decide that, so the order is posted for a provider that will take it. Until then it costs no gas, collects no payment, and can be cancelled by its owner. It expires at its `expires_at` like any open job.
+A held order goes on chain inside the claim of the provider that takes it: `claim` carries the signed order, so the order is recorded and claimed in one transaction. Until then it costs no gas, locks nothing, and can be cancelled by its owner. It expires at its `expires_at` like any open job. While a provider's claim of it is being relayed, it holds the order's lease and the owner's cancel is refused `order_leased`.
+
+A claim is refused `GasFeeChanged` when the order was quoted at a gas fee other than the live one, and `InsufficientDeposit` when the owner's balance, less the locks of its other claims in flight, does not cover the order.
 
 ## The market probe
 

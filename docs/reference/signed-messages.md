@@ -9,7 +9,7 @@ Every write is authorised by an EIP-712 signature (65 bytes, `0x`-hex). Field wi
 
 | Domain `name` | `version` | `chainId` | `verifyingContract` | Types |
 | --- | --- | --- | --- | --- |
-| `VORQ Jobs` | `2` | deployment chain | `JobRegistry` | `Order`, `Cancel`, `Claim`, `Settle`, `Fail` |
+| `VORQ Jobs` | `2` | deployment chain | `JobRegistry` | `Order`, `Cancel`, `Claim`, `Settle`, `Fail`, `Withdraw` |
 | `VORQ Providers` | `2` | deployment chain | `ProviderRegistry` | `SetIdentity`, `RequestCapacity` |
 | `VORQ Asks` | `2` | deployment chain | `AskRegistry` | `AskSnapshot` |
 | payment token's `token_domain.name` | `token_domain.version` | deployment chain | payment token | `ReceiveWithAuthorization` |
@@ -26,7 +26,7 @@ At boot the coordinator checks the job, provider, ask and payment-token domains 
 Order(bytes32 c,uint32 modelId,uint32 slaSecs,uint128 rateIn,uint128 rateOut,uint32 unitsIn,uint32 unitsOut,uint32 designated,uint64 expiresAt)
 ```
 
-Signed by the owner. Used by [`POST /v1/jobs`](./client-api.md#post-v1jobs). `taskCid` is not signed: the coordinator mints it when it stores the container. `rateIn` and `rateOut` are the body's USD rates times 10^decimals: `"0.05"` is signed as `50000` (see [Conventions](./conventions.md#numbers)).
+Signed by the owner. Used by [`POST /v1/jobs`](./client-api.md#post-v1jobs); the coordinator holds it and the provider's `claim` carries it on chain, where the contract recovers it. `taskCid` is not signed: the coordinator mints it when it stores the container. `rateIn` and `rateOut` are the body's USD rates times 10^decimals: `"0.05"` is signed as `50000` (see [Conventions](./conventions.md#numbers)).
 
 ### Cancel
 
@@ -34,7 +34,7 @@ Signed by the owner. Used by [`POST /v1/jobs`](./client-api.md#post-v1jobs). `ta
 Cancel(bytes32 jobId,uint64 issuedAt)
 ```
 
-Signed by the owner. Used by [`POST /v1/jobs/{id}/cancel`](./client-api.md#post-v1jobsidcancel). `issuedAt` within ±600 seconds.
+Signed by the owner. Used by [`POST /v1/jobs/{id}/cancel`](./client-api.md#post-v1jobsidcancel), where the coordinator recovers it against the held order's owner. `issuedAt` within ±600 seconds.
 
 ### Claim
 
@@ -59,6 +59,14 @@ Fail(bytes32 jobId,uint64 issuedAt)
 ```
 
 Signed by the provider wallet. `op: "fail"`. `issuedAt` within ±600 seconds.
+
+### Withdraw
+
+```
+Withdraw(uint128 amount,uint64 issuedAt)
+```
+
+Signed by the owner. Used by [`POST /v1/withdrawals`](./client-api.md#post-v1withdrawals). `amount` is the body's USD amount times 10^decimals. `issuedAt` within ±600 seconds, and greater than the owner's last withdrawal's.
 
 ## Provider registry
 
@@ -89,7 +97,7 @@ Ask(uint32 modelId,uint32 sla,uint128 rateIn,uint128 rateOut)
 
 Signed by the provider wallet. Used by [`PUT /evm/asks`](./provider-api.md#put-evmasks). At most 64 quotes; `signedAt` newer than the provider's last and at most one hour ahead. `rateIn` and `rateOut` are the body's USD rates times 10^decimals, as in `Order`.
 
-## Payment
+## Deposit
 
 ### ReceiveWithAuthorization
 
@@ -97,18 +105,18 @@ Signed by the provider wallet. Used by [`PUT /evm/asks`](./provider-api.md#put-e
 ReceiveWithAuthorization(address from,address to,uint256 value,uint256 validAfter,uint256 validBefore,bytes32 nonce)
 ```
 
-EIP-3009, in the payment token's own domain. Signed by the owner as `auth_sig` on [`POST /v1/jobs`](./client-api.md#post-v1jobs).
+EIP-3009, in the payment token's own domain. Signed by the owner as `auth_sig` on [`POST /v1/deposits`](./client-api.md#post-v1deposits).
 
 | Field | Value |
 | --- | --- |
-| `from` | the order's `owner` |
+| `from` | the depositing `owner` |
 | `to` | the `JobRegistry` |
-| `value` | the quote's `authorization.value`: its USD `amount` times 10^decimals |
+| `value` | the body's USD `value` times 10^decimals, deposit fee included |
 | `validAfter` | `0` |
-| `validBefore` | `expires_at + 1` |
-| `nonce` | the `job_id` |
+| `validBefore` | the body's `valid_before` |
+| `nonce` | the body's `nonce`, 32 random bytes |
 
-The payer must be an account with no contract code. The token collects the payment when the job is claimed.
+The depositor must be an account with no contract code. Each authorization can be used once.
 
 ## Escrow
 

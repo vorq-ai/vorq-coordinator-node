@@ -160,10 +160,14 @@ describe("every request-path chain read is classified (R77)", () => {
     expect(guarded).toEqual([
       // `resolveProviderId` — `POST /evm/ops`, `PUT /evm/asks`, the handshake.
       "api/deps.ts",
-      // `tokenBalance` — the payer's funds, read by `POST /v1/jobs`, the batch
-      // worker and the claim gate.
+      // `balanceOf` — the owner's prepaid balance, read by `POST /v1/jobs`, the
+      // balance doors and the batch worker.
       "api/funding.ts",
-      // The advisory gate's six reads, through one wrapped helper.
+      // `authorizationState` — whether a deposit authorization is spent, read
+      // by `POST /v1/deposits` before and after it relays.
+      "api/routes/balance.ts",
+      // The claim gates' reads — the advisory gate's ladder and the claim
+      // relay's funds gate — through one wrapped helper.
       "api/routes/ops.ts",
       // `registryFloor` — `lastIdentityAt` / `lastCapacityAt`, the registry ops'
       // monotonic floor. Wrapped by the ruling that ended the one opt-out, which
@@ -193,10 +197,10 @@ describe("every request-path chain read is classified (R77)", () => {
    */
   it("knows every read that is off the request path, one by one", () => {
     expect(offRequestPath.map((read) => read.file)).toEqual([
-      // `chainParams`' four cells — `feeBps`, `gasFee`, `treasury`, `allowedSla`
-      // — each wrapped by its caller rather than at the cell: `post.ts`'s
-      // `configRead`, and for `feeBps` the `viewRead`s in `routes/relay.ts` and
-      // `routes/jobs.ts`.
+      // `chainParams`' five cells — `feeBps`, `gasFee`, `depositFee`,
+      // `treasury`, `allowedSla` — each wrapped by its caller rather than at the
+      // cell: `post.ts`'s `configRead`, the balance doors, and for `feeBps` the
+      // `viewRead`s in `routes/relay.ts` and `routes/jobs.ts`.
       // Plus `slaFacts`' two boot-time reads.
       "chain/client.ts",
       "chain/client.ts",
@@ -204,10 +208,14 @@ describe("every request-path chain read is classified (R77)", () => {
       "chain/client.ts",
       "chain/client.ts",
       "chain/client.ts",
-      // `tryReconcileJob`'s best-effort repair: its `getJob`, and the `feeBps`
-      // a settled row's fee is priced at.
+      "chain/client.ts",
+      // `tryReconcileJob`'s best-effort repair: its `getJob`.
       "index/reconcile.ts",
-      "index/reconcile.ts",
+      // The payout keeper's three reads, `earned`, `relayerEarned` and
+      // `accrued`: a timer, no caller, a failure reported to the log.
+      "keepers/payouts.ts",
+      "keepers/payouts.ts",
+      "keepers/payouts.ts",
       // The boot-time deployment check, `assertDomains`. One read because the
       // four contracts — the three registries and the payment token — are read
       // through a single call site.

@@ -8,10 +8,8 @@ import type { Indexer, IndexerStatus } from "../src/index/indexer.js";
 import { sessionDomain } from "../src/api/routes/auth.js";
 import {
   bareRevert,
-  refusedBroadcast,
   refusedCall,
   stubChain,
-  stubTxHash,
   testConfig,
   unreachableEndpoint,
   type StubOptions,
@@ -38,51 +36,89 @@ const stubIndexer = (): Indexer => ({
   stop: async () => undefined,
 });
 
+/** One held order, as `/evm/simulate/claim` reads it from this node's own row. */
+interface HeldRowStub {
+  owner: Buffer;
+  c: Buffer;
+  model_id: bigint;
+  sla_secs: bigint;
+  designated: bigint;
+  rate_in: bigint;
+  rate_out: bigint;
+  units_in: bigint;
+  units_out: bigint;
+  expires_at: bigint;
+  task_cid: Buffer;
+  gas_fee: bigint;
+  order_sig: Buffer;
+}
+
+const OWNER = `0x${"aa".repeat(20)}`;
+
 /**
- * A database no test in the chain half ever reaches, with exactly one exception:
- * the `DELETE` that `/evm/simulate/claim` issues to drop a job row the chain
- * does not have. R22 pins where this route's *answer* comes from, and that
- * statement contributes to no answer — so it is recorded rather than refused,
- * and every read still throws.
+ * A held order whose lock is `cap + feeCap + gasFee` = 210 + 2 + 30 000 =
+ * 30 212 atomic at 100 bps: cap `ceil((30 000·1000 + 90 000·2000) / 1e6)`.
  */
-const unreachableDb = (deletes: unknown[][] = []): Db => ({
+const heldRow = (overrides: Partial<HeldRowStub> = {}): HeldRowStub => ({
+  owner: Buffer.from(OWNER.slice(2), "hex"),
+  c: Buffer.alloc(32, 0xbb),
+  model_id: 7n,
+  sla_secs: 3600n,
+  designated: 0n,
+  rate_in: 30_000n,
+  rate_out: 90_000n,
+  units_in: 1000n,
+  units_out: 2000n,
+  expires_at: 4_102_444_800n,
+  task_cid: Buffer.from("bafkreitaskcid", "utf8"),
+  gas_fee: 30_000n,
+  order_sig: Buffer.alloc(65, 0xab),
+  ...overrides,
+});
+
+/**
+ * The one read `/evm/simulate/claim` makes of this node's database: the held
+ * order under the id, recorded so a test can count it. An unclaimed order exists
+ * only here, so that is where its terms come from; every verdict on them is a
+ * chain view read. Every other statement throws.
+ */
+const heldDb = (row: HeldRowStub | null = heldRow(), reads: unknown[][] = []): Db => ({
   query: ((text: string, params?: readonly unknown[]) => {
-    if (text.includes("DELETE FROM jobs")) {
-      deletes.push([...(params ?? [])]);
-      return Promise.resolve({ rows: [], rowCount: 1 });
+    if (text.includes("FROM jobs") && text.includes("order_sig IS NOT NULL")) {
+      reads.push([...(params ?? [])]);
+      return Promise.resolve({ rows: row === null ? [] : [row] });
     }
-    return Promise.reject(new Error("this route must not read the index"));
+    return Promise.reject(new Error("this route reads the held order and nothing else"));
   }) as unknown as Db["query"],
-  tx: () => Promise.reject(new Error("this route must not read the index")),
-  migrate: () => Promise.reject(new Error("this route must not read the index")),
+  tx: () => Promise.reject(new Error("this route opens no transaction")),
+  migrate: () => Promise.reject(new Error("this route runs no migration")),
   close: async () => undefined,
 });
 
-/** A complete `JobView`, in the ABI's 20-field decode order (R32). */
+/** `getJob`'s return: found, id, state, cause, claimant and claim time. */
 const jobView = (overrides: Record<string, unknown> = {}) => ({
-  found: true,
-  jobId: `0x${"01".repeat(32)}`,
-  owner: `0x${"aa".repeat(20)}`,
-  c: `0x${"bb".repeat(32)}`,
+  found: false,
+  jobId: `0x${"00".repeat(32)}`,
   state: 0,
   endedBecause: 0,
   providerId: 0,
-  designated: 0,
-  modelId: 7,
-  rateIn: 30_000n,
-  rateOut: 90_000n,
-  unitsIn: 1000,
-  unitsOut: 2000,
-  completionTok: 0,
-  promptTok: 0,
-  cachedTok: 0,
-  rateInCached: 0n,
-  slaSecs: 3600,
-  expiresAt: 4_102_444_800n,
   claimedAt: 0n,
-  taskCid: `0x${Buffer.from("bafkreitaskcid", "utf8").toString("hex")}`,
-  resultCid: "0x",
+  ...overrides,
+});
+
+/** Every view the gate ladder reads, each answering "pass". */
+const passing = (overrides: Record<string, unknown> = {}): Record<string, unknown> => ({
+  allowedSla: true,
+  modelExists: true,
+  modelEnabled: true,
+  getJob: jobView(),
+  idOf: 5,
+  isListed: true,
+  modelAllowed: true,
+  activeJobs: 1,
+  effectiveCap: 8,
   gasFee: 30_000n,
+  feeBps: 100,
   ...overrides,
 });
 
@@ -93,13 +129,20 @@ const jobView = (overrides: Record<string, unknown> = {}) => ({
 describe("chain-backed routes", () => {
   let app: FastifyInstance | undefined;
 
-  const build = (options: StubOptions = {}) => {
+  const build = (options: StubOptions = {}, row: HeldRowStub | null = heldRow()) => {
     const config = testConfig();
     const stub = stubChain(config, options);
-    const deletes: unknown[][] = [];
-    app = buildApp({ db: unreachableDb(deletes), indexer: stubIndexer(), config, chain: stub.chain });
-    return { app, stub, config, deletes };
+    const reads: unknown[][] = [];
+    app = buildApp({ db: heldDb(row, reads), indexer: stubIndexer(), config, chain: stub.chain });
+    return { app, stub, config, reads };
   };
+
+  const ask = (server: FastifyInstance, jobId = `0x${"01".repeat(32)}`) =>
+    server.inject({
+      method: "POST",
+      url: "/evm/simulate/claim",
+      payload: { job_id: jobId, address: `0x${"cc".repeat(20)}` },
+    });
 
   afterAll(async () => {
     await app?.close();
@@ -148,183 +191,95 @@ describe("chain-backed routes", () => {
 
   // -- the advisory gate ----------------------------------------------------
 
-  it("answers {ok:false, reason:'NotOpen'} from the view gates", async () => {
-    // `getJob` renders an expired-but-open job as state 3 / cause 5 (R3), so one
-    // comparison covers a resolved row and an abandoned one — exactly as
-    // `claim`'s own `state != Open || now > expiresAt` does.
-    const { app: server, stub } = build({ views: { getJob: jobView({ state: 3, endedBecause: 5 }) } });
+  it("answers NotOpen for an order this node does not hold, without a chain call", async () => {
+    // Claimed already, cancelled, or never accepted: there is no order to claim.
+    const { app: server, stub, reads } = build({ views: passing() }, null);
 
-    const res = await server.inject({
-      method: "POST",
-      url: "/evm/simulate/claim",
-      payload: { job_id: `0x${"01".repeat(32)}`, address: `0x${"cc".repeat(20)}` },
-    });
+    const res = await ask(server);
 
     expect(res.statusCode).toBe(200);
     expect(res.json()).toEqual({ ok: false, reason: "NotOpen" });
-    // Chain `eth_call`s only, no index reads (R22) — the database this app was
-    // built with rejects every query, so a single read would have thrown.
-    expect(stub.requests.every((r) => r.method === "eth_call")).toBe(true);
+    expect(reads).toEqual([[Buffer.from("01".repeat(32), "hex")]]);
+    expect(stub.requests.filter((r) => r.method === "eth_call")).toEqual([]);
   });
 
-  it("answers UnknownJob before it looks at any provider gate", async () => {
-    const { app: server, stub } = build({ views: { getJob: jobView({ found: false }) } });
+  it("answers ok when every gate passes, reading only the held order and chain views (R22)", async () => {
+    const { app: server, stub, reads } = build({ views: passing() });
 
-    const res = await server.inject({
-      method: "POST",
-      url: "/evm/simulate/claim",
-      payload: { job_id: `0x${"01".repeat(32)}`, address: `0x${"cc".repeat(20)}` },
-    });
+    const res = await ask(server);
 
-    expect(res.json()).toEqual({ ok: false, reason: "UnknownJob" });
-    // One call, and only one: the gates are ordered as the contract orders them,
-    // so the answer is the reason `claim` *would* revert with and not merely a
-    // reason it would fail.
-    expect(stub.requests.filter((r) => r.method === "eth_call")).toHaveLength(1);
+    expect(res.json()).toEqual({ ok: true });
+    // One database read — the held order — and chain `eth_call`s for every
+    // verdict: the database this app was built with refuses anything else.
+    expect(reads).toHaveLength(1);
+    expect(stub.requests.every((r) => r.method === "eth_call")).toBe(true);
   });
 
   /**
-   * The repair that actually fires for an orphaned write-through row. The daemon
-   * simulates before it signs and treats a refusal as a skip, so it never reaches
-   * the `/evm/ops` door where `repairOnRefusal` lives — without this the phantom
-   * is re-offered to every daemon until its own `expires_at`.
+   * The ladder in the contract's own order: the order's gates (`_admitOrder`),
+   * then the provider's (`_admitProvider`), then the lock (`_lock`). Each case
+   * fails exactly one gate, so the answer names the first one `claim` would
+   * revert on, and not merely a reason it would fail.
    */
-  it("drops the job row when the chain has no such job, without a second call", async () => {
-    const jobId = `0x${"01".repeat(32)}`;
-    const { app: server, stub, deletes } = build({ views: { getJob: jobView({ found: false }) } });
-
-    await server.inject({
-      method: "POST",
-      url: "/evm/simulate/claim",
-      payload: { job_id: jobId, address: `0x${"cc".repeat(20)}` },
-    });
-
-    expect(deletes).toEqual([[Buffer.from(jobId.slice(2), "hex")]]);
-    // R22 holds: the repair costs no chain method, so the ladder is still the one
-    // `getJob` this route is allowed.
-    expect(stub.requests.filter((r) => r.method === "eth_call")).toHaveLength(1);
-    expect(stub.requests.every((r) => r.method === "eth_call")).toBe(true);
+  it.each<[string, Record<string, unknown>, Partial<HeldRowStub>]>([
+    ["SlaNotAllowed", { allowedSla: false }, {}],
+    ["AlreadyExpired", {}, { expires_at: 1_000n }],
+    ["UnknownModel", { modelExists: false }, {}],
+    ["ModelDisabled", { modelEnabled: false }, {}],
+    // An id the chain has a row for is spent: claimed through a relay this
+    // node has not indexed yet, or cancelled on chain by its owner.
+    ["NotOpen", { getJob: jobView({ found: true, state: 1 }) }, {}],
+    ["UnknownProvider", { idOf: 0 }, {}],
+    ["NotListed", { isListed: false }, {}],
+    ["ModelNotAllowed", { modelAllowed: false }, {}],
+    ["NotDesignated", {}, { designated: 9n }],
+    // Both read from the chain (R21), never from the SQL pair `/evm/providers` computes.
+    ["AtCapacity", { activeJobs: 8, effectiveCap: 8 }, {}],
+    // `claim` locks the live gas fee; the client accepted the quoted one.
+    ["GasFeeChanged", { gasFee: 30_001n }, {}],
+    ["InsufficientDeposit", { balanceOf: 30_211n }, {}],
+  ])("answers %s from its own gate", async (reason, views, row) => {
+    const { app: server } = build({ views: passing(views) }, heldRow(row));
+    expect((await ask(server)).json()).toEqual({ ok: false, reason });
   });
 
-  /** A repair is bolted to somebody else's request and may not break it. */
-  it("still answers UnknownJob when the cleanup write fails", async () => {
-    const config = testConfig();
-    const stub = stubChain(config, { views: { getJob: jobView({ found: false }) } });
-    const failing: Db = {
-      query: () => Promise.reject(new Error("database down")),
-      tx: () => Promise.reject(new Error("database down")),
-      migrate: () => Promise.reject(new Error("database down")),
-      close: async () => undefined,
-    };
-    const server = buildApp({ db: failing, indexer: stubIndexer(), config, chain: stub.chain });
-
-    const res = await server.inject({
-      method: "POST",
-      url: "/evm/simulate/claim",
-      payload: { job_id: `0x${"01".repeat(32)}`, address: `0x${"cc".repeat(20)}` },
-    });
-
-    expect(res.statusCode).toBe(200);
-    expect(res.json()).toEqual({ ok: false, reason: "UnknownJob" });
-    await server.close();
+  it("passes a designated order for the designated provider", async () => {
+    const { app: server } = build({ views: passing() }, heldRow({ designated: 5n }));
+    expect((await ask(server)).json()).toEqual({ ok: true });
   });
 
-  it("walks the gate ladder in the contract's order down to AtCapacity (R21)", async () => {
-    const { app: server } = build({
-      views: {
-        getJob: jobView(),
-        idOf: 5,
-        isListed: true,
-        modelAllowed: true,
-        // Both read from the chain, never from the SQL pair `/evm/providers`
-        // computes for display.
-        activeJobs: 8,
-        effectiveCap: 8,
-      },
-    });
+  it("refuses an unregistered signer before any _rec-gated view", async () => {
+    // `isListed`, `modelAllowed` and `effectiveCap` all revert UnknownProviderId
+    // on id 0, so asking them first would turn a clean answer into a decode
+    // failure. The stub has no view for them, so reaching one is a hard error.
+    const { isListed: _l, modelAllowed: _m, effectiveCap: _e, activeJobs: _a, ...views } = passing({ idOf: 0 });
+    const { app: server } = build({ views });
 
-    const res = await server.inject({
-      method: "POST",
-      url: "/evm/simulate/claim",
-      payload: { job_id: `0x${"01".repeat(32)}`, address: `0x${"cc".repeat(20)}` },
-    });
-
-    expect(res.json()).toEqual({ ok: false, reason: "AtCapacity" });
+    expect((await ask(server)).json()).toEqual({ ok: false, reason: "UnknownProvider" });
   });
 
-  it("answers ok when every gate passes", async () => {
-    const { app: server } = build({
-      views: {
-        getJob: jobView(),
-        idOf: 5,
-        isListed: true,
-        modelAllowed: true,
-        activeJobs: 1,
-        effectiveCap: 8,
-        feeBps: 100,
-      },
-    });
+  /**
+   * The lock, `cap + feeCap + gasFee` = 30 212 atomic, against
+   * `JobRegistry.balanceOf(owner)`: one unit short is refused, exactly the lock
+   * claims.
+   */
+  it("refuses InsufficientDeposit a unit under the lock, and ok at exactly the lock", async () => {
+    const short = build({ views: passing(), tokenBalance: { [OWNER]: 30_211n } });
+    expect((await ask(short.app)).json()).toEqual({ ok: false, reason: "InsufficientDeposit" });
 
-    const res = await server.inject({
-      method: "POST",
-      url: "/evm/simulate/claim",
-      payload: { job_id: `0x${"01".repeat(32)}`, address: `0x${"cc".repeat(20)}` },
-    });
-
-    expect(res.json()).toEqual({ ok: true });
-  });
-
-  it("reads feeBps once for many claim attempts: from the node's cell, not per call", async () => {
-    const { app: server, stub } = build({
-      views: {
-        getJob: jobView(),
-        idOf: 5,
-        isListed: true,
-        modelAllowed: true,
-        activeJobs: 1,
-        effectiveCap: 8,
-        feeBps: 100,
-      },
-    });
-    for (let i = 0; i < 2; i++) {
-      const res = await server.inject({
-        method: "POST",
-        url: "/evm/simulate/claim",
-        payload: { job_id: `0x${"01".repeat(32)}`, address: `0x${"cc".repeat(20)}` },
-      });
-      expect(res.json()).toEqual({ ok: true });
-    }
-    const selector = toFunctionSelector("feeBps()");
-    const reads = stub.requests.filter(
-      (r) => r.method === "eth_call" && (r.params as [{ data: string }])[0].data.startsWith(selector),
-    );
-    expect(reads).toHaveLength(1);
+    const exact = build({ views: passing(), tokenBalance: { [OWNER]: 30_212n } });
+    expect((await ask(exact.app)).json()).toEqual({ ok: true });
   });
 
   /**
    * A batch's lines are claimed in a burst, one simulate per line. At one floor
-   * block the owner balance and the provider gates are one read each, however
-   * many lines ask; `getJob` is per job and stays per call. A new floor reads
-   * again — the memo is exact per block, not a TTL.
+   * block the owner balance, the fees and the provider gates are one read each,
+   * however many lines ask; `getJob` is per job and stays per call. A new floor
+   * reads again — the memo is exact per block, not a TTL.
    */
-  it("reads the balance and provider gates once per floor block across a claim burst", async () => {
-    const { app: server, stub } = build({
-      views: {
-        getJob: jobView(),
-        idOf: 5,
-        isListed: true,
-        modelAllowed: true,
-        activeJobs: 1,
-        effectiveCap: 8,
-        feeBps: 100,
-      },
-    });
-    const claim = (n: number) =>
-      server.inject({
-        method: "POST",
-        url: "/evm/simulate/claim",
-        payload: { job_id: `0x${n.toString(16).padStart(64, "0")}`, address: `0x${"cc".repeat(20)}` },
-      });
+  it("reads the balance, the fees and the provider gates once per floor block across a claim burst", async () => {
+    const { app: server, stub } = build({ views: passing() });
+    const claim = (n: number) => ask(server, `0x${n.toString(16).padStart(64, "0")}`);
     const calls = (signature: string) => {
       const selector = toFunctionSelector(signature);
       return stub.requests.filter(
@@ -338,6 +293,9 @@ describe("chain-backed routes", () => {
     expect(calls("getJob(bytes32)")).toBe(5);
     for (const gate of [
       "balanceOf(address)",
+      "gasFee()",
+      "feeBps()",
+      "allowedSla(uint32)",
       "idOf(address)",
       "isListed(uint32)",
       "modelAllowed(uint32,uint32)",
@@ -354,80 +312,27 @@ describe("chain-backed routes", () => {
   });
 
   /**
-   * The escrow pull, which the payment token refuses with a string revert the
-   * daemon could only take for a lost race. Measured 2026-10-17: fifteen orders
-   * from empty wallets passed this gate and were refused at `/evm/ops` every
-   * sweep until they expired. The job pulls `cap + feeCap + gasFeeSnap`:
-   * 210 + 2 + 30 000 = 30 212 atomic.
-   */
-  it("refuses InsufficientFunds when the owner holds less than the pull, and ok at exactly the pull", async () => {
-    const views = {
-      getJob: jobView(),
-      idOf: 5,
-      isListed: true,
-      modelAllowed: true,
-      activeJobs: 1,
-      effectiveCap: 8,
-      feeBps: 100,
-    };
-    const ask = (server: FastifyInstance) =>
-      server.inject({
-        method: "POST",
-        url: "/evm/simulate/claim",
-        payload: { job_id: `0x${"01".repeat(32)}`, address: `0x${"cc".repeat(20)}` },
-      });
-
-    const short = build({ views, tokenBalance: { [`0x${"aa".repeat(20)}`]: 30_211n } });
-    expect((await ask(short.app)).json()).toEqual({ ok: false, reason: "InsufficientFunds" });
-
-    const exact = build({ views, tokenBalance: { [`0x${"aa".repeat(20)}`]: 30_212n } });
-    expect((await ask(exact.app)).json()).toEqual({ ok: true });
-  });
-
-  /**
    * **R77 on the third door** — and it is the door a provider daemon hits most.
    *
-   * Every gate here is a view read. All six were bare `readContract`s, so a dead
-   * endpoint, an RPC rate limit and a reverting read alike fell to the default
-   * error handler and answered `500 internal_error` with
-   * `x-vorq-retryable: false` — which under R57 promises the identical request
-   * can never succeed, and stops being true the moment the endpoint answers
-   * again. Deleting the `viewRead` wrapper in `ops.ts` turns all three of these
-   * red.
+   * Every gate here is a view read, so a dead endpoint, an RPC rate limit and a
+   * reverting read must answer `503`, retryably, never `500` and never a
+   * verdict. Deleting the `viewRead` wrapper in `ops.ts` turns all three of
+   * these red.
    */
   it.each([
     ["a dead endpoint", () => unreachableEndpoint(), "chain_unreachable", null],
     ["an RPC rate limit", () => refusedCall("limit exceeded", -32005), "relay_unavailable", "rate_limited"],
     ["a reverting view read", () => bareRevert(), "relay_unavailable", "claim_simulate_read"],
   ])("503s %s on the advisory gate, never 500 and never a verdict (R77)", async (_name, callError, type, code) => {
-    const { app: server } = build({ views: { getJob: jobView() }, callError });
+    const { app: server } = build({ views: passing(), callError });
 
-    const res = await server.inject({
-      method: "POST",
-      url: "/evm/simulate/claim",
-      payload: { job_id: `0x${"01".repeat(32)}`, address: `0x${"cc".repeat(20)}` },
-    });
+    const res = await ask(server);
 
     expect(res.statusCode).toBe(503);
     expect(res.json().error).toMatchObject({ type, code, param: null });
     // The whole point: a daemon that reads this header keeps polling instead of
     // deciding the job is unclaimable forever.
     expect(res.headers["x-vorq-retryable"]).toBe("true");
-  });
-
-  it("refuses an unregistered signer before any _rec-gated view", async () => {
-    // `isListed`, `modelAllowed` and `effectiveCap` all revert UnknownProviderId
-    // on id 0, so asking them first would turn a clean answer into a decode
-    // failure. The stub has no view for them, so reaching one is a hard error.
-    const { app: server } = build({ views: { getJob: jobView(), idOf: 0 } });
-
-    const res = await server.inject({
-      method: "POST",
-      url: "/evm/simulate/claim",
-      payload: { job_id: `0x${"01".repeat(32)}`, address: `0x${"cc".repeat(20)}` },
-    });
-
-    expect(res.json()).toEqual({ ok: false, reason: "UnknownProvider" });
   });
 });
 

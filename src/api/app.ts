@@ -21,6 +21,7 @@ import { catalogRoutes } from "./routes/catalog.js";
 import { fileRoutes } from "./routes/files.js";
 import { jobRoutes } from "./routes/jobs.js";
 import { opsRoutes } from "./routes/ops.js";
+import { balanceRoutes } from "./routes/balance.js";
 import { postRoutes } from "./routes/post.js";
 import { providerRoutes } from "./routes/providers.js";
 import { relayRoutes } from "./routes/relay.js";
@@ -382,13 +383,15 @@ function routes(
   authRoutes(app, { db, config, chain });
   relayRoutes(app, { db, config, chain });
   opsRoutes(app, { db, config, chain });
-  // The client's write doors. Outside the gate for the same reason `/evm/ops`
-  // is: the authority is the chain, the answer is a relayed transaction, and a
-  // post refused for a second because the index was catching up is a job the
-  // client cannot place. They carry no `as_of_block` (R28) — the duplicate
-  // pre-check reads the index, but only as a free refusal ahead of the
-  // authoritative on-chain simulate, exactly as `resolveProviderId` does.
+  // The client's submission door. Outside the gate for the same reason `/evm/ops`
+  // is: an order refused for a second because the index was catching up is a
+  // job the client cannot place. It carries no `as_of_block` (R28): what it reads
+  // is the chain and the open orders this node writes itself.
   postRoutes(app, { db, config, chain });
+  // The prepaid balance. Outside the gate for the same reason: the balance is
+  // read from the chain, and the reservation from the open orders this node
+  // holds itself — rows it writes, not rows the indexer has to reach.
+  balanceRoutes(app, { db, config, chain });
   // The batch input door. Outside the gate because it reads no index at all: the
   // object store and this node's own `files` table are its whole dependency set,
   // so index freshness has nothing to say about an upload (R28).
@@ -410,6 +413,7 @@ function routes(
   // something different and false (I2/P14).
   escrowRoutes(app, {
     config,
+    db,
     keys: escrowKeys ?? null,
     chain,
     clock: escrowClock,

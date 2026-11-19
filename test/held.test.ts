@@ -1,31 +1,37 @@
 import {
-  decodeFunctionData,
   encodeAbiParameters,
-  encodeErrorResult,
   encodeEventTopics,
   stringToHex,
   type Abi,
   type AbiEvent,
   type Hex,
   type Log,
-  type TransactionReceipt,
 } from "viem";
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { jobRegistryAbi } from "../src/abi/jobRegistry.js";
 import { OPEN } from "../src/api/routes/jobs.js";
-import type { Chain } from "../src/chain/client.js";
 import type { Address } from "../src/config.js";
 import { openDb, type Db } from "../src/db/db.js";
-import { cancelHeld, holdOrder, publishHeld, type HeldOrder } from "../src/match/held.js";
+import { decodeLog } from "../src/index/decode.js";
+import { applyEvent } from "../src/index/reducer.js";
+import {
+  cancelHeld,
+  dropLease,
+  HELD,
+  holdOrder,
+  takeForClaim,
+  type HeldOrder,
+} from "../src/match/held.js";
 import { leaseOpenJobs } from "../src/match/lease.js";
 
 /**
- * Held orders: a paid order no live ask clears is an open `jobs` row off chain,
- * and the provider poll that leases it posts it.
+ * Held orders: every accepted order is an open `jobs` row off chain, carrying
+ * the order signature `claim` takes, until a provider's claim puts it on chain.
  *
  * Driven against the real projection, because the parts that can be wrong are
- * the SQL's: which rows a poll publishes, and what is left of a row and its
- * lease after each outcome of the `postMany`.
+ * the SQL's: what the row carries, which rows a claim may take, what a cancel
+ * may end, and how the two exclude each other through the row lock and the
+ * lease.
  *
  * Database-gated (R25):
  *
@@ -41,7 +47,8 @@ const OWNER: Address = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 const MODEL = 7n;
 const EXPIRES = 4_102_444_800n;
 const TASK_CID = "bafkreitaskcid";
-const POSTED_BLOCK = 1000n;
+const CURSOR = 4242n;
+const POSTED_BLOCK = 5000n;
 
 const word = (fill: string): Hex => `0x${fill.repeat(32)}`;
 const sig = (fill: string): Hex => `0x${fill.repeat(65)}`;
@@ -70,7 +77,6 @@ const order = (fill: string, overrides: Partial<HeldOrder["terms"]> = {}): HeldO
   taskCid: TASK_CID,
   gasFee: 5n,
   orderSig: sig("0a"),
-  authSig: sig("0b"),
 });
 
 /** Encodes one event off the vendored ABI: indexed members to topics, the rest to data. */
@@ -109,23 +115,6 @@ const postedLog = (held: HeldOrder): Log =>
     taskCid: stringToHex(held.taskCid),
   });
 
-const skippedLog = (index: number, reason: Hex): Log =>
-  eventLog("PostSkipped", { index: BigInt(index), reason });
-
-/** The two calls `publishHeld` makes on the chain, recorded. */
-function chainOf(logs: () => Log[], relayError?: Error, status: "success" | "reverted" = "success") {
-  const relayed: { data: Hex; gas?: bigint }[] = [];
-  const chain = {
-    relay: async (request: { data: Hex; gas?: bigint }) => {
-      if (relayError !== undefined) throw relayError;
-      relayed.push(request);
-      return word("cc");
-    },
-    receipt: async () => ({ logs: logs(), blockNumber: POSTED_BLOCK, status }) as unknown as TransactionReceipt,
-  } as unknown as Chain;
-  return { chain, relayed };
-}
-
 describe.skipIf(!TEST_DATABASE_URL)("held orders", () => {
   let db: Db;
 
@@ -142,206 +131,283 @@ describe.skipIf(!TEST_DATABASE_URL)("held orders", () => {
   });
 
   beforeEach(async () => {
-    for (const table of ["job_leases", "jobs"]) await db.query(`DELETE FROM ${table}`);
+    for (const table of ["job_leases", "jobs", "cursor"]) await db.query(`DELETE FROM ${table}`);
+    await db.query(
+      `INSERT INTO cursor (id, block_number, block_hash) VALUES (1, $1, '0x${"be".repeat(32)}')`,
+      [CURSOR],
+    );
   });
 
   /** One provider poll's lease step, as the route issues it. */
-  const lease = (providerId: bigint, free: bigint, extra = "", params: unknown[] = []) =>
+  const lease = (providerId: bigint, free: bigint) =>
     db.tx((tx) =>
       leaseOpenJobs(tx, {
         providerId,
         free,
         leaseMs: 20_000,
-        filter: `${OPEN} AND model_id = $1${extra}`,
-        params: [MODEL.toString(), ...params],
+        filter: `${OPEN} AND model_id = $1`,
+        params: [MODEL.toString()],
       }),
     );
 
-  const publish = (chain: Chain | undefined, providerId = 1n) =>
-    publishHeld({ db, chain, jobRegistry: JOB_REGISTRY }, providerId, MODEL);
-
   const row = async (held: HeldOrder) => {
-    const { rows } = await db.query<{ state: number; posted_block: bigint; auth_sig: Buffer | null; order_sig: Buffer | null }>(
-      "SELECT state, posted_block, auth_sig, order_sig FROM jobs WHERE job_id = $1",
+    const { rows } = await db.query<{
+      state: number;
+      ended_because: number;
+      posted_block: bigint;
+      order_sig: Buffer | null;
+      gas_fee: bigint;
+    }>(
+      "SELECT state, ended_because, posted_block, order_sig, gas_fee FROM jobs WHERE job_id = $1",
       [bytes(held.jobId)],
     );
     return rows[0];
   };
 
-  const leased = async (held: HeldOrder): Promise<boolean> => {
-    const { rows } = await db.query("SELECT 1 FROM job_leases WHERE job_id = $1", [bytes(held.jobId)]);
-    return rows.length === 1;
+  const leaseOf = async (held: HeldOrder) => {
+    const { rows } = await db.query<{ provider_id: bigint; live: boolean; ms: number }>(
+      `SELECT provider_id, expires_at > now() AS live,
+              (extract(epoch from (expires_at - now())) * 1000)::float8 AS ms
+         FROM job_leases WHERE job_id = $1`,
+      [bytes(held.jobId)],
+    );
+    return rows[0];
   };
 
-  it("writes a held order as an open row carrying both signatures, once", async () => {
+  const yes = async () => true;
+  const no = async () => false;
+
+  it("writes an accepted order as an open row carrying its signature, once", async () => {
     const held = order("a1");
 
     expect(await holdOrder(db, held)).toBe(true);
     expect(await holdOrder(db, held)).toBe(false);
 
+    // `posted_block` is the cursor at acceptance: the book's age filter, its
+    // lease order and the orphan clause read an open order by it.
     expect(await row(held)).toEqual({
       state: 0,
-      posted_block: 0n,
+      ended_because: 0,
+      posted_block: CURSOR,
       order_sig: bytes(held.orderSig),
-      auth_sig: bytes(held.authSig),
+      gas_fee: 5n,
+    });
+    const columns = await db.query<{ column_name: string }>(
+      `SELECT column_name FROM information_schema.columns
+        WHERE table_schema = $1 AND table_name = 'jobs'`,
+      [TEST_SCHEMA],
+    );
+    expect(columns.rows.map((c) => c.column_name)).not.toContain("auth_sig");
+  });
+
+  it("reads 0 for an order accepted before anything was indexed", async () => {
+    await db.query("DELETE FROM cursor");
+    const held = order("a1");
+    await holdOrder(db, held);
+    expect((await row(held))?.posted_block).toBe(0n);
+  });
+
+  it("marks a held order by its order signature alone", () => {
+    expect(HELD).toBe("order_sig IS NOT NULL");
+  });
+
+  it("stops holding an order once the claim's Posted is indexed, and keeps the row", async () => {
+    const held = order("a1");
+    await holdOrder(db, held);
+
+    const event = decodeLog(postedLog(held));
+    if (event === null) throw new Error("Posted did not decode");
+    await applyEvent(db, event, POSTED_BLOCK);
+
+    // The chain's own block and gas fee win; the signature is cleared.
+    expect(await row(held)).toEqual({
+      state: 0,
+      ended_because: 0,
+      posted_block: POSTED_BLOCK,
+      order_sig: null,
+      gas_fee: 30_000n,
     });
   });
 
-  it("posts the held orders a poll leased in one postMany and clears their signatures", async () => {
-    const [first, second] = [order("a1"), order("a2")];
-    await holdOrder(db, first);
-    await holdOrder(db, second);
-    expect(await lease(1n, 5n)).toBe(2);
-    const { chain, relayed } = chainOf(() => [postedLog(first), postedLog(second)]);
+  describe("takeForClaim", () => {
+    it("answers the order as claim takes it, and leases it to the claimant over anyone's poll", async () => {
+      const held = order("a1", { designated: 3n });
+      await holdOrder(db, held);
+      expect(await lease(2n, 5n)).toBe(0); // designated to 3: provider 2 is never offered it
+      expect(await lease(3n, 5n)).toBe(1);
 
-    expect(await publish(chain)).toBe(2);
+      const taken = await takeForClaim(db, held.jobId, 3n, 120_000);
 
-    expect(relayed).toHaveLength(1);
-    const call = decodeFunctionData({ abi: jobRegistryAbi, data: relayed[0]!.data });
-    expect(call.functionName).toBe("postMany");
-    const [orders, owners, orderSigs, authSigs] = call.args as unknown as [
-      { c: Hex; rateIn: bigint; taskCid: Hex }[], Address[], Hex[], Hex[],
-    ];
-    expect(orders.map((o) => o.c)).toEqual([first.terms.c, second.terms.c]);
-    expect(orders[0]!.rateIn).toBe(first.terms.rateIn);
-    expect(orders[0]!.taskCid).toBe(stringToHex(TASK_CID));
-    expect(owners.map((o) => o.toLowerCase())).toEqual([OWNER, OWNER]);
-    expect(orderSigs).toEqual([first.orderSig, second.orderSig]);
-    expect(authSigs).toEqual([first.authSig, second.authSig]);
+      expect(taken).toEqual({
+        owner: OWNER,
+        terms: held.terms,
+        taskCid: TASK_CID,
+        gasFee: 5n,
+        orderSig: held.orderSig,
+      });
+      const claimLease = await leaseOf(held);
+      expect(claimLease?.provider_id).toBe(3n);
+      // Held for the claim's whole relay, past a poll's 20 s.
+      expect(claimLease?.ms).toBeGreaterThan(100_000);
+    });
 
-    for (const held of [first, second]) {
-      expect(await row(held)).toEqual({ state: 0, posted_block: POSTED_BLOCK, order_sig: null, auth_sig: null });
-      expect(await leased(held)).toBe(true);
-    }
-    // Nothing is held any more, so a second poll relays nothing.
-    expect(await publish(chain)).toBe(0);
-    expect(relayed).toHaveLength(1);
+    it("takes the lease from another provider's poll", async () => {
+      const held = order("a1");
+      await holdOrder(db, held);
+      expect(await lease(2n, 5n)).toBe(1);
+
+      expect(await takeForClaim(db, held.jobId, 3n, 120_000)).not.toBeNull();
+      expect((await leaseOf(held))?.provider_id).toBe(3n);
+    });
+
+    it("never shortens a lease already longer than the hold", async () => {
+      const held = order("a1");
+      await holdOrder(db, held);
+      await takeForClaim(db, held.jobId, 3n, 120_000);
+      await takeForClaim(db, held.jobId, 3n, 1_000);
+      expect((await leaseOf(held))?.ms).toBeGreaterThan(100_000);
+    });
+
+    it("answers null for no order, a cancelled order and an order the chain already has", async () => {
+      const [cancelled, onChain] = [order("a2"), order("a3")];
+      await holdOrder(db, cancelled);
+      await holdOrder(db, onChain);
+      expect(await cancelHeld(db, cancelled.jobId, yes, no)).toBe("cancelled");
+      await db.query("UPDATE jobs SET order_sig = NULL, state = 1 WHERE job_id = $1", [bytes(onChain.jobId)]);
+
+      expect(await takeForClaim(db, word("ee"), 3n, 120_000)).toBeNull();
+      expect(await takeForClaim(db, cancelled.jobId, 3n, 120_000)).toBeNull();
+      expect(await takeForClaim(db, onChain.jobId, 3n, 120_000)).toBeNull();
+      // And nothing was leased for any of them.
+      const { rows } = await db.query("SELECT 1 FROM job_leases");
+      expect(rows).toEqual([]);
+    });
+
+    it("gives the lease back with dropLease, the claimant's own only", async () => {
+      const held = order("a1");
+      await holdOrder(db, held);
+      await takeForClaim(db, held.jobId, 3n, 120_000);
+
+      await dropLease(db, held.jobId, 2n);
+      expect(await leaseOf(held)).toBeDefined();
+      await dropLease(db, held.jobId, 3n);
+      expect(await leaseOf(held)).toBeUndefined();
+      // The order is still open, and the next poller takes it.
+      expect(await lease(2n, 5n)).toBe(1);
+    });
   });
 
-  it("leaves a held order a provider's floor refuses unleased and unposted", async () => {
-    const held = order("a1");
-    await holdOrder(db, held);
-    const { chain, relayed } = chainOf(() => []);
+  describe("cancelHeld", () => {
+    it("ends an unleased open order in its row, for its owner only, and keeps its signature", async () => {
+      const held = order("a1");
+      await holdOrder(db, held);
+      const seen: string[] = [];
 
-    expect(await lease(1n, 5n, " AND rate_out >= $2", ["90001"])).toBe(0);
-    expect(await publish(chain)).toBe(0);
+      expect(await cancelHeld(db, held.jobId, no, yes)).toBe("not_owner");
+      expect((await row(held))?.state).toBe(0);
 
-    expect(relayed).toEqual([]);
-    expect((await row(held))?.auth_sig).not.toBeNull();
-  });
+      expect(await cancelHeld(db, held.jobId, async (owner) => (seen.push(owner), true), no)).toBe(
+        "cancelled",
+      );
+      expect(seen).toEqual([OWNER]);
+      // The signature stays: no chain event will ever describe this
+      // cancellation, so the row stays this node's own — and survives a rebuild.
+      expect(await row(held)).toEqual({
+        state: 3,
+        ended_because: 2,
+        posted_block: CURSOR,
+        order_sig: bytes(held.orderSig),
+        gas_fee: 5n,
+      });
+      // Cancelled, so no poll leases it, no claim takes it, and a second cancel
+      // finds nothing open.
+      expect(await lease(1n, 5n)).toBe(0);
+      expect(await takeForClaim(db, held.jobId, 1n, 120_000)).toBeNull();
+      expect(await cancelHeld(db, held.jobId, yes, no)).toBe("not_open");
+    });
 
-  it("publishes only the caller's own leases", async () => {
-    const held = order("a1");
-    await holdOrder(db, held);
-    await lease(2n, 5n);
-    const { chain, relayed } = chainOf(() => [postedLog(held)]);
+    it("answers unknown for an id it holds no row for", async () => {
+      expect(await cancelHeld(db, word("ee"), yes, no)).toBe("unknown");
+    });
 
-    expect(await publish(chain, 1n)).toBe(0);
-    expect(relayed).toEqual([]);
-  });
+    it("answers not_open for a job the chain already has", async () => {
+      const held = order("a1");
+      await holdOrder(db, held);
+      await db.query("UPDATE jobs SET order_sig = NULL, state = 1 WHERE job_id = $1", [bytes(held.jobId)]);
 
-  it("deletes a held order the contract refused and keeps one it gave no verdict on", async () => {
-    const [refused, undecided, landed] = [order("a1"), order("a2"), order("a3")];
-    for (const held of [refused, undecided, landed]) await holdOrder(db, held);
-    await lease(1n, 5n);
-    const { chain } = chainOf(() => [skippedLog(0, "0x12345678"), skippedLog(1, "0x"), postedLog(landed)]);
+      expect(await cancelHeld(db, held.jobId, yes, no)).toBe("not_open");
+      expect((await row(held))?.state).toBe(1);
+    });
 
-    expect(await publish(chain)).toBe(1);
+    it("refuses a leased order and leaves it untouched, without asking the chain", async () => {
+      const held = order("a1");
+      await holdOrder(db, held);
+      await lease(1n, 5n);
+      let asked = false;
 
-    expect(await row(refused)).toBeUndefined();
-    expect(await leased(refused)).toBe(false);
-    expect((await row(undecided))?.auth_sig).not.toBeNull();
-    expect(await leased(undecided)).toBe(false);
-    expect((await row(landed))?.auth_sig).toBeNull();
-    expect(await leased(landed)).toBe(true);
-  });
+      expect(await cancelHeld(db, held.jobId, yes, async () => ((asked = true), false))).toBe("leased");
+      expect(asked).toBe(false);
+      expect((await row(held))?.state).toBe(0);
+    });
 
-  it("keeps the row of an order the chain already has, and stops holding it", async () => {
-    const held = order("a1");
-    await holdOrder(db, held);
-    await lease(1n, 5n);
-    const duplicate = encodeErrorResult({ abi: jobRegistryAbi, errorName: "DuplicateJob" });
-    const { chain } = chainOf(() => [skippedLog(0, duplicate)]);
+    it("refuses an order whose claim is in flight", async () => {
+      const held = order("a1");
+      await holdOrder(db, held);
+      await takeForClaim(db, held.jobId, 3n, 120_000);
 
-    expect(await publish(chain)).toBe(0);
+      expect(await cancelHeld(db, held.jobId, yes, no)).toBe("leased");
+      expect((await row(held))?.state).toBe(0);
+    });
 
-    expect(await row(held)).toEqual({ state: 0, posted_block: 0n, order_sig: null, auth_sig: null });
-    expect(await leased(held)).toBe(true);
-  });
+    it("refuses an order the chain has a row for once its lease has lapsed", async () => {
+      // A claim whose relay outlived its lease: the chain has the job, the index
+      // does not yet. The row is not ended under it.
+      const held = order("a1");
+      await holdOrder(db, held);
+      await db.query(
+        "INSERT INTO job_leases (job_id, provider_id, offered_at, expires_at) VALUES ($1, 3, now(), now() - interval '1 second')",
+        [bytes(held.jobId)],
+      );
 
-  it("treats a reverted postMany as nothing posted: leases dropped, rows still held", async () => {
-    const held = order("a1");
-    await holdOrder(db, held);
-    await lease(1n, 5n);
-    const { chain } = chainOf(() => [], undefined, "reverted");
+      expect(await cancelHeld(db, held.jobId, yes, yes)).toBe("not_open");
+      expect((await row(held))?.state).toBe(0);
+    });
 
-    await expect(publish(chain)).rejects.toThrow("reverted");
+    it("drops a lapsed lease with the order it cancels", async () => {
+      const held = order("a1");
+      await holdOrder(db, held);
+      await db.query(
+        "INSERT INTO job_leases (job_id, provider_id, offered_at, expires_at) VALUES ($1, 3, now(), now() - interval '1 second')",
+        [bytes(held.jobId)],
+      );
 
-    expect(await leased(held)).toBe(false);
-    expect((await row(held))?.auth_sig).not.toBeNull();
-  });
+      expect(await cancelHeld(db, held.jobId, yes, no)).toBe("cancelled");
+      expect(await leaseOf(held)).toBeUndefined();
+    });
 
-  it("drops the leases on held orders past one transaction's worth", async () => {
-    const all = Array.from({ length: 52 }, (_, n) => order((0x10 + n).toString(16)));
-    for (const held of all) await holdOrder(db, held);
-    expect(await lease(1n, 60n)).toBe(52);
-    const posted: HeldOrder[] = [];
-    const { chain, relayed } = chainOf(() => posted.map(postedLog));
-    // The receipt answers for exactly the lines the call carried.
-    const original = chain.relay;
-    chain.relay = (async (request: { data: Hex }) => {
-      const [orders] = decodeFunctionData({ abi: jobRegistryAbi, data: request.data }).args as unknown as [{ c: Hex }[]];
-      posted.push(...orders.map((o) => all.find((held) => held.terms.c === o.c) as HeldOrder));
-      return original(request as never);
-    }) as never;
+    it("waits on a claim holding the row lock, then sees its lease", async () => {
+      const held = order("a1");
+      await holdOrder(db, held);
+      let release!: () => void;
+      const gate = new Promise<void>((resolve) => (release = resolve));
 
-    expect(await publish(chain)).toBe(50);
+      // A claim's transaction, paused after it locked the row and wrote its lease.
+      const claim = db.tx(async (tx) => {
+        await tx.query("SELECT 1 FROM jobs WHERE job_id = $1 FOR UPDATE", [bytes(held.jobId)]);
+        await tx.query(
+          "INSERT INTO job_leases (job_id, provider_id, offered_at, expires_at) VALUES ($1, 3, now(), now() + interval '2 minutes')",
+          [bytes(held.jobId)],
+        );
+        await gate;
+      });
+      await new Promise((resolve) => setTimeout(resolve, 50));
+      const cancel = cancelHeld(db, held.jobId, yes, no);
+      await new Promise((resolve) => setTimeout(resolve, 50));
+      release();
+      await claim;
 
-    expect(relayed).toHaveLength(1);
-    const stillLeased = (await Promise.all(all.map(leased))).filter(Boolean).length;
-    expect(stillLeased).toBe(50);
-    for (const held of all) {
-      expect(await leased(held)).toBe((await row(held))?.auth_sig === null);
-    }
-  });
-
-  it("cancels an unleased held order in its row, for its owner only", async () => {
-    const held = order("a1");
-    await holdOrder(db, held);
-    const seen: string[] = [];
-
-    expect(await cancelHeld(db, held.jobId, async () => false)).toBe("not_owner");
-    expect((await row(held))?.state).toBe(0);
-
-    expect(await cancelHeld(db, held.jobId, async (owner) => (seen.push(owner), true))).toBe("cancelled");
-    expect(seen).toEqual([OWNER]);
-    expect(await row(held)).toEqual({ state: 3, posted_block: 0n, order_sig: null, auth_sig: null });
-    // Cancelled, so no poll leases it.
-    expect(await lease(1n, 5n)).toBe(0);
-  });
-
-  it("leaves a leased held order, and a job that is not held, to the chain's cancel", async () => {
-    const held = order("a1");
-    await holdOrder(db, held);
-    await lease(1n, 5n);
-
-    expect(await cancelHeld(db, held.jobId, async () => true)).toBe("on_chain");
-    expect((await row(held))?.state).toBe(0);
-    expect(await cancelHeld(db, word("ee"), async () => true)).toBe("on_chain");
-  });
-
-  it("drops the leases and keeps the rows when the relay fails or there is no chain", async () => {
-    const held = order("a1");
-    await holdOrder(db, held);
-    await lease(1n, 5n);
-
-    await expect(publish(chainOf(() => [], new Error("rpc down")).chain)).rejects.toThrow("rpc down");
-    expect(await leased(held)).toBe(false);
-    expect((await row(held))?.auth_sig).not.toBeNull();
-
-    await lease(1n, 5n);
-    expect(await publish(undefined)).toBe(0);
-    expect(await leased(held)).toBe(false);
-    expect((await row(held))?.auth_sig).not.toBeNull();
+      expect(await cancel).toBe("leased");
+      expect((await row(held))?.state).toBe(0);
+    });
   });
 });

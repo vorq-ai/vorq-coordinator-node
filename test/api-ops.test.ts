@@ -1,6 +1,14 @@
 import { createHash } from "node:crypto";
 import type { FastifyInstance } from "fastify";
-import { decodeFunctionData, encodeErrorResult, parseTransaction, type Hex } from "viem";
+import {
+  decodeFunctionData,
+  encodeErrorResult,
+  encodeEventTopics,
+  encodeAbiParameters,
+  getAddress,
+  parseTransaction,
+  type Hex,
+} from "viem";
 import { privateKeyToAccount, type PrivateKeyAccount } from "viem/accounts";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import { jobRegistryAbi } from "../src/abi/jobRegistry.js";
@@ -38,7 +46,9 @@ import { EIP712_NAMES } from "../src/orders.js";
  * of an `eth_sendRawTransaction` in the recorded request log rather than by a
  * status code that could be right for the wrong reason.
  *
- * No database and no chain: this file runs in every `npm test`.
+ * No database and no chain: this file runs in every `npm test`. The job rows the
+ * door reads — a claim's held order, a settle's or fail's exit terms — come from
+ * an in-memory table in {@link stubDb}.
  */
 
 const JOB_ID = `0x${"01".repeat(32)}` as const;
@@ -78,7 +88,90 @@ interface Upload {
   purpose: string;
 }
 
+/** The relay gas fee every held order below was quoted at, and the chain's live one. */
+const GAS_FEE = 10_000n;
+const FEE_BPS = 100;
+
+/** The client whose order every job row below carries. */
+const OWNER = `0x${"66".repeat(20)}` as const;
+const ORDER_SIG = `0x${"ab".repeat(65)}` as const;
+const TASK_CID = "bafyheldtask";
+/**
+ * The relayer that landed the claim of every claimed row below — another
+ * coordinator's, not this node's: the exits pass the row's relayer, whoever it is.
+ */
+const CLAIM_RELAYER = `0x${"77".repeat(20)}` as const;
+
+/** One `jobs` row as the op door reads it: a held order, or a claimed job's terms. */
+interface JobRowStub {
+  owner: Buffer;
+  c: Buffer;
+  model_id: bigint;
+  sla_secs: bigint;
+  designated: bigint;
+  rate_in: bigint;
+  rate_out: bigint;
+  units_in: bigint;
+  units_out: bigint;
+  expires_at: bigint;
+  task_cid: Buffer;
+  gas_fee: bigint;
+  order_sig: Buffer | null;
+  state: number;
+  provider_id: bigint;
+  claimed_at: bigint;
+  /** The claim's relayer, off `Claimed`; `null` until that is indexed. */
+  relayer: Buffer | null;
+}
+
+/** A held order: open, carrying its order signature, quoted at {@link GAS_FEE}. */
+const heldRow = (overrides: Partial<JobRowStub> = {}): JobRowStub => ({
+  owner: Buffer.from(OWNER.slice(2), "hex"),
+  c: Buffer.alloc(32, 0xcc),
+  model_id: 3n,
+  sla_secs: 3600n,
+  designated: 0n,
+  rate_in: 2_000_000n,
+  rate_out: 8_000_000n,
+  units_in: 1000n,
+  units_out: 500n,
+  expires_at: BigInt(Math.floor(Date.now() / 1000) + 3600),
+  task_cid: Buffer.from(TASK_CID, "utf8"),
+  gas_fee: GAS_FEE,
+  order_sig: Buffer.from(ORDER_SIG.slice(2), "hex"),
+  state: 0,
+  provider_id: 0n,
+  claimed_at: 0n,
+  relayer: null,
+  ...overrides,
+});
+
+/**
+ * The lock a {@link heldRow} order takes at claim: the cap
+ * `ceil((2_000_000·1000 + 8_000_000·500) / 1e6) = 6000`, the fee at 100 bps on
+ * it, and the gas fee.
+ */
+const HELD_LOCK = 6000n + 60n + GAS_FEE;
+
+const keyOf = (bytes: Buffer): string => `0x${bytes.toString("hex")}`;
+
+/** The `Terms` a {@link heldRow} carries back to `submitAndSettle`, `fail` and `reclaim`. */
+const ROW_TERMS = {
+  owner: getAddress(OWNER),
+  rateIn: 2_000_000n,
+  rateOut: 8_000_000n,
+  unitsIn: 1000,
+  unitsOut: 500,
+  slaSecs: 3600,
+  gasFee: GAS_FEE,
+  relayer: getAddress(CLAIM_RELAYER),
+};
+
 interface DbOptions {
+  /** The `jobs` table, by job id. Both job ids below hold a held order unless a test says otherwise. */
+  jobs?: Map<string, JobRowStub>;
+  /** Every `job_leases` write: `["take" | "drop", jobId, providerId]`. */
+  leases?: unknown[][];
   operators?: Map<string, bigint>;
   /** Uploads a `result_cid` may name, by cid. */
   uploads?: Map<string, Upload>;
@@ -100,8 +193,39 @@ interface DbOptions {
 function stubDb(options: DbOptions = {}): Db {
   const operators = options.operators ?? registeredOperators();
   const uploads = options.uploads ?? new Map<string, Upload>();
+  const jobs = options.jobs ?? defaultJobs();
 
   const query = (async (text: string, params?: readonly unknown[]) => {
+    // `takeForClaim` and the advisory gate: an open held order, or nothing.
+    if (text.includes("FROM jobs") && text.includes("order_sig IS NOT NULL")) {
+      const row = jobs.get(keyOf(params?.[0] as Buffer));
+      return { rows: row !== undefined && row.state === 0 && row.order_sig !== null ? [row] : [] };
+    }
+    // `readExitTerms`: the row under the id, once its claim's relayer is known.
+    if (text.includes("FROM jobs") && text.includes("relayer IS NOT NULL")) {
+      const row = jobs.get(keyOf(params?.[0] as Buffer));
+      return { rows: row === undefined || row.relayer === null ? [] : [row] };
+    }
+    if (text.includes("INSERT INTO job_leases")) {
+      options.leases?.push(["take", keyOf(params?.[0] as Buffer), BigInt(params?.[1] as string)]);
+      return { rows: [], rowCount: 1 };
+    }
+    if (text.includes("DELETE FROM job_leases")) {
+      options.leases?.push(["drop", keyOf(params?.[0] as Buffer), BigInt(params?.[1] as string)]);
+      return { rows: [], rowCount: 1 };
+    }
+    // The reducer's `Claimed` arm, applied from the claim's own receipt.
+    if (text.includes("UPDATE jobs SET state = 1")) {
+      const row = jobs.get(keyOf(params?.[0] as Buffer));
+      if (row === undefined) return { rows: [], rowCount: 0 };
+      row.state = 1;
+      row.provider_id = BigInt(params?.[1] as number);
+      row.claimed_at = BigInt(params?.[2] as bigint);
+      row.relayer = params?.[4] as Buffer;
+      return { rows: [], rowCount: 1 };
+    }
+    // Reconcile-on-refusal's update; its chain read is unstubbed and swallowed.
+    if (text.includes("UPDATE jobs SET state = $2")) return { rows: [], rowCount: 0 };
     if (text.includes("FROM sessions")) {
       const token = params?.[0];
       return {
@@ -150,11 +274,21 @@ function stubDb(options: DbOptions = {}): Db {
 
   return {
     query,
-    tx: () => Promise.reject(new Error("stubDb: no transaction expected")),
+    // One connection, no isolation to model: the door's transactions are a row
+    // lock and a lease write, and what is under test is what they read and write.
+    tx: (fn) => fn({ query }),
     migrate: () => Promise.reject(new Error("stubDb: no migration expected")),
     close: async () => undefined,
   };
 }
+
+// The claim ops read the held order and ignore `relayer`; the exits read the
+// claim's relayer and ignore the held-order members. One row serves both.
+const defaultJobs = () =>
+  new Map<string, JobRowStub>([
+    [JOB_ID, heldRow({ relayer: Buffer.from(CLAIM_RELAYER.slice(2), "hex") })],
+    [OTHER_JOB, heldRow({ c: Buffer.alloc(32, 0xdd), relayer: Buffer.from(CLAIM_RELAYER.slice(2), "hex") })],
+  ]);
 
 const registeredOperators = () =>
   new Map<string, bigint>([[provider.address.toLowerCase(), PROVIDER_ID]]);
@@ -253,6 +387,21 @@ const signClaim = (account: PrivateKeyAccount, jobId: Hex, issuedAt: bigint) =>
     message: { jobId, issuedAt },
   });
 
+const FAIL_TYPES = {
+  Fail: [
+    { name: "jobId", type: "bytes32" },
+    { name: "issuedAt", type: "uint64" },
+  ],
+} as const;
+
+const signFail = (account: PrivateKeyAccount, jobId: Hex, issuedAt: bigint) =>
+  account.signTypedData({
+    domain: jobDomain,
+    types: FAIL_TYPES,
+    primaryType: "Fail",
+    message: { jobId, issuedAt },
+  });
+
 const signSettle = (
   account: PrivateKeyAccount,
   jobId: Hex,
@@ -316,6 +465,11 @@ describe("POST /evm/ops", () => {
   function build(options: {
     simulate?: (stub: () => StubChain) => Simulate;
     views?: Record<string, unknown>;
+    jobs?: Map<string, JobRowStub>;
+    leases?: unknown[][];
+    tokenBalance?: Record<string, bigint>;
+    receiptLogs?: () => unknown[];
+    sendDelayMs?: number;
     operators?: Map<string, bigint>;
     uploads?: Map<string, Upload>;
     attached?: unknown[][];
@@ -335,7 +489,11 @@ describe("POST /evm/ops", () => {
     });
     let stub: StubChain;
     stub = stubChain(appConfig, {
-      views: options.views ?? {},
+      // The claim's two config reads, live: the gas fee every held order was quoted at.
+      views: { gasFee: GAS_FEE, feeBps: FEE_BPS, ...(options.views ?? {}) },
+      tokenBalance: options.tokenBalance,
+      receiptLogs: options.receiptLogs,
+      sendDelayMs: options.sendDelayMs,
       simulate: options.simulate === undefined ? undefined : () => options.simulate!(() => stub),
       sendError: options.sendError,
       callError: options.callError,
@@ -343,6 +501,8 @@ describe("POST /evm/ops", () => {
     });
     app = buildApp({
       db: stubDb({
+        jobs: options.jobs,
+        leases: options.leases,
         operators: options.operators,
         uploads: options.uploads,
         attached: options.attached,
@@ -392,11 +552,30 @@ describe("POST /evm/ops", () => {
     expect(stub.simulated).toHaveLength(1);
     const decoded = decodeFunctionData({ abi: jobRegistryAbi, data: stub.simulated[0] as Hex });
     expect(decoded.functionName).toBe("claim");
-    expect(decoded.args).toEqual([JOB_ID, issuedAt, signature]);
+    // `claim(order, owner, orderSig, issuedAt, sig)`: the order and its
+    // signature from the held row, `taskCid` the name this node filed it under.
+    expect(decoded.args).toEqual([
+      {
+        c: `0x${"cc".repeat(32)}`,
+        modelId: 3,
+        slaSecs: 3600,
+        rateIn: 2_000_000n,
+        rateOut: 8_000_000n,
+        unitsIn: 1000,
+        unitsOut: 500,
+        designated: 0,
+        expiresAt: expect.any(BigInt),
+        taskCid: `0x${Buffer.from(TASK_CID, "utf8").toString("hex")}`,
+      },
+      getAddress(OWNER),
+      ORDER_SIG,
+      issuedAt,
+      signature,
+    ]);
 
     // Simulated once, then relayed once — in that order.
     const order = stub.requests.map((r) => r.method).filter((m) => m !== "eth_chainId");
-    expect(order.indexOf("eth_call")).toBeLessThan(order.indexOf("eth_sendRawTransaction"));
+    expect(order.lastIndexOf("eth_call")).toBeLessThan(order.indexOf("eth_sendRawTransaction"));
     expect(stub.broadcasts).toHaveLength(1);
   });
 
@@ -417,6 +596,226 @@ describe("POST /evm/ops", () => {
 
     expect(res.statusCode).toBe(201);
     expect(stub.broadcasts).toHaveLength(1);
+  });
+
+  // -- the merged claim: the order comes from the held row -----------------
+
+  const claimBody = async (jobId: Hex = JOB_ID, issuedAt = now()) => ({
+    op: "claim",
+    job_id: jobId,
+    issued_at: Number(issuedAt),
+    signature: await signClaim(provider, jobId, issuedAt),
+  });
+
+  /** `Claimed(jobId, provider, relayer, claimedAt)`, as the claim's receipt carries it. */
+  const claimedLog = (jobId: Hex, providerId: number, claimedAt: bigint, relayer: Hex) => ({
+    address: config.addresses.jobRegistry,
+    topics: encodeEventTopics({
+      abi: jobRegistryAbi,
+      eventName: "Claimed",
+      args: { jobId, provider: providerId, relayer },
+    }),
+    data: encodeAbiParameters([{ type: "uint64" }], [claimedAt]),
+    blockNumber: "0x3e8",
+    blockHash: `0x${"ab".repeat(32)}`,
+    transactionHash: `0x${"cd".repeat(32)}`,
+    transactionIndex: "0x0",
+    logIndex: "0x0",
+    removed: false,
+  });
+
+  it("refuses a claim on an order this node does not hold as NotOpen, and simulates nothing", async () => {
+    // The order is only here until a claim puts it on chain: no held row is no
+    // order to build `claim` from — claimed already, cancelled, or never accepted.
+    for (const jobs of [
+      new Map<string, JobRowStub>(),
+      new Map([[JOB_ID, heldRow({ state: 1, order_sig: null })]]),
+      new Map([[JOB_ID, heldRow({ state: 3 })]]),
+    ]) {
+      const { server, stub } = build({ jobs });
+      const res = await push(server, await claimBody());
+
+      expect(res.statusCode).toBe(409);
+      expect(res.json()).toEqual({ ok: false, reason: "NotOpen" });
+      expect(res.headers["x-vorq-retryable"]).toBe("false");
+      expect(stub.simulated).toEqual([]);
+      expect(stub.broadcasts).toEqual([]);
+      await server.close();
+    }
+  });
+
+  it("refuses a claim whose order was quoted at another gas fee, relays nothing, and gives the lease back", async () => {
+    // `claim` locks the live gas fee; the client accepted the one it was quoted.
+    const leases: unknown[][] = [];
+    const { server, stub } = build({ views: { gasFee: GAS_FEE + 1n }, leases });
+
+    const res = await push(server, await claimBody());
+
+    expect(res.statusCode).toBe(409);
+    expect(res.json()).toEqual({ ok: false, reason: "GasFeeChanged" });
+    expect(stub.simulated).toEqual([]);
+    expect(stub.broadcasts).toEqual([]);
+    // The claimant's lease was written over the row, then dropped on the refusal.
+    expect(leases).toEqual([
+      ["take", JOB_ID, PROVIDER_ID],
+      ["drop", JOB_ID, PROVIDER_ID],
+    ]);
+  });
+
+  it("refuses InsufficientDeposit when the balance is a unit short of the lock, and claims at exactly it", async () => {
+    const short = build({ tokenBalance: { [OWNER.toLowerCase()]: HELD_LOCK - 1n } });
+    const refused = await push(short.server, await claimBody());
+    expect(refused.statusCode).toBe(409);
+    expect(refused.json()).toEqual({ ok: false, reason: "InsufficientDeposit" });
+    expect(short.stub.simulated).toEqual([]);
+    await short.server.close();
+
+    const exact = build({ tokenBalance: { [OWNER.toLowerCase()]: HELD_LOCK } });
+    const landed = await push(exact.server, await claimBody());
+    expect(landed.statusCode).toBe(201);
+    expect(exact.stub.broadcasts).toHaveLength(1);
+  });
+
+  it("counts another claim of the same owner still in flight against the balance", async () => {
+    // The balance read at the floor does not show a claim that is broadcast and
+    // not mined: two claims a moment apart would both pass the gate and the
+    // second revert `InsufficientDeposit` after the relayer paid for it.
+    const leases: unknown[][] = [];
+    const { server, stub } = build({
+      tokenBalance: { [OWNER.toLowerCase()]: HELD_LOCK },
+      sendDelayMs: 300,
+      leases,
+    });
+
+    const first = push(server, await claimBody(JOB_ID));
+    // The first claim is past its gate once its simulate has been made.
+    for (let spins = 0; stub.simulated.length === 0; spins++) {
+      if (spins > 400) throw new Error("the first claim never reached its simulate");
+      await new Promise((resolve) => setTimeout(resolve, 5));
+    }
+    const second = await push(server, await claimBody(OTHER_JOB));
+
+    expect(second.statusCode).toBe(409);
+    expect(second.json()).toEqual({ ok: false, reason: "InsufficientDeposit" });
+    expect((await first).statusCode).toBe(201);
+    expect(stub.broadcasts).toHaveLength(1);
+    expect(leases).toContainEqual(["drop", OTHER_JOB, PROVIDER_ID]);
+
+    // Once the first has its receipt the entry is gone: the floor's balance is
+    // net of its lock from there on (this stub's balance does not move, so the
+    // retry passes).
+    const retried = await push(server, await claimBody(OTHER_JOB));
+    expect(retried.statusCode).toBe(201);
+  });
+
+  it("refuses the second of two claims fired together on one owner whose balance covers one", async () => {
+    // A floor above zero, so both gates are handed the same memoised
+    // `balanceOf` read: the check against the claims in flight and the entry
+    // must be one step after it, or both pass and the second reverts on chain
+    // after the relayer paid.
+    const leases: unknown[][] = [];
+    const { server, stub } = build({
+      tokenBalance: { [OWNER.toLowerCase()]: HELD_LOCK },
+      sendDelayMs: 300,
+      leases,
+    });
+    const [a, b] = await Promise.all([claimBody(JOB_ID), claimBody(OTHER_JOB)]);
+    stub.chain.saw(1000n);
+
+    const answers = await Promise.all([push(server, a), push(server, b)]);
+
+    expect(answers.map((res) => res.statusCode).sort()).toEqual([201, 409]);
+    expect(answers.find((res) => res.statusCode === 409)?.json()).toEqual({
+      ok: false,
+      reason: "InsufficientDeposit",
+    });
+    expect(stub.broadcasts).toHaveLength(1);
+  });
+
+  it("writes the claim onto the row from its own receipt's Claimed log", async () => {
+    const jobs = new Map([[JOB_ID, heldRow()]]);
+    const claimedAt = now();
+    const relayer = privateKeyToAccount(RELAYER_KEY).address;
+    const { server } = build({
+      jobs,
+      receiptLogs: () => [claimedLog(JOB_ID, Number(PROVIDER_ID), claimedAt, relayer)],
+    });
+
+    const res = await push(server, await claimBody());
+
+    expect(res.statusCode).toBe(201);
+    const row = jobs.get(JOB_ID)!;
+    expect(row.state).toBe(1);
+    expect(row.provider_id).toBe(PROVIDER_ID);
+    expect(row.claimed_at).toBe(claimedAt);
+    // The relayer the exits will pass back, so this node's own claim can settle
+    // before the indexer reaches it.
+    expect(row.relayer).toEqual(Buffer.from(relayer.slice(2), "hex"));
+    // The order signature stays until the indexed `Posted` clears it.
+    expect(row.order_sig).not.toBeNull();
+  });
+
+  it("encodes fail(jobId, terms, issuedAt, sig) with the row's exit terms", async () => {
+    const { server, stub } = build();
+    const issuedAt = now();
+    const signature = await signFail(provider, JOB_ID, issuedAt);
+
+    const res = await push(server, { op: "fail", job_id: JOB_ID, issued_at: Number(issuedAt), signature });
+
+    expect(res.statusCode).toBe(201);
+    const call = decodeFunctionData({ abi: jobRegistryAbi, data: stub.relayed[0] as Hex });
+    expect(call.functionName).toBe("fail");
+    expect(call.args).toEqual([JOB_ID, ROW_TERMS, issuedAt, signature]);
+  });
+
+  it("refuses a settle or a fail on a job this node has no row for, or whose claim it has not indexed, as NotClaimed, before filing anything", async () => {
+    // No relayer is no exit terms: the relayer is hashed into the stored terms,
+    // and none — this node's own least of all — may stand in for the claim's.
+    for (const [op, jobs] of [
+      ["settle", new Map<string, JobRowStub>()],
+      ["fail", new Map<string, JobRowStub>()],
+      ["settle", new Map([[JOB_ID, heldRow({ state: 1, order_sig: null })]])],
+      ["fail", new Map([[JOB_ID, heldRow({ state: 1, order_sig: null })]])],
+    ] as const) {
+      const { server, stub } = build({ jobs });
+      const issuedAt = now();
+      const res = await push(
+        server,
+        op === "settle"
+          ? settleBody({
+              op,
+              job_id: JOB_ID,
+              ...WIRE_USAGE,
+              completion_tok: 100,
+              issued_at: Number(issuedAt),
+              signature: await signSettle(provider, JOB_ID, 100, issuedAt),
+            })
+          : { op, job_id: JOB_ID, issued_at: Number(issuedAt), signature: await signFail(provider, JOB_ID, issuedAt) },
+      );
+
+      expect(res.statusCode, op).toBe(409);
+      expect(res.json()).toEqual({ ok: false, reason: "NotClaimed" });
+      expect(stub.simulated).toEqual([]);
+      expect(store.objects.size).toBe(0);
+      await server.close();
+    }
+  });
+
+  it("gives the lease back when the chain refuses the claim", async () => {
+    const leases: unknown[][] = [];
+    const { server, stub } = build({
+      leases,
+      simulate: () => ({ kind: "revert", errorName: "AtCapacity" }),
+    });
+
+    const res = await push(server, await claimBody());
+
+    expect(res.json()).toEqual({ ok: false, reason: "AtCapacity" });
+    expect(stub.broadcasts).toEqual([]);
+    expect(leases).toEqual([
+      ["take", JOB_ID, PROVIDER_ID],
+      ["drop", JOB_ID, PROVIDER_ID],
+    ]);
   });
 
   // -- refusals, none of which spend gas ------------------------------------
@@ -469,7 +868,7 @@ describe("POST /evm/ops", () => {
     // The bytes really reached the store, whole.
     expect([...store.objects.values()].some((object) => object.equals(RESULT))).toBe(true);
 
-    // And the calldata names exactly that: `submitAndSettle(jobId, completionTok,
+    // And the calldata names exactly that: `submitAndSettle(jobId, terms, usage,
     // resultCid, issuedAt, sig)`, with the CID as its UTF-8 bytes.
     expect(stub.broadcasts).toHaveLength(1);
     const call = decodeFunctionData({
@@ -477,9 +876,11 @@ describe("POST /evm/ops", () => {
       data: parseTransaction(stub.broadcasts[0] as Hex).data as Hex,
     });
     expect(call.functionName).toBe("submitAndSettle");
+    // The job's exit terms, from its row: what the contract hashes against the claim's.
+    expect(call.args?.[1]).toEqual(ROW_TERMS);
     // The signed usage, as the `Usage` tuple, with `rate_in_cached` in atomic units.
-    expect(call.args?.[1]).toEqual({ promptTok: 900, cachedTok: 300, completionTok: 100, rateInCached: 3000n });
-    expect(call.args?.[2]).toBe(`0x${Buffer.from(minted, "utf8").toString("hex")}`);
+    expect(call.args?.[2]).toEqual({ promptTok: 900, cachedTok: 300, completionTok: 100, rateInCached: 3000n });
+    expect(call.args?.[3]).toBe(`0x${Buffer.from(minted, "utf8").toString("hex")}`);
   });
 
   it("403s a settle whose metered input disagrees with its signature", async () => {
@@ -1015,9 +1416,16 @@ describe("POST /evm/ops", () => {
     expect([a.statusCode, b.statusCode]).toEqual([201, 201]);
     expect(stub.broadcasts).toHaveLength(2);
 
-    const order = stub.requests.map((r) => r.method);
-    const simulates = order.flatMap((m, i) => (m === "eth_call" ? [i] : []));
-    const sends = order.flatMap((m, i) => (m === "eth_sendRawTransaction" ? [i] : []));
+    // The simulates are the `eth_call`s carrying `claim` calldata; the claim's
+    // view reads before them are `eth_call`s too.
+    const simulates = stub.requests.flatMap((r, i) =>
+      r.method === "eth_call" &&
+      decodeFunctionData({ abi: jobRegistryAbi, data: (r.params as [{ data: Hex }])[0].data })
+        .functionName === "claim"
+        ? [i]
+        : [],
+    );
+    const sends = stub.requests.flatMap((r, i) => (r.method === "eth_sendRawTransaction" ? [i] : []));
     expect(simulates).toHaveLength(2);
     expect(sends).toHaveLength(2);
     expect(Math.max(...simulates)).toBeLessThan(Math.min(...sends));
@@ -1042,9 +1450,21 @@ describe("POST /evm/ops", () => {
     // a single request, whose calls are strictly one after another, must report
     // 1. A counter that cannot fall reads the number of RPCs the request made
     // instead, which is six, so both halves go red the moment the decrement goes.
+    //
+    // Two `fail`s rather than two claims: a claim reads the gas fee and the fee
+    // together, so its own pipeline has two RPCs in flight at one point.
     const both = build();
-
-    await twoJobs(both.server);
+    const at = now();
+    await Promise.all(
+      [JOB_ID, OTHER_JOB].map(async (jobId) =>
+        push(both.server, {
+          op: "fail",
+          job_id: jobId,
+          issued_at: Number(at),
+          signature: await signFail(provider, jobId, at),
+        }),
+      ),
+    );
 
     expect(both.stub.maxInFlight).toBe(2);
     await both.server.close();
@@ -1052,9 +1472,9 @@ describe("POST /evm/ops", () => {
     const solo = build();
     const issuedAt = now();
     const res = await push(solo.server, {
-      op: "claim",
+      op: "fail",
       job_id: JOB_ID, issued_at: Number(issuedAt),
-      signature: await signClaim(provider, JOB_ID, issuedAt),
+      signature: await signFail(provider, JOB_ID, issuedAt),
     });
 
     expect(res.statusCode).toBe(201);
@@ -1464,15 +1884,19 @@ describe("POST /evm/ops", () => {
     },
   ];
 
+  // The simulate stage, driven with `fail`: of the job ops it is the one whose
+  // first chain call is the simulate itself. A claim reads the gas fee, the fee
+  // and the owner's balance first, and an endpoint failing those is a failed
+  // read (R77), not a simulate.
   for (const { label, error, type, code } of SIMULATE_FAILURES) {
     it(`503s ${label} at the simulate, retryably, rather than calling it a verdict (R72)`, async () => {
       const { server, stub } = build({ callError: error });
       const issuedAt = now();
 
       const res = await push(server, {
-        op: "claim",
+        op: "fail",
         job_id: JOB_ID, issued_at: Number(issuedAt),
-        signature: await signClaim(provider, JOB_ID, issuedAt),
+        signature: await signFail(provider, JOB_ID, issuedAt),
       });
 
       expect(res.statusCode).toBe(503);
@@ -1496,9 +1920,9 @@ describe("POST /evm/ops", () => {
     const issuedAt = now();
 
     const res = await push(server, {
-      op: "claim",
+      op: "fail",
       job_id: JOB_ID, issued_at: Number(issuedAt),
-      signature: await signClaim(provider, JOB_ID, issuedAt),
+      signature: await signFail(provider, JOB_ID, issuedAt),
     });
 
     expect(res.statusCode).toBe(409);
@@ -1518,9 +1942,9 @@ describe("POST /evm/ops", () => {
     const issuedAt = now();
 
     const res = await push(server, {
-      op: "claim",
+      op: "fail",
       job_id: JOB_ID, issued_at: Number(issuedAt),
-      signature: await signClaim(provider, JOB_ID, issuedAt),
+      signature: await signFail(provider, JOB_ID, issuedAt),
     });
 
     expect(res.statusCode).toBe(409);
@@ -1541,9 +1965,9 @@ describe("POST /evm/ops", () => {
     const issuedAt = now();
 
     const res = await push(server, {
-      op: "claim",
+      op: "fail",
       job_id: JOB_ID, issued_at: Number(issuedAt),
-      signature: await signClaim(provider, JOB_ID, issuedAt),
+      signature: await signFail(provider, JOB_ID, issuedAt),
     });
 
     expect(res.statusCode).toBe(409);
@@ -1566,9 +1990,9 @@ describe("POST /evm/ops", () => {
     const issuedAt = now();
 
     const res = await push(server, {
-      op: "claim",
+      op: "fail",
       job_id: JOB_ID, issued_at: Number(issuedAt),
-      signature: await signClaim(provider, JOB_ID, issuedAt),
+      signature: await signFail(provider, JOB_ID, issuedAt),
     });
 
     expect(res.statusCode).toBe(409);
@@ -1945,7 +2369,7 @@ describe("POST /evm/ops", () => {
         data: parseTransaction(stub.broadcasts[0] as Hex).data as Hex,
       });
       expect(call.functionName).toBe("submitAndSettle");
-      expect(call.args?.[2]).toBe(`0x${Buffer.from(UPLOAD_CID, "utf8").toString("hex")}`);
+      expect(call.args?.[3]).toBe(`0x${Buffer.from(UPLOAD_CID, "utf8").toString("hex")}`);
       // No second copy of bytes the provider already paid to upload.
       expect(store.requests).toEqual([]);
       expect(attached).toEqual([

@@ -11,7 +11,7 @@ import { providerRegistryAbi } from "../src/abi/providerRegistry.js";
  * asserts them for every commit, including hand edits and bad merges.
  */
 const EXPECTED_ENTRIES = {
-  jobRegistry: 69,
+  jobRegistry: 84,
   providerRegistry: 55,
   askRegistry: 14,
 } as const;
@@ -28,20 +28,27 @@ describe("vendored ABIs", () => {
 
   it("expose the JobRegistry surface the indexer and relayer depend on", () => {
     expect(names(jobRegistryAbi, "event")).toEqual(
-      // `PostSkipped` is the batch worker's whole receipt for a line that never
-      // became a job: `postMany` skips rather than reverting, so a missing decode
-      // here is a line silently lost rather than a decode that fails loudly.
-      expect.arrayContaining(["Posted", "Claimed", "Settled", "Ended", "PostSkipped"]),
+      expect.arrayContaining(["Posted", "Claimed", "Settled", "Ended"]),
     );
     expect(names(jobRegistryAbi, "function")).toEqual(
       expect.arrayContaining([
         "getJob",
-        "post",
-        "postMany",
-        "cancel",
         "claim",
         "submitAndSettle",
         "fail",
+        "reclaim",
+        "deposit",
+        "withdraw",
+        "payProvider",
+        "payTreasury",
+        "payRelayer",
+        "relayerEarned",
+        "balanceOf",
+        "earned",
+        "accrued",
+        "depositFee",
+        "gasFee",
+        "feeBps",
       ]),
     );
   });

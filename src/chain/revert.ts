@@ -12,9 +12,8 @@ import { decodeErrorResult, type Abi } from "viem";
  *
  * The other half matters more: **a revert this node cannot decode is reported as
  * `unknown` with the raw bytes attached, never swallowed and never guessed.**
- * The escrow pull inside `claim` calls the payment token, which reverts with
- * errors that are in neither of this node's ABIs — a
- * `FiatTokenV2: authorization is used` string. Mapping those onto
+ * A deposit calls the payment token, which reverts with errors that are in
+ * none of this node's ABIs — a `FiatTokenV2: invalid signature` string. Mapping those onto
  * the nearest familiar name would tell a provider its claim was refused for a
  * reason that is not why it was refused.
  */

@@ -15,7 +15,7 @@ The deployment parameters a client or provider needs to sign.
 
 **Auth:** public · **Index-backed:** no (reads the chain)
 
-`contracts.usdc` is the payment token, and `token_domain` its EIP-712 `name` and `version` for signing the payment. `block_time_ms` is the node's poll interval. `fee_bps` is the protocol fee.
+`contracts.usdc` is the payment token, and `token_domain` its EIP-712 `name` and `version` for signing a deposit. `block_time_ms` is the node's poll interval. `fee_bps` is the protocol fee.
 
 **Errors:** `503 chain_unreachable` or `relay_unavailable` (`config_read`).
 
@@ -27,13 +27,13 @@ The job book, filtered. With `free=N` it is also the provider's poll.
 
 **Auth:** public; a provider session with `free` · **Index-backed:** yes · **Paged:** yes
 
-`state=Cancelled` matches every ended job: cancelled, expired, failed or reclaimed. `provider` matches the jobs claimed by that provider. `min_rate_in` and `min_rate_out` keep jobs at or above those rates; `posted_before` keeps jobs posted at or before that block. The default `order` is `oldest`, by posting block.
+`state=Cancelled` matches every ended job: cancelled, expired, failed or reclaimed. `provider` matches the jobs claimed by that provider. `min_rate_in` and `min_rate_out` keep jobs at or above those rates; `posted_before` keeps jobs posted at or before that block. The default `order` is `oldest`, by posting block. An open job's posting block is the index block when the coordinator accepted the order; a claimed job's is the block of its claim.
 
-`state` and `ended_because` are as in [Job lifecycle](../concepts/job-lifecycle.md#states); an open job past `expires_at` reads as `3` / `5`. `provider_id`, `claimed_at`, `prompt_tok`, `cached_tok`, `completion_tok` and `rate_in_cached` are `"0"` until claimed or settled; the four usage fields are what settlement billed, after the contract's clamps. `gas_fee` is the relay gas fee in USD that the `JobRegistry` fixed for the job when it was posted; the treasury keeps it when a claimed job settles, fails or is reclaimed. `fee` is the protocol fee in USD that settlement took on top of the charge, `"0"` for a job that did not settle.
+`state` and `ended_because` are as in [Job lifecycle](../concepts/job-lifecycle.md#states); an open job past `expires_at` reads as `3` / `5`. `provider_id`, `claimed_at`, `prompt_tok`, `cached_tok`, `completion_tok` and `rate_in_cached` are `"0"` until claimed or settled; the four usage fields are what settlement billed, after the contract's clamps. `gas_fee` is the relay gas fee in USD: the one an open order was quoted at, and the one the claim locked once claimed; the claim's relayer earns it when a claimed job settles, fails or is reclaimed. `fee` is the protocol fee in USD that settlement took on top of the charge, `"0"` for a job that did not settle.
 
-**Provider poll.** `free=N` needs a provider session, `state=Open` and a `model` in the catalog. The node records the provider as live for that model with `N` free slots, leases it up to `N` of the oldest matching jobs it may claim (open bids, or designated to it) for `MATCH_LEASE_MS`, counting leases it already holds, and returns only the jobs it holds. [Held orders](../concepts/matching-and-leases.md#held-orders) among them are posted on chain before the poll answers. See [Matching and leases](../concepts/matching-and-leases.md). Without `free`, the session is ignored.
+**Provider poll.** `free=N` needs a provider session, `state=Open` and a `model` in the catalog. The node records the provider as live for that model with `N` free slots, leases it up to `N` of the oldest matching jobs it may claim (open bids, or designated to it) for `MATCH_LEASE_MS`, counting leases it already holds, and returns only the jobs it holds. Every open job is a [held order](../concepts/matching-and-leases.md#held-orders) that the provider's claim puts on chain. See [Matching and leases](../concepts/matching-and-leases.md). Without `free`, the session is ignored.
 
-On a coordinator whose escrow has lost keys, open undesignated jobs posted before its current key custody are left out of the book.
+On a coordinator whose escrow has lost keys, open undesignated jobs accepted before its current key custody are left out of the book.
 
 **Errors**
 
@@ -81,6 +81,7 @@ A missing session answers `401` before the body is validated.
 ```
 
 - `settle` takes `prompt_tok`, `cached_tok` and `completion_tok` (integers) and `rate_in_cached` (USD per 1M, a decimal string), all signed, and exactly one of `result` (the sealed result, base64, non-empty) and `result_cid` (the `vorq.cid` of a `result` upload by this session's address).
+- The coordinator adds what the contract needs beyond the signed fields: `claim` carries the client's signed order from the coordinator's held order, and `settle` and `fail` carry the job's terms from its record, including the relayer that landed the claim. A claim with no open held order under `job_id` is refused `NotOpen`; a settle or fail with no record of the job, or whose claim is not indexed yet, `NotClaimed`.
 - `claim`, `settle` and `fail` need `issued_at` within ±600 seconds of the node's clock. `set_identity` and `request_capacity` need `issued_at` greater than the last accepted one for that op and at most one hour ahead.
 
 **Response `201`:** after the receipt. On `settle` only, `result_cid` is the IPFS CID the result was stored under.
@@ -92,18 +93,18 @@ A missing session answers `401` before the body is validated.
 | `400` | `result_required`, `result_ambiguous`, `unknown_result`, or `null` | A malformed op (`param` names the field), or a missing, doubled or unknown result. |
 | `401` | `invalid_session` | No valid session. Answered before the body is validated. |
 | `403` | type `invalid_op_signature` | The signature does not recover to a registered provider. |
-| `409` | `{"ok": false, "reason": "<ContractError>"}` | The chain refuses the op, for example `StaleOp`, `NotOpen`, `AtCapacity`, `SlaExpired`. When `reason` is `unknown`, `raw` carries the revert data. `x-vorq-retryable: false`. |
+| `409` | `{"ok": false, "reason": "<ContractError>"}` | The chain refuses the op, for example `StaleOp`, `NotOpen`, `AtCapacity`, `InsufficientDeposit`, `TermsMismatch`, `SlaExpired`. A claim on an order quoted at another gas fee than the live one answers `GasFeeChanged`. When `reason` is `unknown`, `raw` carries the revert data. `x-vorq-retryable: false`. |
 | `429`, `503`, `504` | | See [Errors](./errors.md). A `504` message names the route to poll. |
 
 ### POST /evm/simulate/claim
 
-An advisory check before signing a claim, for a `job_id` and the provider wallet `address`. It reads the chain, not the index, so it is accurate while the index lags.
+An advisory check before signing a claim, for a `job_id` and the provider wallet `address`. It reads the held order from the coordinator and every gate from the chain, not the index, so it is accurate while the index lags.
 
 **Auth:** public · **Index-backed:** no
 
-**Response `200`:** `{"ok": true}`, or `{"ok": false, "reason": …}` with the first failing check, in the contract's order: `UnknownJob`, `NotOpen`, `UnknownProvider`, `NotListed`, `ModelNotAllowed`, `NotDesignated`, `AtCapacity`, `InsufficientFunds` (the owner's balance is below the escrow pull). It does not check the signature or the ±600-second window; `POST /evm/ops` simulates the real transaction.
+**Response `200`:** `{"ok": true}`, or `{"ok": false, "reason": …}` with the first failing check, in the contract's order: `NotOpen` (no open held order, or the id is already on chain), `SlaNotAllowed`, `AlreadyExpired`, `UnknownModel`, `ModelDisabled`, `UnknownProvider`, `NotListed`, `ModelNotAllowed`, `NotDesignated`, `AtCapacity`, `GasFeeChanged` (the order was quoted at another gas fee), `InsufficientDeposit` (the owner's balance, less the locks of its other claims in flight, is below the lock). It does not check the signatures or the ±600-second window; `POST /evm/ops` simulates the real transaction.
 
-Reads are pinned to the node's floor block and shared within it: a burst of checks — a batch's lines claimed one after another — reads the owner's balance and each provider gate once per block, and only `getJob` once per job.
+Reads are pinned to the node's floor block and shared within it: a burst of checks — a batch's lines claimed one after another — reads the owner's balance, the fees and each provider gate once per block, and `getJob` once per job.
 
 ## Asks
 

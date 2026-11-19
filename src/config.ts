@@ -181,7 +181,7 @@ export interface Addresses {
   jobRegistry: Address;
   providerRegistry: Address;
   askRegistry: Address;
-  /** The payment token. Every escrow pull is one authorization against it. */
+  /** The payment token. Every deposit is one authorization against it. */
   usdc: Address;
   /**
    * The payment token's decimals, from the address book and never assumed: it is
@@ -288,6 +288,10 @@ export interface Config {
   match: MatchConfig;
   /** Jobs one wallet may post for one model in 24 hours; `0` is no limit. */
   jobRateLimit: number;
+  /** Deposits plus withdrawals one wallet may have relayed in 24 hours. */
+  moneyRateLimit: number;
+  /** How often the payout keeper pays providers' earnings and the treasury's accruals. */
+  payoutIntervalMs: number;
   addresses: Addresses;
 }
 
@@ -442,6 +446,17 @@ export const NUMERIC = {
   // Jobs one wallet may post for one model in 24 hours. `0`, the default, is no
   // limit. The ceiling is past anything a wallet posts one job at a time.
   JOB_RATE_LIMIT: { fallback: 0, min: 0, max: 1_000_000 },
+  // Deposits plus withdrawals one wallet may have relayed in 24 hours. Never
+  // unlimited: each is a transaction the relayer pays for, and a withdrawal
+  // carries no fee, so a dust balance could otherwise spend the relayer's gas
+  // one withdrawal at a time. 24 is one an hour; the ceiling is one a minute.
+  MONEY_RATE_LIMIT: { fallback: 24, min: 1, max: 1440 },
+  // How often providers' earnings and the treasury's accruals are paid out. A
+  // day by default: each payout is one relayed transaction the relayer pays for.
+  // The floor is a minute, past which a pass re-reads every provider for
+  // nothing new; the ceiling is a week, past which providers wait longer than
+  // anyone running one would accept.
+  PAYOUT_INTERVAL_MS: { fallback: 86_400_000, min: 60_000, max: 604_800_000 },
   // Merged in rather than listed here, so `integer()` reaches every declared
   // variable through one table while the production surface above stays
   // readable as the production surface.
@@ -941,6 +956,8 @@ export function loadConfig(env: Env = process.env): Config {
       candidates: integer(env, "MATCH_CANDIDATES"),
     },
     jobRateLimit: integer(env, "JOB_RATE_LIMIT"),
+    moneyRateLimit: integer(env, "MONEY_RATE_LIMIT"),
+    payoutIntervalMs: integer(env, "PAYOUT_INTERVAL_MS"),
     addresses: loadAddresses(env),
   };
 }

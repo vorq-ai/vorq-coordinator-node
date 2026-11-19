@@ -63,9 +63,10 @@ const RETRYABLE: Record<ErrorType, boolean> = {
   // seconds and the answer changes when it does, so this is the one refusal on
   // the op door that a client should simply try again.
   busy: true,
-  // A wallet at its daily job limit (`JOB_RATE_LIMIT`). `false` although a slot
-  // does open eventually: that is up to 24 hours away, and a client that reads
-  // `true` retries on a backoff measured in seconds. The message names when.
+  // A wallet at its daily limit (`JOB_RATE_LIMIT`, `MONEY_RATE_LIMIT`). `false`
+  // although a slot does open eventually: that is up to 24 hours away, and a
+  // client that reads `true` retries on a backoff measured in seconds. The
+  // message names when.
   rate_limit_exceeded: false,
   // Unknown by definition: a 500 promises nothing about a second attempt.
   internal: false,

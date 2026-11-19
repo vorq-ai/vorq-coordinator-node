@@ -1,19 +1,21 @@
 import {
+  getAddress,
   hashDomain,
   keccak256,
   type Hex,
   type PublicClient,
 } from "viem";
 import type { Address, Addresses } from "./config.js";
+import type { Queryable } from "./db/db.js";
 
 /**
- * The order, the quote and the two signatures — everything about a job's terms
+ * The order, the quote and the exit terms — everything about a job's terms
  * that is arithmetic or EIP-712 rather than HTTP.
  *
  * Kept out of the route because every value here is a **restatement of a frozen
  * contract** (R32) and has to be checked against `JobRegistry.sol` line by line:
  * the `Order` typehash member order, the `jobId` preimage, the cap formula, the
- * payment authorization. A member renamed or reordered here recovers a different
+ * `Terms` struct. A member renamed or reordered here recovers a different
  * address and the post is refused — a silent failure — so this file is written
  * against the contract source and the vendored ABI, never from memory, and
  * `test/api-post.test.ts` spells all four out again *literally* rather than
@@ -34,8 +36,8 @@ export const MAX_EXPIRY_SECONDS = 86_400n;
 export const UINT128_MAX = (1n << 128n) - 1n;
 
 /**
- * 2^53 − 1, the largest cap quotable: the 402's `authorization.value` is the
- * atomic amount a wallet signs, and it travels as a JSON integer.
+ * 2^53 − 1, the largest cap quotable: a quote's amount is what a wallet may have
+ * to deposit, and an atomic amount this node handles stays a safe integer.
  */
 export const MAX_CAP = BigInt(Number.MAX_SAFE_INTEGER);
 
@@ -54,7 +56,7 @@ export const MAX_CAP = BigInt(Number.MAX_SAFE_INTEGER);
  */
 export const MAX_SLA_SECONDS = MAX_EXPIRY_SECONDS;
 
-/** The one payment scheme this node quotes and accepts. */
+/** The one payment scheme this node quotes and accepts: EIP-3009 deposits. */
 export const PAYMENT_SCHEME = "eip3009";
 
 /**
@@ -63,7 +65,7 @@ export const PAYMENT_SCHEME = "eip3009";
  *
  * **Exactly the members the order signature covers**, which is why `taskCid` is
  * not here any more. The CID is minted by the pin this node performs *after* the
- * signature is checked, so it is a `post` argument the route supplies (see
+ * signature is checked, so it is an argument of `claim`'s `Order` the node supplies (see
  * {@link taskCidHex}) and never a term. Leaving it in a struct whose whole
  * purpose is "what the client signed" is the silent drift this file exists to
  * prevent.
@@ -151,9 +153,9 @@ const vorqDomain = (chainId: number, verifyingContract: Address) =>
 /**
  * `Cancel(bytes32 jobId,uint64 issuedAt)` — `JobRegistry.CANCEL_TYPEHASH`.
  *
- * Recovered here only for a held order (`match/held.ts`), whose owner is in this
- * node's row and not on chain. A posted job's cancel is still checked by the
- * contract, in the simulate.
+ * Recovered here against the owner in the order's row: an open order exists
+ * only in this node's database, so its cancel is decided here and relayed
+ * nowhere (`match/held.ts`).
  */
 export function cancelTypedData(chainId: number, jobRegistry: Address, jobId: Hex, issuedAt: bigint) {
   return {
@@ -176,15 +178,14 @@ export function cancelTypedData(chainId: number, jobRegistry: Address, jobId: He
  * `JobRegistry.ORDER_TYPEHASH`, member for member — and **`taskCid` is not one of
  * them**. The client cannot know the name when it signs: it hands the container
  * bytes to this node with the order, the node pins them, and the storage service
- * mints the CID inside the same call. So the CID is a `post` **parameter** (still
- * stored, still in `Posted`, still `EmptyTaskCid` on empty) and not a signed
- * member.
+ * mints the CID inside the same call. So the CID is a member of the `Order`
+ * struct `claim` takes (still in `Posted`, still `EmptyTaskCid` on empty) and not
+ * a signed one.
  *
- * The selector did not change when the member left — `post` still takes the same
- * struct — so **regenerating the ABI carries none of this**. The type string
- * below is the whole difference, and a signature made over the old one recovers
- * a different address and is refused. `test/api-post.test.ts` proves both
- * directions.
+ * **Regenerating the ABI carries none of this**: the struct still has the
+ * member. The type string below is the whole difference, and a signature made
+ * over one that included it recovers a different address and is refused.
+ * `test/api-post.test.ts` proves both directions.
  *
  * Nothing is lost by dropping it: the signed `c` welds the container to
  * `jobId = keccak256(owner ‖ c)`, every claimant re-derives it from the bytes it
@@ -224,53 +225,74 @@ export function orderTypedData(chainId: number, jobRegistry: Address, terms: Ter
 /**
  * The CID's UTF-8 bytes — what `order.taskCid` is on chain.
  *
- * Still needed, and needed more than before: `taskCid` left the **typehash** and
- * stayed a **parameter**, so this is what encodes the name this node's own pin
- * minted into the struct `post` takes.
+ * `taskCid` is in the struct and not in the typehash, so this is what encodes
+ * the name this node's own pin minted into the `Order` that `claim` takes.
  */
 export const taskCidHex = (taskCid: string): Hex =>
   `0x${Buffer.from(taskCid, "utf8").toString("hex")}`;
 
-/** Everything the payment signature commits to beyond the deployment itself. */
-export interface AuthorizationTerms {
-  from: Address;
-  to: Address;
-  value: bigint;
-  /** `expiresAt + 1`: the token requires `now < validBefore`, and a claim may land on `expiresAt`. */
-  validBefore: bigint;
-  jobId: Hex;
+/**
+ * `Terms(address owner,uint128 rateIn,uint128 rateOut,uint32 unitsIn,uint32 unitsOut,
+ * uint32 slaSecs,uint64 gasFee,address relayer)` — what `submitAndSettle`, `fail`
+ * and `reclaim` pass back to the contract, which requires it to hash to the job's
+ * stored `termsHash`. Built from the job's row: the order's members, the `gasFee`
+ * its `Posted` announced, and the `relayer` its `Claimed` announced — whichever
+ * coordinator landed the claim, not necessarily this one.
+ */
+export interface ExitTerms {
+  owner: Address;
+  rateIn: bigint;
+  rateOut: bigint;
+  unitsIn: number;
+  unitsOut: number;
+  slaSecs: number;
+  gasFee: bigint;
+  relayer: Address;
 }
 
-/** The payment token's own EIP-712 domain. Name and version differ per network, so they come
- * from the address book and `assertDomains` proves them against the deployed token. */
-export const tokenDomain = (addresses: Addresses) =>
-  ({
-    name: addresses.tokenDomain.name,
-    version: addresses.tokenDomain.version,
-    chainId: addresses.chainId,
-    verifyingContract: addresses.usdc,
-  }) as const;
+/** The `jobs` columns {@link exitTermsOf} reads. */
+export const EXIT_TERMS_COLUMNS =
+  "owner, rate_in, rate_out, units_in, units_out, sla_secs, gas_fee, relayer";
 
-/** EIP-3009 `ReceiveWithAuthorization`. `nonce` is the job id: single-use on the token, bound to the job. */
-export function authorizationTypedData(addresses: Addresses, auth: AuthorizationTerms) {
+export interface ExitTermsRow {
+  owner: Buffer;
+  rate_in: bigint;
+  rate_out: bigint;
+  units_in: bigint;
+  units_out: bigint;
+  sla_secs: bigint;
+  gas_fee: bigint;
+  /** NULL until the job's `Claimed` is indexed. */
+  relayer: Buffer | null;
+}
+
+/**
+ * One job row's {@link ExitTerms}. Throws on a row whose claim is not indexed:
+ * the relayer is hashed into the stored terms, so there is no value to stand in
+ * for it — callers select only rows with one.
+ */
+export function exitTermsOf(row: ExitTermsRow): ExitTerms {
+  if (row.relayer === null) throw new Error("exit terms built from a job row whose Claimed is not indexed");
   return {
-    domain: tokenDomain(addresses),
-    types: {
-      ReceiveWithAuthorization: [
-        { name: "from", type: "address" },
-        { name: "to", type: "address" },
-        { name: "value", type: "uint256" },
-        { name: "validAfter", type: "uint256" },
-        { name: "validBefore", type: "uint256" },
-        { name: "nonce", type: "bytes32" },
-      ],
-    },
-    primaryType: "ReceiveWithAuthorization" as const,
-    message: {
-      from: auth.from, to: auth.to, value: auth.value,
-      validAfter: 0n, validBefore: auth.validBefore, nonce: auth.jobId,
-    },
+    owner: getAddress(`0x${row.owner.toString("hex")}`) as Address,
+    rateIn: BigInt(row.rate_in),
+    rateOut: BigInt(row.rate_out),
+    unitsIn: Number(row.units_in),
+    unitsOut: Number(row.units_out),
+    slaSecs: Number(row.sla_secs),
+    gasFee: BigInt(row.gas_fee),
+    relayer: getAddress(`0x${row.relayer.toString("hex")}`) as Address,
   };
+}
+
+/** What a claim locks out of the owner's balance: `cap + feeCap + gasFee`, `JobRegistry._locked`. */
+export function lockOf(
+  terms: Pick<Terms, "rateIn" | "rateOut" | "unitsIn" | "unitsOut">,
+  feeBps: number,
+  gasFee: bigint,
+): bigint {
+  const cap = capOf(terms);
+  return cap + feeOf(cap, feeBps) + gasFee;
 }
 
 /** `DOMAIN_SEPARATOR()` — the one member of the payment token and of the three
@@ -330,9 +352,8 @@ const domainHash = (
  */
 export async function assertDomains(client: PublicClient, addresses: Addresses): Promise<void> {
   // The payment token is one row of the same table: its domain is deployment
-  // data like any other, every payment this node quotes names it, and a mismatch
-  // is invisible until a provider's `claim` reverts inside the token — after the
-  // node has already fronted the gas for the post.
+  // data like any other, every deposit authorization is signed under it, and a
+  // mismatch is invisible until a relayed deposit reverts inside the token.
   const contracts = [
     ["job registry", EIP712_NAMES.job, "2", addresses.jobRegistry],
     ["provider registry", EIP712_NAMES.provider, "2", addresses.providerRegistry],
@@ -361,4 +382,18 @@ export async function assertDomains(client: PublicClient, addresses: Addresses):
       );
     }
   }
+}
+
+/**
+ * The {@link ExitTerms} of one job, from its row, or `null` when this node has no
+ * row for it or has not yet indexed its `Claimed` — the same answer: this node
+ * does not know the job as claimed.
+ */
+export async function readExitTerms(db: Queryable, jobId: Hex): Promise<ExitTerms | null> {
+  const { rows } = await db.query<ExitTermsRow>(
+    `SELECT ${EXIT_TERMS_COLUMNS} FROM jobs WHERE job_id = $1 AND relayer IS NOT NULL`,
+    [Buffer.from(jobId.slice(2), "hex")],
+  );
+  const row = rows[0];
+  return row === undefined ? null : exitTermsOf(row);
 }

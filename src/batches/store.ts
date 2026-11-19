@@ -92,12 +92,12 @@ export async function listBatches(
  *
  * Three cases the `CASE` above spells out and a reader should not have to infer:
  *
- *   * **`bl.job_id IS NULL`** — `postMany` answered `PostSkipped` for that line,
- *     so it never became a job. Terminal, and counted as failed: nothing on chain
- *     will ever move it, and a batch whose counts leave it out reads as still
- *     running forever.
- *   * **a `job_id` with no `jobs` row** — the post landed and the index has not
- *     reached it yet. `open`, deliberately: in flight is the safe reading, and it
+ *   * **`bl.job_id IS NULL`** — the worker skipped that line, so it never became
+ *     a job. Terminal, and counted as failed: nothing will ever move it, and a
+ *     batch whose counts leave it out reads as still running forever.
+ *   * **a `job_id` with no `jobs` row** — not written by this node's worker,
+ *     which writes the line and its held order together. `open`, deliberately: in
+ *     flight is the safe reading, and it
  *     becomes settled or cancelled a block later.
  *   * **`state = 0` past `expires_at`** — the one job state that is *computed*
  *     rather than stored (`0001_init.sql` says so: nothing writes cause 5 back). A

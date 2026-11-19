@@ -10,7 +10,6 @@ import {
   waitFor,
   waitForHead,
   waitForReady,
-  waitForSocket,
   type NodeProcess,
 } from "./support/harness.js";
 import {
@@ -26,7 +25,7 @@ import {
   resolveOutstandingClaims,
   signedRelease,
   startEscrowNode,
-  tokenBalance,
+  prepaidBalance,
   type EscrowContainer,
   type ErrorEnvelope,
 } from "./support/escrow.js";
@@ -136,10 +135,10 @@ describe("escrow key loss", () => {
       client,
     );
 
-    const balanceBeforeClaim = await tokenBalance(addresses, client.address);
-    await claimOnChain(addresses, claimedPosted.jobId);
-    const balanceAfterClaim = await tokenBalance(addresses, client.address);
-    // The escrow funded exactly once, at claim: cap + the gas fee snapshot.
+    const balanceBeforeClaim = await prepaidBalance(addresses, client.address);
+    await claimOnChain(addresses, claimedPosted);
+    const balanceAfterClaim = await prepaidBalance(addresses, client.address);
+    // Locked exactly once, at claim, out of the prepaid balance: cap + feeCap + gasFee.
     expect(balanceAfterClaim).toBeLessThan(balanceBeforeClaim);
     const reputationBefore = await reputationOf(addresses, providerId);
 
@@ -162,10 +161,11 @@ describe("escrow key loss", () => {
 
     const fresh = await startEscrowNode({ schema: "vorq_devnet_escrow_loss_fresh" });
     running.push(fresh);
-    // The socket, not readiness: `/release` is outside the gate, and the grace
-    // window is 300 s from the claim, so the time-critical half of this scenario
-    // runs the moment the process answers.
-    await waitForSocket(fresh);
+    // Readiness, not just the socket: `/release` reads the job's owner from the
+    // row the claim's `Posted` writes, and this instance has its own schema, so it
+    // can prove the owner only once it has indexed that claim. The grace window
+    // is 300 s from the claim; a cold start on the devnet is well inside it.
+    await waitForReady(fresh);
 
     const freshKey = await escrowPublicKeyOf(fresh);
     expect(freshKey.equals(escrowKey)).toBe(false);
@@ -186,9 +186,12 @@ describe("escrow key loss", () => {
 
     // Inside the grace window, so no penalty: the reputation is untouched.
     expect(await reputationOf(addresses, providerId)).toBe(reputationBefore);
-    // And the client has cap + feeCap back — `_refundAndEnd` pays those to the
-    // owner and the gas fee snapshot to the treasury; the operator takes nothing.
-    expect(await tokenBalance(addresses, client.address)).toBe(balanceBeforeClaim - (await gasFeeOf(addresses)));
+    // And the client has cap + feeCap back in its balance — `_refundAndEnd`
+    // credits those to the owner and the gas fee to the claim's relayer; the
+    // operator takes nothing.
+    expect(await prepaidBalance(addresses, client.address)).toBe(
+      balanceBeforeClaim - (await gasFeeOf(addresses)),
+    );
 
     // ---- the book, once the successor has caught up -----------------------
 

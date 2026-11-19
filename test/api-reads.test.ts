@@ -69,6 +69,8 @@ function config(overrides: Partial<Config> = {}): Config {
     escrow: { mode: "off", releaseOrdinal: 1, sweepIntervalMs: 300_000, peerUrl: null, peerRequired: false, peerSyncMs: 300_000, rotateIntervalMs: 86_400_000, operatorKeys: [], clockOffsetMs: 0 },
     match: { leaseMs: 20_000, livenessMs: 15_000, candidates: 3 },
     jobRateLimit: 0,
+    moneyRateLimit: 24,
+    payoutIntervalMs: 86_400_000,
     addresses: ADDRESSES,
     ...overrides,
   };

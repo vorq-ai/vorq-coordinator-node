@@ -2,10 +2,10 @@ import { Type, type Static } from "typebox";
 import type { Hex } from "viem";
 import { ApiError } from "../api/errors.js";
 import { bodyAjv, validationFailure } from "../api/schemas/ajv.js";
+import { Usd } from "../api/schemas/common.js";
 import type { Address, Addresses } from "../config.js";
 import { assertCommitment, assertSameCommitment, ContainerError } from "../container.js";
 import {
-  authorizationTypedData,
   capOf,
   CapOverflowError,
   feeOf,
@@ -17,19 +17,23 @@ import {
 import type { Queryable } from "../db/db.js";
 import { findUpload } from "../api/routes/files.js";
 import {
+  parseAmount,
   parseContent,
   parseOrder,
-  parsePayment,
   recovers,
   Submission,
   type Content,
 } from "../submission.js";
 
-/** A line: a submission, plus OpenAI's optional per-line `url`. */
-const Line = Type.Object(
-  { ...Submission.properties, url: Type.Optional(Type.String()) },
-  { dependentRequired: { auth_sig: ["amount"] } },
-);
+/**
+ * A line: a complete submission — `amount` required, because a line is never a
+ * challenge — plus OpenAI's optional per-line `url`.
+ */
+const Line = Type.Object({
+  ...Submission.properties,
+  amount: Usd({ description: "What this line's claim locks from the prepaid balance, in USD." }),
+  url: Type.Optional(Type.String()),
+});
 const validLine = bodyAjv.compile<Static<typeof Line>>(Line);
 
 /**
@@ -38,7 +42,7 @@ const validLine = bodyAjv.compile<Static<typeof Line>>(Line);
  * ## A line is a `POST /v1/jobs` body
  *
  * The same nine signed members, the same `container` / `container_cid` pair, the
- * same payment — parsed by the same {@link parseOrder} and
+ * same `amount` — parsed by the same {@link parseOrder} and
  * {@link parseContent}, because a batch line **is** a single-job submission that
  * happens to arrive fifty thousand at a time. Nothing about a line is
  * batch-shaped except the file it sits on.
@@ -55,22 +59,20 @@ const validLine = bodyAjv.compile<Static<typeof Line>>(Line);
  * ## Skip, never refuse
  *
  * Every refusal below produces a {@link LineSkip} rather than an error, and the
- * batch continues. That is the `AskRegistry.setAsks` rule the contract's own
- * `postMany` follows, and at a 50 000-line cap it is the only coherent choice: an
+ * batch continues. That is the `AskRegistry.setAsks` rule, and at a 50 000-line
+ * cap it is the only coherent choice: an
  * all-or-nothing create would throw away 49 999 good lines — and the ~8 minutes of
  * pinning already spent on them — for one line with a typo. The skip's `code` is
  * what the error-file row for that line carries.
  *
  * ## Almost everything here is free
  *
- * No store: admission is the set of checks that cost no round trip, which is what
- * lets 50 000 of them run before a single object is filed. There are two
- * exceptions. A line that references its container by cid is one indexed `files`
- * read, and there is no way to check such a line without it. A line's payer is
- * one `eth_getCode` — read once per payer for the whole file by the closure the
- * worker supplies, so a file signed by one wallet costs one call. The two
- * checks that are not a line's own — is this model in the catalog, and does this
- * `job_id` repeat — are the worker's, and it makes them in bulk.
+ * No store and no chain: admission is the set of checks that cost no round trip,
+ * which is what lets 50 000 of them run before a single object is filed. The one
+ * exception is a line that references its container by cid: one indexed `files`
+ * read, and there is no way to check such a line without it. The checks that are
+ * not a line's own — is this model in the catalog, does this `job_id` repeat, can
+ * the owner's balance cover it — are the worker's, and it makes them in bulk.
  *
  * ## A referenced upload has 300 seconds to be taken up
  *
@@ -97,40 +99,23 @@ export interface LineContext {
    * upload was made under.
    */
   owner: Buffer;
-  /** The deployment both of a line's signatures are verified against. */
+  /** The deployment a line's order signature is verified against. */
   addresses: Addresses;
   /** Unix seconds, taken once for the whole file so lines are judged against one instant. */
   now: bigint;
-  /** `JobRegistry.gasFee()`, read once per batch — every line's payment must cover it. */
+  /** `JobRegistry.gasFee()`, read once per batch — every line's amount must include it. */
   gasFee: bigint;
-  /** `JobRegistry.feeBps()`, read once per batch — the fee every line's payment must also cover. */
+  /** `JobRegistry.feeBps()`, read once per batch — the fee every line's amount must also include. */
   feeBps: number;
-  /**
-   * Whether one account carries code at `latest` — `eth_getCode`, and the one
-   * chain read a line's own checks make.
-   *
-   * A code-bearing payer is validated by the payment token through ERC-1271
-   * rather than `ecrecover`, so its plain EOA authorization fails inside the
-   * token at `claim` however well it recovers here. The line is skipped rather
-   * than posted, for the same reason every other check on this path exists: the
-   * gas is never fronted for a job that can only rest Open to expiry.
-   *
-   * Supplied by the worker as a closure, so the answer is read **once per payer
-   * per batch** rather than once per line — the way `gasFee` and `feeBps` are
-   * read once for the whole file. A file of 50 000 lines from one wallet is one
-   * `eth_getCode`.
-   */
-  hasCode: (address: Address) => Promise<boolean>;
 }
 
-/** An admitted line: everything the pin and the `postMany` call need, and nothing else. */
+/** An admitted line: everything the pin and the held row need, and nothing else. */
 export interface AdmittedLine {
   terms: Terms;
   owner: Address;
   jobId: Hex;
   signature: Hex;
-  authSig: Hex;
-  /** What this line's claim pulls from `owner`: `cap + feeCap + gasFeeSnap`. */
+  /** What this line's claim locks from `owner`'s balance: `cap + feeCap + gasFee`. */
   amount: bigint;
   /**
    * The sealed container, inline or by name. Inline bytes are filed as-is and
@@ -154,8 +139,8 @@ const skip = (code: string, message: string): LineVerdict => ({ ok: false, skip:
  * Parse and check one line.
  *
  * The order of the checks is the order of their cost: the JSON parse, then the
- * widths, then the commitment, then the clock, then the two ECDSA recoveries. A
- * line that fails cheaply never pays for the rest. The commitment sits where it
+ * widths, then the commitment, then the clock, then the ECDSA recovery. A line
+ * that fails cheaply never pays for the rest. The commitment sits where it
  * does because inline it is two keccaks — cheaper than a recovery — and a line
  * that references an upload has to be read before anything about it is known.
  */
@@ -200,9 +185,8 @@ export async function admitLine(raw: string, ctx: LineContext): Promise<LineVerd
       );
     }
 
-    // The one check no other party can make: no contract sees a container, and a
-    // job posted over bytes that miss their commitment can never be claimed by
-    // anyone while its escrow is committed the moment it would be. Inline, that
+    // The one check no other party can make: no contract sees a container, and an
+    // order over bytes that miss their commitment can never be worked. Inline, that
     // is two keccaks over bytes this process already holds; by cid it is the
     // commitment `POST /v1/files` computed while the upload streamed past.
     //
@@ -236,9 +220,9 @@ export async function admitLine(raw: string, ctx: LineContext): Promise<LineVerd
       }
     }
 
-    // The contract's own two bounds, checked here so the gas is never fronted.
-    // Separate codes because the remedies are opposite — one line needs a later
-    // expiry, the other an earlier one.
+    // The contract's own two bounds, checked here so no line is held that no
+    // claim could land. Separate codes because the remedies are opposite — one
+    // line needs a later expiry, the other an earlier one.
     if (terms.expiresAt <= ctx.now) {
       return skip("order_expired", "expires_at is in the past");
     }
@@ -257,20 +241,16 @@ export async function admitLine(raw: string, ctx: LineContext): Promise<LineVerd
       return skip("cap_overflow", error.message);
     }
 
-    const { authSig, amount } = parsePayment(body, ctx.addresses.decimals);
+    const amount = parseAmount(body, ctx.addresses.decimals);
 
-    // **`!==`, exactly as `POST /v1/jobs` compares.** The asymmetry this door
-    // used to carry — a line over-signed for more than the pull was admitted —
-    // belonged to the retired scheme, whose signature was a ceiling the claim
-    // drew under. An EIP-3009 authorization is not a ceiling: the claim pulls the **signed**
-    // value, so a line signed for more than `cap + feeCap + gasFeeSnap` would
-    // move the difference out of the client's wallet and a line signed for less
-    // reverts. One amount is payable, and it is this one.
+    // **`!==`, exactly as `POST /v1/jobs` compares.** The claim locks exactly
+    // `cap + feeCap + gasFee`, so a line stating any other amount is one the
+    // client did not price, whichever way it is wrong.
     const due = cap + feeOf(cap, ctx.feeBps) + ctx.gasFee;
     if (amount !== due) {
       return skip(
         "insufficient_payment",
-        `amount is ${amount} and this line's claim will pull exactly ${due}`,
+        `amount is ${amount} and this line's claim will lock exactly ${due}`,
       );
     }
 
@@ -287,35 +267,7 @@ export async function admitLine(raw: string, ctx: LineContext): Promise<LineVerd
       );
     }
 
-    const authorization = authorizationTypedData(ctx.addresses, {
-      from: owner,
-      to: ctx.addresses.jobRegistry,
-      value: amount,
-      validBefore: terms.expiresAt + 1n,
-      jobId,
-    });
-    if (!(await recovers(authorization, owner, authSig))) {
-      return skip(
-        "invalid_payment_signature",
-        "auth_sig does not recover to owner over this line's payment authorization",
-      );
-    }
-
-    // Last, because it is the only check here that costs a round trip. Same fact
-    // as `POST /v1/jobs`'s `payer_has_code`: the payment token routes a
-    // code-bearing authorizer to ERC-1271, so this line's authorization — which
-    // recovers perfectly above — can never be collected, and posting it would
-    // spend gas on a job that rests Open to expiry.
-    if (await ctx.hasCode(owner)) {
-      return skip(
-        "payer_has_code",
-        `owner ${owner} carries contract code, so the payment token would validate this ` +
-          "authorization through ERC-1271 and the claim would revert; pay from an account " +
-          "with no code — an undelegated EOA",
-      );
-    }
-
-    return { ok: true, line: { terms, owner, jobId, signature, authSig, amount, content } };
+    return { ok: true, line: { terms, owner, jobId, signature, amount, content } };
   } catch (error) {
     // The schema's refusal and `parseOrder`'s — a missing member, a value past
     // its chain width, a malformed signature, a `job_id` that is not the order's.

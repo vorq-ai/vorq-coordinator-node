@@ -3,8 +3,9 @@ import { recoverTypedDataAddress, type Hex } from "viem";
 import { Type, type Static } from "typebox";
 import { ApiError } from "../api/errors.js";
 import { Base64, Hex32, HexBare32, SafeUint } from "../api/schemas/common.js";
-import { getJob, idOf, type Chain, type JobView } from "../chain/client.js";
+import { getJob, idOf, type Chain } from "../chain/client.js";
 import type { Address, Config } from "../config.js";
+import type { Queryable } from "../db/db.js";
 import { SEED_WRAP_BYTES } from "../container.js";
 import { DEK_BYTES, SEED_BYTES, commitment, jobIdFor, sealDek } from "./container.js";
 import type { EscrowKeys } from "./keys.js";
@@ -27,10 +28,10 @@ import type { EscrowKeys } from "./keys.js";
  * The repairs that do **not** close it, each ruled out before this file was
  * written, and each stated here so nobody re-derives them:
  *
- *   * *reading `owner` from chain instead of from the body* — necessary, and done
- *     (P4 requires it); C1 has since removed the body field entirely, but the
- *     attacker's job genuinely has the attacker as its chain owner, so the
- *     comparison was always self-consistent and always passed;
+ *   * *taking `owner` from the job instead of from the body* — necessary, and
+ *     done (P4 requires it; C1 removed the body field), but the attacker's job
+ *     genuinely has the attacker as its owner, so the comparison is always
+ *     self-consistent and always passes;
  *   * *`c` uniqueness on chain* — the attacker picks a fresh `ct_hash`, so `c'` is
  *     a commitment nobody has spent;
  *   * *fetching the container from its CID rather than trusting the body* — the
@@ -53,7 +54,8 @@ import type { EscrowKeys } from "./keys.js";
  * dek = HKDF-SHA256(ikm = seed, salt = "" (zero length), info = "vorq-dek" ‖ owner20, L = 32)
  * ```
  *
- * where `owner20` is the job's **chain-read** owner as 20 raw bytes and `seed` is
+ * where `owner20` is the job's **proven** owner (the one that, with the wrap's
+ * commitment, reproduces the job id) as 20 raw bytes and `seed` is
  * the 32 bytes recovered from the sealed box. See {@link deriveDek}, which states
  * every input.
  *
@@ -73,11 +75,18 @@ import type { EscrowKeys } from "./keys.js";
  * and derive its encryption key this way, and `vorq-provider-sdk` must derive
  * after unsealing a designated wrap.
  *
- * ## What this door never reads (P7)
+ * ## What this door reads from Postgres (P7)
  *
- * **Postgres.** Claim state, provider identity and owner all come from `eth_call`
- * at `latest` (P18). A `Claimed` row forged directly in the projection must not
- * move this decision by a byte, and Task 7 has a test that forges one.
+ * **Only what it can check.** Claim state and the claimant come from `getJob` at
+ * the node's floor (P18); a `Claimed` row forged directly in the projection must
+ * not move this decision by a byte, and Task 7 has a test that forges one. The
+ * owner the KDF derives under cannot come from the chain — `getJob` does not
+ * carry it — so it comes from the job's row, and is accepted **only** when
+ * `keccak256(owner ‖ commitment(seed_wrap, ct_hash)) == job_id`. The id is
+ * collision-resistant in both of its inputs, so a row naming any other owner, or
+ * a wrap from any other job, fails the hash: the row is a hint the request has
+ * to prove, never an authority. The escrow-orphan label reads the row's
+ * `designated` and `expires_at` the same way — a label, never a permission.
  */
 
 /**
@@ -120,7 +129,7 @@ export const DEK_HKDF_SALT = Buffer.alloc(0);
 
 /**
  * The working DEK for a job, from the seed its container sealed and the job's
- * **chain-read** owner.
+ * **proven** owner.
  *
  * ```
  * ikm  = seed                                   32 bytes, the sealed-box plaintext
@@ -170,10 +179,9 @@ export interface KeyEpochStart {
  * Whether a job's wrap can only ever have named a key this node's custody never
  * covered — the per-job `escrow_key_lost` predicate (P7).
  *
- * **Chain-only and one-sided, by construction.** The plan routed this through
- * `posted_block`, which exists only in Postgres, and `/release` must not read
- * Postgres. `JobView` carries no posting block and no posting time either, so the
- * derivation has to come from something the chain does expose:
+ * **One-sided, by construction**, and read from the order's own two members in
+ * the job's row (`getJob` carries neither). No posting block or posting time is
+ * read, so the derivation has to come from the order itself:
  *
  *   * `expiresAt` is **always later than the posting** — the registry refuses an
  *     order whose expiry is already past — so `expiresAt < keyEpochStart` proves
@@ -194,10 +202,34 @@ export interface KeyEpochStart {
  * The comparison is strict: an expiry landing exactly on the epoch instant proves
  * nothing about when the job was posted.
  */
-export function isEscrowOrphan(view: JobView, epoch: KeyEpochStart | null): boolean {
+export function isEscrowOrphan(
+  order: { designated: bigint | number; expiresAt: bigint | number },
+  epoch: KeyEpochStart | null,
+): boolean {
   if (epoch === null) return false;
-  if (Number(view.designated) !== 0) return false;
-  return Number(view.expiresAt) * 1000 < epoch.time;
+  if (Number(order.designated) !== 0) return false;
+  return Number(order.expiresAt) * 1000 < epoch.time;
+}
+
+/** What `/release` reads from the job's row: the owner to prove, and the orphan label's two members. */
+interface ReleaseRow {
+  owner: Address;
+  designated: bigint;
+  expiresAt: bigint;
+}
+
+async function releaseRow(db: Queryable, jobId: Hex): Promise<ReleaseRow | null> {
+  const { rows } = await db.query<{ owner: Buffer; designated: bigint; expires_at: bigint }>(
+    "SELECT owner, designated, expires_at FROM jobs WHERE job_id = $1",
+    [Buffer.from(jobId.slice(2), "hex")],
+  );
+  const row = rows[0];
+  if (row === undefined) return null;
+  return {
+    owner: `0x${row.owner.toString("hex")}` as Address,
+    designated: BigInt(row.designated),
+    expiresAt: BigInt(row.expires_at),
+  };
 }
 
 /**
@@ -384,6 +416,8 @@ export interface ReleaseDeps {
    */
   keys: EscrowKeys;
   chain: Chain;
+  /** The job's row: its owner, proven against the id before anything is derived under it. */
+  db: Queryable;
   config: Config;
   /** This node's clock, in milliseconds. Injected so the ±600 s bound is testable. */
   nowMs: number;
@@ -451,27 +485,21 @@ export async function release(deps: ReleaseDeps, body: ReleaseBody): Promise<Rel
     );
   }
 
-  // 5b. **The authorisation weld over what the caller supplied** (P4). `view.c`
-  //     is the commitment the chain holds for this job, so a wrap that does not
-  //     reproduce it is not this job's wrap — whatever the body said. C1 removed
-  //     the body's `owner`, so the wrap and the ct hash are the only
-  //     caller-supplied pieces left for a weld to check. It is **not** the only
-  //     weld: the owner the KDF derives under is guarded separately, by the
-  //     chain-side check immediately below, which R3 keeps for that reason.
-  if (commitment(request.seedWrap, request.ctHash).toLowerCase() !== view.c.toLowerCase()) {
-    throw wrapMismatch(
-      "this seed_wrap and ct_hash do not reproduce the commitment the chain holds for this job",
-    );
+  // 5b. **The authorisation weld** (P4). The owner is not on chain any more —
+  //     `getJob` answers status and claimant only — so it is read from the job's
+  //     row and accepted only when it, together with the commitment the caller's
+  //     wrap and ct hash reproduce, hashes to this job's id. `jobId =
+  //     keccak256(owner ‖ c)` binds both halves: a wrap lifted from another job
+  //     reproduces another `c`, and a row naming another owner names another id.
+  //     Either fails here, and nothing is derived.
+  const row = await releaseRow(deps.db, request.jobId);
+  if (row === null) {
+    throw wrapMismatch("this node holds no order under this job id, so no owner can be proven for it");
   }
-  // The registry derives `jobId` from `owner ‖ c` on post, so this cannot fail
-  // against a healthy contract. It is checked anyway because the *next* thing
-  // that happens is deriving key material under `view.owner`: an owner that does
-  // not reproduce the id would be an owner this job's client never committed to,
-  // and deriving under it would hand back a key nobody can use while looking
-  // exactly like success.
-  if (jobIdFor(view.owner as Address, view.c).toLowerCase() !== request.jobId.toLowerCase()) {
+  const c = commitment(request.seedWrap, request.ctHash);
+  if (jobIdFor(row.owner, c).toLowerCase() !== request.jobId.toLowerCase()) {
     throw wrapMismatch(
-      "the chain's own owner and commitment for this job do not reproduce its id",
+      "this seed_wrap and ct_hash, under the job's owner, do not reproduce this job's id",
     );
   }
 
@@ -491,18 +519,16 @@ export async function release(deps: ReleaseDeps, body: ReleaseBody): Promise<Rel
   //    keeps its narrow signature anyway, because the property worth holding is
   //    not "the body's owner is unused" but "nothing a caller supplies can reach
   //    the KDF", and that stays true whatever the next field added to this body
-  //    turns out to be. The weld at the `jobIdFor` check above invites its own
-  //    removal ("cannot fail against a healthy contract"); the day somebody
-  //    accepts that invitation, this signature is still the thing standing there.
-  return releaseUnder(keys, view, request.seedWrap, request.responsePubkey, deps.keyEpochStart);
+  //    turns out to be.
+  return releaseUnder(keys, row, request.seedWrap, request.responsePubkey, deps.keyEpochStart);
 }
 
 /**
- * Trial-unseal, derive, and seal to the recipient — **under the chain's owner,
+ * Trial-unseal, derive, and seal to the recipient — **under the proven owner,
  * which is the only owner this function can see**.
  *
- * The parameters are deliberately narrow: a `JobView` read from the chain, the
- * wrap, and the recipient key. There is no request here, so there is no
+ * The parameters are deliberately narrow: the job's row once its owner has
+ * reproduced the job id, the wrap, and the recipient key. There is no request here, so there is no
  * request-supplied identity to derive under, and reaching for one is a change to
  * this signature rather than a one-word slip inside a hundred-line function.
  * C1 removed the body's `owner`, which makes the point moot today and is exactly
@@ -511,14 +537,14 @@ export async function release(deps: ReleaseDeps, body: ReleaseBody): Promise<Rel
  */
 function releaseUnder(
   keys: EscrowKeys,
-  view: JobView,
+  row: ReleaseRow,
   wrap: Buffer,
   responsePubkey: Buffer,
   keyEpochStart: KeyEpochStart | null,
 ): ReleaseResponse {
   const unsealed = keys.tryUnseal(wrap);
   if (unsealed === null) {
-    if (isEscrowOrphan(view, keyEpochStart)) {
+    if (isEscrowOrphan(row, keyEpochStart)) {
       throw new ApiError(
         410,
         "not_found",
@@ -541,7 +567,7 @@ function releaseUnder(
 
   // **The seed is not the DEK.** `tryUnseal` returns the sealed-box plaintext,
   // which under P4's mechanism is a 32-byte seed; the working key is derived from
-  // it and the job's chain-read owner. See this module's header for why.
-  const dek = deriveDek(unsealed.seed, view.owner as Address);
+  // it and the job's proven owner. See this module's header for why.
+  const dek = deriveDek(unsealed.seed, row.owner);
   return { dek_sealed: sealDek(dek, responsePubkey).toString("base64") };
 }

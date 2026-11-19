@@ -49,6 +49,8 @@ const ASK_REGISTRY = "0x3333333333333333333333333333333333333333" as const;
 
 const OWNER = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" as const;
 const OPERATOR = "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb" as const;
+/** The claim's sender, as `Claimed` announces it: the exits' `Terms.relayer`. */
+const RELAYER = "0xcccccccccccccccccccccccccccccccccccccccc" as const;
 
 const word = (fill: string): Hex => `0x${fill.repeat(32)}`;
 
@@ -210,8 +212,8 @@ const posted = (over: PostedOverrides = {}): Emit =>
     }),
   );
 
-const claimed = (jobId: Hex, provider = 3, claimedAt = 1_700_000_000n): Emit =>
-  job(encodeLog(jobRegistryAbi, "Claimed", { jobId, provider, claimedAt }));
+const claimed = (jobId: Hex, provider = 3, claimedAt = 1_700_000_000n, relayer: Hex = RELAYER): Emit =>
+  job(encodeLog(jobRegistryAbi, "Claimed", { jobId, provider, relayer, claimedAt }));
 
 /** The metered input a `Settled` carries besides `completionTok`. */
 const USAGE = { promptTok: 900, cachedTok: 300, rateInCached: 3000n };
@@ -372,7 +374,7 @@ describe("decodeLog", () => {
     // topics are deliberately absent from the decode table. What a job paid
     // rides on its own `Posted` and `Settled` instead.
     const config = [
-      job(encodeLog(jobRegistryAbi, "FeesChanged", { feeBps: 250, gasFee: 1n })),
+      job(encodeLog(jobRegistryAbi, "FeesChanged", { feeBps: 250, gasFee: 1n, depositFee: 2n })),
       job(
         encodeLog(jobRegistryAbi, "SlaAllowedChanged", {
           secs: 3600,
@@ -605,6 +607,7 @@ describe.skipIf(!TEST_DATABASE_URL)("reduceRange", () => {
         as_of_block: bigint;
         gas_fee: bigint;
         fee: bigint;
+        relayer: Buffer;
       }>("SELECT * FROM jobs");
 
       expect(rows).toHaveLength(1);
@@ -632,10 +635,10 @@ describe.skipIf(!TEST_DATABASE_URL)("reduceRange", () => {
         gas_fee: GAS_FEE,
         fee: FEE,
         order_sig: null,
-        auth_sig: null,
         prompt_tok: 900n,
         cached_tok: 300n,
         rate_in_cached: 3000n,
+        relayer: bytes(RELAYER),
       });
       expect(await cursorBlock()).toBe(3n);
     });
@@ -703,6 +706,21 @@ describe.skipIf(!TEST_DATABASE_URL)("reduceRange", () => {
       expect(rows[0]).toEqual({ state: 0, ended_because: 0 });
     });
 
+    it("spends the claimed job's lease, and only that job's", async () => {
+      // A lease left live past the claim counts the job twice against the
+      // provider's free slots in the ranking: once in its own free_slots, once here.
+      for (const id of [JOB_A, JOB_B]) {
+        await db.query(
+          "INSERT INTO job_leases (job_id, provider_id, expires_at) VALUES ($1, 3, now() + interval '2 minutes')",
+          [bytes(id)],
+        );
+      }
+      await reduceRange(db, stream([posted(), claimed(JOB_A, 3)]), 2n);
+
+      const { rows } = await db.query<{ job_id: Buffer }>("SELECT job_id FROM job_leases");
+      expect(rows).toEqual([{ job_id: bytes(JOB_B) }]);
+    });
+
     it("throws on a Claimed with no Posted, and never invents the row", async () => {
       await expect(reduceRange(db, stream([claimed(JOB_A)]), 1n)).rejects.toThrow(/Claimed/);
 
@@ -710,9 +728,20 @@ describe.skipIf(!TEST_DATABASE_URL)("reduceRange", () => {
       expect(rows[0]?.count).toBe(0n);
     });
 
-    it("throws on an orphan Settled and an orphan Ended too", async () => {
+    it("throws on an orphan Settled, and on an orphan fail or reclaim Ended", async () => {
       await expect(reduceRange(db, stream([settled(JOB_A)]), 1n)).rejects.toThrow(/Settled/);
-      await expect(reduceRange(db, stream([ended(JOB_A, 2)]), 1n)).rejects.toThrow(/Ended/);
+      await expect(reduceRange(db, stream([ended(JOB_A, 3)]), 1n)).rejects.toThrow(/Ended/);
+      await expect(reduceRange(db, stream([ended(JOB_A, 4)]), 1n)).rejects.toThrow(/Ended/);
+    });
+
+    it("steps over an owner's on-chain cancel of an order no row describes", async () => {
+      // `cancel` of an unclaimed order writes a Cancelled row on chain and emits
+      // `Ended(2)` with no `Posted` before it. Any wallet can do that for an id of
+      // its own, so it must neither stop the indexer nor invent a row.
+      await expect(reduceRange(db, stream([ended(JOB_A, 2)]), 1n)).resolves.toBeDefined();
+
+      const { rows } = await db.query<{ count: bigint }>("SELECT count(*) FROM jobs");
+      expect(rows[0]?.count).toBe(0n);
     });
   });
 
@@ -1434,7 +1463,7 @@ describe.skipIf(!TEST_DATABASE_URL)("reduceRange", () => {
   });
 
   it("skips logs it does not project and still advances the cursor", async () => {
-    const feesChanged = job(encodeLog(jobRegistryAbi, "FeesChanged", { feeBps: 250, gasFee: 1n }));
+    const feesChanged = job(encodeLog(jobRegistryAbi, "FeesChanged", { feeBps: 250, gasFee: 1n, depositFee: 2n }));
 
     const applied = await reduceRange(db, stream([feesChanged, posted()]), 2n);
 

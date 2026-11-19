@@ -33,8 +33,7 @@ import {
   type TypedDataDomain,
 } from "viem";
 
-import { authorizationTypedData, EIP712_NAMES, orderTypedData } from "../src/orders.js";
-import type { Addresses } from "../src/config.js";
+import { EIP712_NAMES, orderTypedData } from "../src/orders.js";
 import { OP_REGISTRY, OP_TYPES } from "../src/api/routes/ops.js";
 import { ASK_SNAPSHOT_TYPES, askDomain, askSnapshotTypedData } from "../src/asks/push.js";
 import { RELEASE_TYPES, releaseDomain } from "../src/escrow/release.js";
@@ -71,25 +70,6 @@ const VECTORS = JSON.parse(
 
 const CASES = new Map(VECTORS.cases.map((c) => [c.name, c]));
 const A = VECTORS.addresses;
-
-/**
- * The vectors' deployment as an {@link Addresses}, so the builders under test are
- * called the way the node calls them — through the address book, not through
- * loose arguments.
- *
- * `decimals` and `deployBlock` are along for the type: nothing a digest is built
- * over reads them.
- */
-const ADDRESSES_FOR_VECTORS: Addresses = {
-  chainId: VECTORS.chain_id,
-  deployBlock: 0,
-  jobRegistry: A.job_registry,
-  providerRegistry: A.provider_registry,
-  askRegistry: A.ask_registry,
-  usdc: A.payment_token,
-  decimals: 6,
-  tokenDomain: { name: "USDC", version: "2" },
-};
 
 function vector(name: string): Case {
   const found = CASES.get(name);
@@ -193,7 +173,7 @@ describe("the vectors belong to this deployment", () => {
 });
 
 // ---------------------------------------------------------------------------
-// orders.ts — Order and the payment authorization the escrow is pulled with
+// orders.ts — Order
 // ---------------------------------------------------------------------------
 
 describe("orders.ts", () => {
@@ -221,25 +201,6 @@ describe("orders.ts", () => {
     expect(vector("order-designated").extra!.task_cid).toBeTruthy();
     expect(built.types.Order.map((m) => m.name)).not.toContain("taskCid");
     expect(Object.keys(built.message)).not.toContain("taskCid");
-  });
-
-  it("the payment authorization matches the vector", async () => {
-    const m = vector("payment-authorization").typed_data.message;
-    const d = vector("payment-authorization").typed_data.domain as { name: string; version: string };
-    await expectMatchesVector(
-      "payment-authorization",
-      authorizationTypedData(
-        { ...ADDRESSES_FOR_VECTORS, usdc: A.payment_token, tokenDomain: { name: d.name, version: d.version } },
-        { from: m.from as Address, to: m.to as Address, value: BigInt(m.value),
-          validBefore: BigInt(m.validBefore), jobId: m.nonce as Hex },
-      ),
-    );
-  });
-
-  it("the authorization is valid through expires_at and its nonce is the job id", () => {
-    const m = vector("payment-authorization").typed_data.message;
-    expect(m.validAfter).toBe("0");
-    expect(m.nonce).toBe(vector("payment-authorization").extra!.job_id);
   });
 });
 

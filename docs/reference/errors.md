@@ -16,7 +16,7 @@ description: The error envelope, the error types, the retry rule, and the codes 
 | `param` | The request field at fault, or `null`. |
 | `code` | A machine-readable discriminator within `type`, or `null`. Branch on this. |
 
-Two routes answer some failures with a different body, documented on the route: [`POST /v1/jobs`](./client-api.md#post-v1jobs) answers a changed price with a fresh quote, and [`POST /evm/ops`](./provider-api.md#post-evmops) answers a chain refusal with `{"ok": false, "reason": …}`.
+Two routes answer some failures with a different body, documented on the route: [`POST /v1/jobs`](./client-api.md#post-v1jobs) answers a changed price or a short balance with a fresh quote, and [`POST /evm/ops`](./provider-api.md#post-evmops) answers a chain refusal with `{"ok": false, "reason": …}`.
 
 ## Retrying
 
@@ -31,7 +31,7 @@ Two routes answer some failures with a different body, documented on the route: 
 | `invalid_op_signature` | 403 | no | A provider op or ask snapshot does not recover to a registered provider. |
 | `not_found` | 404, 410 | no | No such resource. |
 | `busy` | 429 | yes | More than 8 requests are queued on one job or op subject. Retry shortly. |
-| `rate_limit_exceeded` | 429 | no | The wallet reached the coordinator's 24-hour job limit for this model. The message names when the next slot opens. |
+| `rate_limit_exceeded` | 429 | no | The wallet reached the coordinator's 24-hour limit on jobs for this model, or on relayed deposits and withdrawals. The message names when the next slot opens. |
 | `not_ready` | 503 | yes | The index is catching up, or a joining escrow has no key yet. |
 | `chain_unreachable` | 503 | yes | The RPC endpoint did not answer. |
 | `relay_unavailable` | 503 | yes | The coordinator could not get its own transaction or chain read through. Nothing is wrong with the request. |
@@ -39,7 +39,7 @@ Two routes answer some failures with a different body, documented on the route: 
 | `receipt_timeout` | 504 | **no** | The transaction was broadcast but no receipt arrived within 60 seconds. `code` is the transaction hash. Poll the job or provider instead of re-sending. |
 | `internal_error` | 500 | no | Unexpected failure. |
 
-A `409` always means the chain refused, or would refuse, the transaction. Failing to reach the chain is never a `409`.
+A `409` means the request conflicts with the state of the job, the order or the balance: the chain refused, or would refuse, the transaction, or the coordinator's own record refuses it (`DuplicateJob`, `NotOpen`, `order_leased`, `insufficient_balance`). Failing to reach the chain is never a `409`.
 
 ## `relay_unavailable` codes
 
@@ -50,7 +50,7 @@ A `409` always means the chain refused, or would refuse, the transaction. Failin
 | `rpc_internal`, `rate_limited` | The RPC endpoint answered `-32603` or `-32005`. |
 | `endpoint_refused` | The RPC endpoint refused the transaction for another reason. |
 | `relay_queue_full`, `relay_queue_timeout` | Too many relays are queued on the relayer account (`RELAY_MAX_DEPTH`), or one waited longer than `RELAY_QUEUE_TIMEOUT_MS`. |
-| `config_read`, `payer_code_read`, `provider_id_read`, `registry_floor_read`, `claim_simulate_read`, `job_read`, `allowlist_status_read` | A named chain read failed. |
+| `config_read`, `balance_read`, `authorization_state_read`, `payer_code_read`, `provider_id_read`, `registry_floor_read`, `claim_simulate_read`, `job_read`, `allowlist_status_read` | A named chain read failed. |
 | `publication_skipped` | An ask snapshot was mined but the chain recorded no publication. |
 
 ## `pinner_unavailable` codes

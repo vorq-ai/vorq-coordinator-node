@@ -13,6 +13,7 @@ import { minKeyEpochStart, startPeerSync } from "./escrow/handover.js";
 import { KeyManager } from "./escrow/keys.js";
 import { handoverAuthSigner } from "./escrow/operator.js";
 import { StaticKeyManager } from "./escrow/static-keys.js";
+import { startPayoutKeeper } from "./keepers/payouts.js";
 import { startReclaimKeeper } from "./keepers/reclaim.js";
 import { startRelayerBalanceWatch } from "./keepers/relayer-balance.js";
 import type { KeyEpochStart } from "./escrow/release.js";
@@ -314,11 +315,12 @@ async function main(): Promise<void> {
   });
 
   /**
-   * The batch worker: split, pin, `postMany`, then freeze the two output files.
+   * The batch worker: split, pin, hold each line as an order, then freeze the
+   * two output files.
    *
    * A background pass rather than part of `POST /v1/batches`, and it has to be:
    * 50 000 lines is 50 000 objects filed against a service rate-limited to 100
-   * requests a second, which is eight minutes before a transaction is signed.
+   * requests a second, which is eight minutes of filing.
    * The create door answers `validating` and this moves it on.
    *
    * `unref`ed inside, so it cannot hold a container stop open, and re-entrant-safe
@@ -331,7 +333,7 @@ async function main(): Promise<void> {
   );
 
   /**
-   * The `reclaim` keeper — the one automatic on-chain write this node makes.
+   * The `reclaim` keeper — one of the two automatic on-chain writes this node makes.
    *
    * It has no privilege: it uses the relayer wallet, which has no standing in
    * either registry, and `reclaim` takes no signature at all. Anyone with a
@@ -350,6 +352,21 @@ async function main(): Promise<void> {
       app.log.error({ err: error, jobId }, "reclaim keeper pass failed"),
   );
   void reclaimKeeper.tick();
+
+  /**
+   * The payout keeper: every `PAYOUT_INTERVAL_MS`, `payProvider(id)` for each
+   * provider whose earnings are above zero, then `payRelayer(<this node's
+   * relayer>)`, then `payTreasury()`. Settlement only credits balances inside the
+   * registry; this is what moves the tokens. Equally unprivileged — every call is
+   * permissionless and the registry picks the payee. The first pass runs at boot, as the reclaim keeper's does: a timer
+   * alone never fires on a node redeployed more often than the interval. A boot
+   * pass pays only what has accrued since the last one, and a payee with nothing
+   * is skipped, so a restart costs at most one more payout per payee.
+   */
+  const onPayoutError = (error: unknown, payee: string) =>
+    app.log.error({ err: error, payee }, "payout keeper pass failed");
+  const payoutKeeper = startPayoutKeeper({ db, config, chain }, onPayoutError, config.payoutIntervalMs);
+  void payoutKeeper.tick().catch((error: unknown) => onPayoutError(error, ""));
 
   /**
    * The relayer's gas balance, reported while it is low and before it is empty.
@@ -383,6 +400,7 @@ async function main(): Promise<void> {
       fileSweep.stop();
       batchWorker.stop();
       reclaimKeeper.stop();
+      payoutKeeper.stop();
       relayerBalance.stop();
       if (escrowSweep !== null) clearInterval(escrowSweep);
       if (escrowRotate !== null) clearInterval(escrowRotate);

@@ -1,7 +1,7 @@
 import { readdirSync, readFileSync } from "node:fs";
 import { beforeAll, afterAll, describe, expect, it } from "vitest";
 import { readSession, sweepExpired, TTL_TABLES } from "../src/api/sessions.js";
-import { dropDerived, openDb, PRESERVED, SCHEMA_LOCK_KEY, type Db } from "../src/db/db.js";
+import { dropDerived, openDb, PRESERVED, PRUNED, SCHEMA_LOCK_KEY, type Db } from "../src/db/db.js";
 
 /**
  * Gated on `TEST_DATABASE_URL`, and deliberately part of the **unit** suite (R25):
@@ -397,6 +397,38 @@ describe.skipIf(!TEST_DATABASE_URL)("db", () => {
         await expect(db.query(NAME, [4, "x".repeat(65)])).rejects.toThrow(/check constraint/);
         await db.query(NAME, [4, "x".repeat(64)]);
         await db.query("DELETE FROM provider_names");
+      });
+    });
+
+    describe("0007_drop_auth_sig", () => {
+      const jobColumns = async (): Promise<string[]> => {
+        const { rows } = await db.query<{ column_name: string }>(
+          `SELECT column_name FROM information_schema.columns
+            WHERE table_schema = $1 AND table_name = 'jobs' ORDER BY column_name`,
+          [TEST_SCHEMA],
+        );
+        return rows.map((row) => row.column_name);
+      };
+
+      it("leaves jobs with an order_sig and no auth_sig", async () => {
+        await resetSchema();
+        await db.migrate();
+        const columns = await jobColumns();
+        expect(columns).toContain("order_sig");
+        expect(columns).not.toContain("auth_sig");
+      });
+
+      it("is re-runnable, including after a replay of 0004 adds the column back", async () => {
+        await db.migrate();
+        const file = (version: string) =>
+          readFileSync(new URL(`../src/db/migrations/${version}`, import.meta.url), "utf8");
+        // The rebuild path drops `schema_migrations` and replays every file over
+        // the tables it keeps: 0004 re-adds `auth_sig`, 0007 takes it away again.
+        await db.query(file("0004_held_orders.sql"));
+        expect(await jobColumns()).toContain("auth_sig");
+        await db.query(file("0007_drop_auth_sig.sql"));
+        await db.query(file("0007_drop_auth_sig.sql"));
+        expect(await jobColumns()).not.toContain("auth_sig");
       });
     });
   });
@@ -861,7 +893,7 @@ describe.skipIf(!TEST_DATABASE_URL)("db", () => {
       await db.migrate();
     });
 
-    it("drops every derived table and leaves the two that are not", async () => {
+    it("drops every derived table, keeps the preserved ones, and prunes jobs", async () => {
       await db.query("INSERT INTO pins (cid, s3_key) VALUES ('bafypinned', 'k')");
       await db.query(
         `INSERT INTO quotes_live (provider_id, snapshot, signature, signed_at)
@@ -876,10 +908,10 @@ describe.skipIf(!TEST_DATABASE_URL)("db", () => {
         "SELECT table_name FROM information_schema.tables WHERE table_schema = $1 ORDER BY 1",
         [TEST_SCHEMA],
       );
-      // Exactly the preserved set survives — asserted as an equality, not as a
-      // set of `toContain`s, so a table that escapes the drop is a failure and
-      // not an omission nobody notices.
-      expect(rows.map((row) => row.table_name)).toEqual([...PRESERVED].sort());
+      // Exactly the preserved set and the pruned ones survive — asserted as an
+      // equality, not as a set of `toContain`s, so a table that escapes the drop
+      // is a failure and not an omission nobody notices.
+      expect(rows.map((row) => row.table_name)).toEqual([...PRESERVED, ...Object.keys(PRUNED)].sort());
 
       // And their rows came with them.
       const pins = await db.query<{ n: bigint }>("SELECT count(*) AS n FROM pins");
@@ -915,6 +947,33 @@ describe.skipIf(!TEST_DATABASE_URL)("db", () => {
         "SELECT line_no FROM batch_lines WHERE batch_id = 'batch_1'",
       );
       expect(lines.rows.map((row) => row.line_no)).toEqual([0n]);
+    });
+
+    it("keeps every held order and drops every row the chain can give back", async () => {
+      // An order nobody has claimed exists only here — `claim` is what puts it
+      // on chain — and so does one cancelled before a claim. A row the indexer
+      // wrote from `Posted` (order_sig cleared) is replayed from the logs.
+      await db.migrate();
+      await db.query("DELETE FROM jobs");
+      await insertJob({ job_id: bytes(0x11), order_sig: bytes(0x51, 65) });
+      await insertJob({ job_id: bytes(0x12), order_sig: bytes(0x52, 65), state: 3, ended_because: 2 });
+      await insertJob({ job_id: bytes(0x13), state: 1, provider_id: 3n });
+
+      await dropDerived(db);
+
+      const { rows } = await db.query<{ job_id: Buffer; state: number }>(
+        "SELECT job_id, state FROM jobs ORDER BY job_id",
+      );
+      expect(rows).toEqual([
+        { job_id: bytes(0x11), state: 0 },
+        { job_id: bytes(0x12), state: 3 },
+      ]);
+
+      // And the next boot's migrations run over the table it kept.
+      await db.migrate();
+      const kept = await db.query<{ n: bigint }>("SELECT count(*) AS n FROM jobs");
+      expect(kept.rows[0]?.n).toBe(2n);
+      await db.query("DELETE FROM jobs");
     });
 
     it("is safe to run twice, and migrate brings the schema back", async () => {

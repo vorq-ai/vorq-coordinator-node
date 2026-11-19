@@ -24,9 +24,9 @@ Every route's request and response schema is published by the coordinator itself
 **Money is a USD decimal string**; every other integer is a **JSON integer**, in requests and responses alike.
 
 - **Rates** (`rate_in`, `rate_out`, `min_rate_in`, `min_rate_out`) are USD per 1M units of work: `"0.05"` is $0.05 per million tokens.
-- **Amounts** (`amount`, `cap`, `fee`, `gas_fee`, `escrowed`) are USD.
+- **Amounts** (`amount`, `cap`, `fee`, `gas_fee`, `balance`, `deposit`, `deposit_fee`, `reserved`, `available`, `value`, `escrowed`) are USD.
 - A money string is plain decimal: `"0.05"`, `"12"`, `"0.000219"`. No sign, exponent, spaces or leading zeros, and at most as many fraction digits as the payment token has (`decimals` on `GET /evm/chain`, 6 for USDC). A value with more is refused, never rounded.
-- **Signed data is atomic.** What a signature covers is the chain's own integer, `usd × 10^decimals`: the EIP-712 `rateIn`/`rateOut` of an order or ask (`"0.05"` → `50000`), and the 402's `authorization.value`, which is the JSON integer a wallet signs.
+- **Signed data is atomic.** What a signature covers is the chain's own integer, `usd × 10^decimals`: the EIP-712 `rateIn`/`rateOut` of an order or ask (`"0.05"` → `50000`), a withdrawal's `amount`, and a deposit authorization's `value`.
 - **Everything else** is a JSON integer at most 2^53 − 1: ids, windows, unit counts, timestamps, and block numbers.
 
 A money value sent as a JSON number is refused, and so is an integer sent as a string.

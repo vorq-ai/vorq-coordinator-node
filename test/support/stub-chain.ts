@@ -16,6 +16,7 @@ import { providerRegistryAbi } from "../../src/abi/providerRegistry.js";
 import { makeChain, type Chain } from "../../src/chain/client.js";
 import type { Addresses, Config } from "../../src/config.js";
 import { MAX_BLOB_BYTES } from "../../src/api/routes/files.js";
+import { authorizationStateAbi } from "../../src/api/routes/balance.js";
 
 /**
  * A canned JSON-RPC endpoint, so the write doors can be driven without a chain.
@@ -78,6 +79,8 @@ export function testConfig(overrides: Partial<Config> = {}): Config {
     escrow: { mode: "off", releaseOrdinal: 1, sweepIntervalMs: 300_000, peerUrl: null, peerRequired: false, peerSyncMs: 300_000, rotateIntervalMs: 86_400_000, operatorKeys: [], clockOffsetMs: 0 },
     match: { leaseMs: 20_000, livenessMs: 15_000, candidates: 3 },
     jobRateLimit: 0,
+    moneyRateLimit: 24,
+    payoutIntervalMs: 86_400_000,
     addresses: ADDRESSES,
     ...overrides,
   };
@@ -122,9 +125,9 @@ export interface StubOptions {
    */
   code?: Record<string, Hex>;
   /**
-   * The payment token's `balanceOf`, by address (lower-cased). Anything not named
-   * holds a thousand dollars, so a door that reads a payer's funds passes unless a
-   * test says the payer is short.
+   * `JobRegistry.balanceOf` — the prepaid balance — by address (lower-cased).
+   * Anything not named holds a thousand dollars, so a door that reads an owner's
+   * funds passes unless a test says the owner is short.
    */
   tokenBalance?: Record<string, bigint>;
   receiptStatus?: "success" | "reverted";
@@ -229,11 +232,8 @@ export interface StubChain {
    * The **gas limit** of every broadcast, likewise parsed back off the wire, and
    * `undefined` where the node let viem estimate one.
    *
-   * Read rather than dropped because for `postMany` the estimate is the wrong
-   * question: that call succeeds however many of its lines it skipped, so
-   * `eth_estimateGas` converges on a limit at which the tail of a chunk runs out
-   * of gas and is silently refused. Only an explicit limit is observable, and only
-   * from the signed transaction.
+   * Read rather than dropped: a limit the node set is only observable from the
+   * signed transaction.
    */
   relayedGas: (bigint | undefined)[];
   /** The `data` of every `eth_call` that decoded to a mutating function. */
@@ -283,16 +283,15 @@ const ABIS: { abi: Abi; names: Set<string> }[] = [
   { abi: providerRegistryAbi as Abi, names: new Set<string>() },
   { abi: askRegistryAbi as Abi, names: new Set<string>() },
   { abi: erc20Abi as Abi, names: new Set<string>() },
+  { abi: authorizationStateAbi as Abi, names: new Set<string>() },
 ];
 
 /**
  * The relayed mutations. An `eth_call` naming one of these is the simulate.
  *
- * `post` and `cancel` joined the five ops when the client's write doors landed:
- * without them here an `eth_call` carrying `post` calldata is taken for a view,
- * and `POST /v1/jobs` cannot be driven off the happy path at all — its simulate
- * would fail with `no stub for view post` and every relay test would be
- * measuring the stub's own guard instead of the door (R64, R65).
+ * Without one here an `eth_call` carrying its calldata is taken for a view and
+ * answered `no stub for view …`, and a test would measure the stub's own guard
+ * instead of the door (R64, R65).
  */
 const MUTATIONS = new Set([
   "claim",
@@ -300,13 +299,13 @@ const MUTATIONS = new Set([
   "fail",
   "setIdentity",
   "requestCapacity",
-  "post",
-  // The batch worker's posting door. Here for `post`'s reason one level up: a
-  // `postMany` taken for a view would make the whole worker undrivable, and its
-  // interesting behaviour — a line skipped with a receipt while its neighbours
-  // land — is only observable through a real relay and a real receipt.
-  "postMany",
-  "cancel",
+  // The balance doors' two relays.
+  "deposit",
+  "withdraw",
+  // The payout keeper's three.
+  "payProvider",
+  "payRelayer",
+  "payTreasury",
   // The ask publisher's one call. Present for the same reason `post` is: without
   // it an `eth_call` carrying `setAsks` calldata is taken for a view and answered
   // `no stub for view setAsks`, so a test would measure the stub's own guard

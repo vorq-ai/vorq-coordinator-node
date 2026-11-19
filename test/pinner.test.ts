@@ -5,7 +5,7 @@ import { privateKeyToAccount } from "viem/accounts";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { buildApp } from "../src/api/app.js";
 import type { Config, S3PinConfig } from "../src/config.js";
-import { DROPPABLE, openDb, PRESERVED, type Db } from "../src/db/db.js";
+import { DROPPABLE, openDb, PRESERVED, PRUNED, type Db } from "../src/db/db.js";
 import type { Indexer, IndexerStatus } from "../src/index/indexer.js";
 import { cidForBytes, contentHashOfCid } from "../src/pin/cid.js";
 import {
@@ -832,6 +832,23 @@ describe("a permanently misconfigured object store", () => {
         }
         if (text.includes("FROM providers")) return { rows: [{ provider_id: PROVIDER_ID }] };
         if (text.includes("INSERT INTO pins")) return { rows: [{ s3_key: params?.[1] }] };
+        // The settle's exit terms, read from the job's row before anything is filed.
+        if (text.includes("FROM jobs")) {
+          return {
+            rows: [
+              {
+                owner: Buffer.alloc(20, 0x55),
+                rate_in: 1n,
+                rate_out: 1n,
+                units_in: 10n,
+                units_out: 10n,
+                sla_secs: 3600n,
+                gas_fee: 3000n,
+                relayer: Buffer.alloc(20, 0x77),
+              },
+            ],
+          };
+        }
         throw new Error(`settleDb: unexpected query ${text}`);
       }) as unknown as Db["query"],
       tx: () => Promise.reject(new Error("no transaction expected")),
@@ -1020,10 +1037,19 @@ describe("the rebuild path's drop set", () => {
   });
 
   it("classifies every table the migrations declare exactly once", () => {
-    // A new table must be *decided* about. Defaulting into either list is how
+    // A new table must be *decided* about. Defaulting into any list is how
     // `pins` would have been dropped by a rebuild written six months from now.
-    expect([...DROPPABLE, ...PRESERVED].sort()).toEqual([...declared].sort());
+    const pruned = Object.keys(PRUNED);
+    expect([...DROPPABLE, ...PRESERVED, ...pruned].sort()).toEqual([...declared].sort());
     expect(DROPPABLE.filter((table) => PRESERVED.includes(table))).toEqual([]);
+    expect(pruned.filter((table) => DROPPABLE.includes(table) || PRESERVED.includes(table))).toEqual([]);
+  });
+
+  it("prunes jobs to the held orders rather than dropping it", () => {
+    // An order nobody has claimed exists only in this node's database: no chain
+    // log will ever bring it back, so a rebuild keeps exactly those rows.
+    expect(PRUNED).toEqual({ jobs: "order_sig IS NOT NULL" });
+    expect(DROPPABLE).not.toContain("jobs");
   });
 
   it("agrees with the schema about which tables exist", () => {

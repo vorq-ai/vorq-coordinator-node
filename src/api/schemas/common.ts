@@ -43,9 +43,10 @@ export const Hex = (maxBytes: number, o?: Options) =>
 
 /**
  * A 65-byte secp256k1 signature — the only length the contracts' `_recover`
- * accepts, and a bound rather than a formality: `authSig` is stored on the job
- * row, so an unbounded one is storage gas the relayer fronts for a post that
- * can never be claimed. A 64-byte EIP-2098 compact form is refused.
+ * accepts, and a bound rather than a formality: an order signature is stored on
+ * its held row and relayed in `claim`, so an unbounded one is storage and gas
+ * spent on a signature the chain refuses. A 64-byte EIP-2098 compact form is
+ * refused.
  */
 export const Sig65 = (o?: Options) =>
   Type.String({

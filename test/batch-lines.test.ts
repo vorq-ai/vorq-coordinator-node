@@ -12,11 +12,11 @@ import { testConfig } from "./support/stub-chain.js";
  * One input-file line, admitted or skipped.
  *
  * A line **is** the body of `POST /v1/jobs` — the same order, the same
- * `container` / `container_cid` pair, the same payment — so every refusal this
+ * `container` / `container_cid` pair, the same `amount` — so every refusal this
  * file asserts is one the single-job door makes too. What differs is the answer:
  * the door refuses the request, and this skips the line and keeps a receipt,
  * because a batch is up to 50 000 lines and one bad one must not kill the other
- * 49 999 (the `AskRegistry.setAsks` rule the contract's own `postMany` follows).
+ * 49 999 (the `AskRegistry.setAsks` rule).
  *
  * The EIP-712 domains and type strings are written out literally, from the
  * contract sources, rather than imported from `src/orders.ts` — importing them
@@ -82,7 +82,7 @@ const capFor = (t: Terms): bigint => {
 /** The protocol's own fee, and the one every context here charges. */
 const FEE_BPS = 100;
 
-/** The pull a line's payment must be for: `cap + cap*feeBps/10000 + gasFeeSnap`. */
+/** What a line's claim locks, and so its amount: `cap + cap*feeBps/10000 + gasFee`. */
 const amountFor = (t: Terms, feeBps = FEE_BPS): bigint =>
   capFor(t) + feeOf(capFor(t), feeBps) + GAS_FEE;
 
@@ -132,41 +132,6 @@ const signOrder = (t: Terms, signer = owner): Promise<Hex> =>
 /** `keccak256(abi.encodePacked(owner, c))` — 20 bytes then 32. */
 const jobIdFor = (address: Hex, c: Hex): Hex => keccak256(`0x${address.slice(2)}${c.slice(2)}` as Hex);
 
-const authDomain = { name: "USDC", version: "2", chainId, verifyingContract: usdc } as const;
-
-const authTypes = {
-  ReceiveWithAuthorization: [
-    { name: "from", type: "address" },
-    { name: "to", type: "address" },
-    { name: "value", type: "uint256" },
-    { name: "validAfter", type: "uint256" },
-    { name: "validBefore", type: "uint256" },
-    { name: "nonce", type: "bytes32" },
-  ],
-} as const;
-
-const signAuthorization = (
-  jobId: Hex,
-  value: bigint,
-  expiresAt: bigint,
-  signer = owner,
-): Promise<Hex> =>
-  signer.signTypedData({
-    domain: authDomain,
-    types: authTypes,
-    primaryType: "ReceiveWithAuthorization",
-    message: {
-      from: owner.address,
-      to: jobRegistry,
-      value,
-      validAfter: 0n,
-      // `expiresAt + 1`: the token requires `now < validBefore`, and a claim may
-      // land on `expiresAt` itself.
-      validBefore: expiresAt + 1n,
-      nonce: jobId,
-    },
-  });
-
 // ---------------------------------------------------------------------------
 // A line
 // ---------------------------------------------------------------------------
@@ -206,9 +171,6 @@ const context = (overrides: Partial<LineContext> = {}): LineContext => ({
   now: NOW,
   gasFee: GAS_FEE,
   feeBps: FEE_BPS,
-  // The default is the ordinary account: no code, so the line is judged on
-  // everything else. A case that wants a code-bearing payer says so.
-  hasCode: async () => false,
   ...overrides,
 });
 
@@ -218,7 +180,6 @@ interface LineOptions {
   /** Sent instead of `container`, for a line that references an upload. */
   containerCid?: string;
   orderSigner?: typeof owner;
-  authSigner?: typeof owner;
   amount?: bigint;
   url?: string;
   patch?: Record<string, unknown>;
@@ -247,7 +208,6 @@ async function line(options: LineOptions = {}): Promise<string> {
     ...(options.containerCid === undefined
       ? { container: container.toString("base64") }
       : { container_cid: options.containerCid }),
-    auth_sig: await signAuthorization(jobId, amount, t.expiresAt, options.authSigner ?? owner),
     amount: formatUsd(amount, 6),
     ...options.patch,
   });
@@ -390,8 +350,18 @@ describe("admitting one input-file line", () => {
     expect(await skipCode(await line({ orderSigner: stranger }))).toBe("invalid_order_signature");
   });
 
-  it("skips a line whose payment was authorized by somebody else", async () => {
-    expect(await skipCode(await line({ authSigner: stranger }))).toBe("invalid_payment_signature");
+  it("skips a line that states no amount: a line is never a challenge", async () => {
+    const raw = JSON.parse(await line()) as Record<string, unknown>;
+    delete raw.amount;
+    expect(await skipCode(JSON.stringify(raw))).toBe("invalid_line");
+  });
+
+  it("ignores an auth_sig a line still carries: a line signs no payment", async () => {
+    // A field this node does not read is left alone, and nothing about a
+    // payment authorization is recovered any more.
+    const raw = JSON.parse(await line()) as Record<string, unknown>;
+    raw.auth_sig = `0x${"ab".repeat(65)}`;
+    expect(await skipCode(JSON.stringify(raw))).toBe(null);
   });
 
   it("skips a line whose job_id is not keccak256(owner ‖ c)", async () => {
@@ -417,14 +387,11 @@ describe("admitting one input-file line", () => {
   });
 
   /**
-   * **One payable amount, exactly as the single-job door has it.** The claim
-   * pulls the *signed* value, so a line authorized for more than
-   * `cap + feeCap + gasFeeSnap` moves the difference out of the client's wallet
-   * and a line authorized for less reverts. This door used to admit the
-   * over-signed line — that looseness belonged to a scheme whose signature was a
-   * ceiling the claim drew under, and it does not survive the change.
+   * **One amount, exactly as the single-job door has it.** The claim locks
+   * exactly `cap + feeCap + gasFee`, so a line stating more or less is one the
+   * client did not price.
    */
-  it("skips a line authorized for more than the pull as well as one for less", async () => {
+  it("skips a line stating more than the lock as well as one stating less", async () => {
     const t = terms();
     expect(await skipCode(await line({ terms: t, amount: amountFor(t) + 1n }))).toBe(
       "insufficient_payment",
@@ -436,18 +403,18 @@ describe("admitting one input-file line", () => {
   });
 
   /**
-   * The pull is `cap + cap*feeBps/10000 + gasFeeSnap`, so an authorization for
-   * only the cap and the gas fee is short by the protocol fee and the claim
-   * would revert — a line the worker must skip rather than post.
+   * The lock is `cap + cap*feeBps/10000 + gasFee`, so an amount of only the cap
+   * and the gas fee is short by the protocol fee — a line the worker must skip
+   * rather than hold.
    */
-  it("skips a line whose authorization leaves the protocol fee out", async () => {
+  it("skips a line whose amount leaves the protocol fee out", async () => {
     const t = terms();
     expect(
       await skipCode(await line({ terms: t, amount: capFor(t) + GAS_FEE }), context({ feeBps: 250 })),
     ).toBe("insufficient_payment");
   });
 
-  it("admits a line authorized for the cap, the protocol fee and the gas fee", async () => {
+  it("admits a line stating the cap, the protocol fee and the gas fee", async () => {
     const t = terms();
     const amount = capFor(t) + (capFor(t) * 250n) / 10000n + GAS_FEE;
     expect(await skipCode(await line({ terms: t, amount }), context({ feeBps: 250 }))).toBe(null);
@@ -467,39 +434,6 @@ describe("admitting one input-file line", () => {
     const raw = JSON.parse(await line()) as Record<string, unknown>;
     raw.rate_in = ((1n << 128n) + 1n).toString();
     expect(await skipCode(JSON.stringify(raw))).toBe("invalid_line");
-  });
-
-  /**
-   * The batch half of `POST /v1/jobs`'s `payer_has_code`. A code-bearing payer is
-   * validated by the payment token through ERC-1271 rather than `ecrecover`, so
-   * this line's authorization — which recovers perfectly — can never be
-   * collected, and posting it would spend gas on a job that rests Open to expiry.
-   */
-  it("skips a line whose payer carries contract code", async () => {
-    const asked: string[] = [];
-    const ctx = context({
-      hasCode: async (address) => {
-        asked.push(address.toLowerCase());
-        return true;
-      },
-    });
-    expect(await skipCode(await line(), ctx)).toBe("payer_has_code");
-    // The line's own signer, not the batch's owner: a batch may carry orders
-    // signed by several wallets and it is the payer whose code matters.
-    expect(asked).toEqual([owner.address.toLowerCase()]);
-  });
-
-  it("asks about the payer only once every cheaper check has passed", async () => {
-    const asked: string[] = [];
-    const ctx = context({
-      hasCode: async (address) => {
-        asked.push(address.toLowerCase());
-        return false;
-      },
-    });
-    // A line refused on its order signature never pays for the round trip.
-    expect(await skipCode(await line({ orderSigner: stranger }), ctx)).toBe("invalid_order_signature");
-    expect(asked).toEqual([]);
   });
 
   it("carries a message with every skip, so the error file row says what went wrong", async () => {

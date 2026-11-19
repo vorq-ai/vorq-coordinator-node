@@ -11,10 +11,10 @@ Designated orders are sealed straight to the provider's `box_key` and do not use
 
 > The escrow releases an open-bid payload key only to the registered provider wallet that holds the job's claim on chain.
 
-[`POST /release`](../reference/escrow-api.md#post-release) authorises against the chain, never against the coordinator's index. It reads the job with `getJob` and requires that:
+[`POST /release`](../reference/escrow-api.md#post-release) authorises against the chain. It reads the job's state and claimant with `getJob` and requires that:
 
 - the job exists and is in the Claimed state;
-- the `seed_wrap` and `ct_hash` presented reproduce the job's commitment `c`;
+- the job's owner, read from the coordinator's record of the order, and the commitment `c` reproduced from the `seed_wrap` and `ct_hash` presented hash to the job id: `keccak256(owner ‖ c) == job_id`. A record naming any other owner, or a wrap from any other job, fails this check;
 - the request is signed by the wallet registered for the provider that claimed it.
 
 So every release corresponds to a visible, on-record claim by a registered provider.

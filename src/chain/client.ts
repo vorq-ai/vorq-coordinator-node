@@ -158,13 +158,9 @@ export interface Chain {
    * account and adds no throughput. The only change that adds throughput is a
    * second relayer key — a second nonce sequence and a second queue.
    *
-   * `gas` is optional and almost never wanted: viem estimates one, and an
-   * estimate is right for every call whose failure is a revert. It is wrong for
-   * exactly one caller — `postMany`, which catches each line's revert and
-   * succeeds regardless — so the estimate converges on a limit at which the tail
-   * of a chunk runs out of gas inside its sub-call and is reported as skipped on a
-   * transaction whose receipt says success. That caller computes its own limit;
-   * see `batches/worker.ts`.
+   * `gas` is optional: viem estimates one when it is absent. The op door passes
+   * the estimate it took at the node's floor, so the broadcast does not
+   * re-estimate against a lagging endpoint.
    */
   relay(request: { to: Address; data: Hex; gas?: bigint }): Promise<Hex>;
 }
@@ -229,14 +225,12 @@ export async function headBlockOf(reader: ChainReader): Promise<bigint> {
  * `receiveWithAuthorization` through `SignatureChecker`, which routes an
  * authorizer *with code* to ERC-1271 `isValidSignature` and never to `ecrecover`.
  * A plain EOA signature from an account carrying an EIP-7702 delegation — or from
- * a smart account — therefore recovers correctly off chain and fails on chain with
- * `invalid signature` at `claim`, after this node has pinned the container and
- * fronted the gas for the post. The doors read this **before** they spend either.
+ * a smart account — therefore recovers correctly off chain and fails inside the
+ * token on chain. `POST /v1/deposits` reads this before it simulates.
  *
  * `blockTag: "latest"` and no memo, deliberately: 7702 code appears and
  * disappears with a single transaction the wallet makes, so an answer older than
- * this request is an answer about a different account. It is one `eth_getCode`
- * per payment, which is the same order as the two signature recoveries beside it.
+ * this request is an answer about a different account.
  */
 export async function hasCodeAt(reader: ChainReader, address: Address): Promise<boolean> {
   const code = await readerOf(reader).getCode({ address, blockTag: "latest" });
@@ -460,12 +454,10 @@ export function missingBlock(error: unknown): boolean {
  * again for up to {@link FLOOR_RETRIES} attempts rather than served stale.
  * Anything else is thrown unchanged, for the caller's own classification.
  *
- * **Not the `post` simulate.** That `eth_call` is a verdict on the transaction
- * as it would mine, and `ExpiryTooFar` tightens at an older block: it refused a
- * valid 24 h order there (measured 2026-09-23), so `POST /v1/jobs` stays at
- * `latest`. The `/evm/ops` simulate is pinned here — its ops follow this node's
- * own receipts, and none of their timestamp checks tightens (see
- * `simulateThenRelay`).
+ * The `/evm/ops` simulate is pinned here too — its ops follow this node's own
+ * receipts (a settle its claim, a claim the owner's deposit). `claim`'s
+ * `ExpiryTooFar` is the one timestamp check that tightens at an older block; see
+ * `simulateThenRelay` for why that is accepted.
  *
  * Before the first head poll or receipt the floor is `0n` and the read goes to
  * `latest`, because there is nothing yet to be consistent with.
@@ -584,6 +576,8 @@ export interface ChainParams {
   feeBps(): Promise<number>;
   /** Flat gas fee the client funds on top of the cap. */
   gasFee(): Promise<bigint>;
+  /** Flat fee taken from each deposit before the rest is credited. */
+  depositFee(): Promise<bigint>;
   /** Fee recipient. Mutable on chain (R39) — read here, never from the addresses file. */
   treasury(): Promise<Address>;
   /** Whether an SLA of `secs` may be posted. */
@@ -610,6 +604,8 @@ export function chainParams(reader: ChainReader, addresses: Addresses): ChainPar
   const feeBps = cell(() => client.readContract({ ...at, functionName: "feeBps" }));
   // R77-off-request-path: as `feeBps` above — reached only through `configRead`.
   const gasFee = cell(() => client.readContract({ ...at, functionName: "gasFee" }));
+  // R77-off-request-path: as `feeBps` above — every caller wraps it in a `viewRead`.
+  const depositFee = cell(() => client.readContract({ ...at, functionName: "depositFee" }));
   // R77-off-request-path: as `feeBps` above — reached only through `configRead`.
   const treasury = cell(() => client.readContract({ ...at, functionName: "treasury" }));
 
@@ -635,11 +631,13 @@ export function chainParams(reader: ChainReader, addresses: Addresses): ChainPar
   return {
     feeBps: () => feeBps.get(),
     gasFee: () => gasFee.get(),
+    depositFee: () => depositFee.get(),
     treasury: () => treasury.get(),
     slaAllowed: (secs: number) => slaCell(secs).get(),
     bust() {
       feeBps.bust();
       gasFee.bust();
+      depositFee.bust();
       treasury.bust();
       sla.clear();
     },
@@ -679,7 +677,7 @@ export function chainParams(reader: ChainReader, addresses: Addresses): ChainPar
  *     perfectly good request can never succeed.
  */
 
-/** `getJob`'s 20-field return, derived from the ABI rather than restated. */
+/** `getJob`'s return — found, id, state, cause, claimant and claim time — derived from the ABI. */
 export type JobView = ReadContractReturnType<typeof jobRegistryAbi, "getJob">;
 
 /**

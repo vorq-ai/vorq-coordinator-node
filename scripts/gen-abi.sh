@@ -20,7 +20,7 @@ OUT_DIR="${ROOT}/src/abi"
 
 # <export prefix>|<artifact path, relative to the contracts repo>|<expected ABI entries>
 SPECS=(
-  "jobRegistry|out/JobRegistry.sol/JobRegistry.json|69"
+  "jobRegistry|out/JobRegistry.sol/JobRegistry.json|84"
   "providerRegistry|out/ProviderRegistry.sol/ProviderRegistry.json|55"
   "askRegistry|out/AskRegistry.sol/AskRegistry.json|14"
 )

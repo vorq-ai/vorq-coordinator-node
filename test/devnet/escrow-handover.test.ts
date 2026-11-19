@@ -133,7 +133,7 @@ async function postAndClaim(
     freshTerms(container.c, { designated: 0n }),
     clientAccount(),
   );
-  await claimOnChain(node.config.addresses, posted.jobId);
+  await claimOnChain(node.config.addresses, posted);
   return posted.jobId;
 }
 

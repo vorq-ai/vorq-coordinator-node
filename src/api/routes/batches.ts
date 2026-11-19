@@ -312,7 +312,7 @@ export function batchCreateRoute(app: App, deps: RouteDeps): void {
     const created = nowSeconds();
     const batchId = mintBatchId();
     // `validating`, and the worker owns the transition out of it. At 50 000 lines
-    // the split, the pins and the `postMany` run behind this answer; a row that
+    // the split, the pins and the held orders run behind this answer; a row that
     // started `in_progress` with no lines would fold to `completed` on the very
     // first read.
     await deps.db.query(
@@ -465,8 +465,8 @@ export function batchRoutes(
     // `COALESCE`, so a second cancel is a no-op rather than a fresh stamp: a
     // client that retries a timed-out request must not move the moment it asked.
     // Nothing here reaches a **claimed** line — a provider that holds one runs it
-    // to its own end, exactly as it does for a standalone job. The worker relays
-    // the per-line cancels for the lines still open.
+    // to its own end, exactly as it does for a standalone job. A line still open
+    // is its owner's to cancel, as any order is.
     const { rows } = await deps.db.query<{ cancelling_at: bigint }>(
       `UPDATE batches SET cancelling_at = COALESCE(cancelling_at, $2)
         WHERE batch_id = $1 RETURNING cancelling_at`,

@@ -118,8 +118,8 @@ export async function applyEvent(
       // re-applied `Posted` cannot date a row back behind the `Claimed` that
       // already advanced it.
       //
-      // The two signatures are cleared: a held order (`match/held.ts`) that the
-      // chain now has is no longer held.
+      // The order signature is cleared: a held order (`match/held.ts`) whose
+      // claim carried it on chain is the chain's row from here on.
       await db.query(
         `INSERT INTO jobs (job_id, owner, c, model_id, sla_secs, designated,
                            rate_in, rate_out, units_in, units_out, expires_at,
@@ -132,7 +132,7 @@ export async function applyEvent(
            units_in = EXCLUDED.units_in, units_out = EXCLUDED.units_out,
            expires_at = EXCLUDED.expires_at, task_cid = EXCLUDED.task_cid,
            posted_block = EXCLUDED.posted_block, gas_fee = EXCLUDED.gas_fee,
-           order_sig = NULL, auth_sig = NULL,
+           order_sig = NULL,
            as_of_block = GREATEST(jobs.as_of_block, EXCLUDED.as_of_block)`,
         [
           bytea(a.jobId),
@@ -158,12 +158,15 @@ export async function applyEvent(
       const a = event.args;
       await updateOne(
         db,
-        `UPDATE jobs SET state = 1, provider_id = $2, claimed_at = $3,
+        `UPDATE jobs SET state = 1, provider_id = $2, claimed_at = $3, relayer = $5,
                          as_of_block = GREATEST(as_of_block, $4)
          WHERE job_id = $1`,
-        [bytea(a.jobId), a.provider, a.claimedAt, blockNumber],
+        [bytea(a.jobId), a.provider, a.claimedAt, blockNumber, bytea(a.relayer)],
         `Claimed for job ${a.jobId}`,
       );
+      // The claim spends the lease: the daemon's own free_slots counts the job
+      // from here, so a lease left live would count it twice in the ranking.
+      await db.query("DELETE FROM job_leases WHERE job_id = $1", [bytea(a.jobId)]);
       return;
     }
 
@@ -199,14 +202,18 @@ export async function applyEvent(
       // and 5 is read-time only. The `ended_because` CHECK is the single place
       // that vocabulary is enforced, so anything outside it fails at the write
       // rather than being silently normalised into something plausible (R43).
-      await updateOne(
-        db,
-        `UPDATE jobs SET state = 3, ended_because = $2,
+      const sql = `UPDATE jobs SET state = 3, ended_because = $2,
                          as_of_block = GREATEST(as_of_block, $3)
-         WHERE job_id = $1`,
-        [bytea(a.jobId), a.cause, blockNumber],
-        `Ended for job ${a.jobId}`,
-      );
+         WHERE job_id = $1`;
+      const params = [bytea(a.jobId), a.cause, blockNumber];
+      // An owner's own `cancel` of an order nobody claimed writes a Cancelled
+      // row on chain and emits this with no `Posted` before it: the order never
+      // went on chain, and this node may never have held it. Any wallet can do
+      // that for an id of its own, so a missing row here is ordinary and must
+      // not stop the indexer. The other two causes end a claimed job, whose
+      // `Posted` always comes first.
+      if (a.cause === 2) await db.query(sql, params);
+      else await updateOne(db, sql, params, `Ended for job ${a.jobId}`);
       return;
     }
 

@@ -61,8 +61,9 @@ import { ADDRESSES, bareRevert, stubChain, testConfig } from "./support/stub-cha
  * injected transport that is `app.inject`, so the bytes crossing between them are
  * the bytes a socket would carry.
  *
- * The database handed to every app here **throws on any query**: the escrow doors
- * read neither the index nor the store, and a stub that answered would let that
+ * The database handed to every app here answers **one** statement — the job row
+ * `/release` proves its owner from — and throws on any other: the handover door
+ * reads neither the index nor the store, and a stub that answered would let that
  * property pass untested.
  */
 
@@ -70,11 +71,28 @@ import { ADDRESSES, bareRevert, stubChain, testConfig } from "./support/stub-cha
 // Fixtures
 // ---------------------------------------------------------------------------
 
-const hostileDb = {
-  query: async () => {
-    throw new Error("the handover door must not read the store");
-  },
-} as unknown as Db;
+/** The one statement an escrow door may make: `/release`'s job row, by id. */
+const ROW_READ = /^SELECT owner, designated, expires_at FROM jobs WHERE job_id = \$1$/;
+
+/** A store holding exactly the job rows in `jobs`, refusing every other statement. */
+const rowStore = (jobs: Map<string, JobFixture>) =>
+  ({
+    query: async (sql: string, params: readonly unknown[]) => {
+      if (!ROW_READ.test(sql.trim())) throw new Error(`the escrow doors must not run ${sql}`);
+      const job = jobs.get(`0x${(params[0] as Buffer).toString("hex")}`);
+      if (job === undefined) return { rows: [], rowCount: 0 };
+      return {
+        rows: [
+          {
+            owner: Buffer.from(job.owner.slice(2), "hex"),
+            designated: BigInt(job.designated),
+            expires_at: job.expiresAt,
+          },
+        ],
+        rowCount: 1,
+      };
+    },
+  }) as unknown as Db;
 
 const indexerReporting = (status: IndexerStatus): Indexer => ({
   coldStart: async () => undefined,
@@ -155,35 +173,33 @@ const escrowConfig = (overrides: Partial<Config["escrow"]> = {}): Config =>
     },
   });
 
-const jobView = (over: Partial<JobView>): JobView =>
-  ({
-    found: true,
-    jobId: ZERO32,
-    owner: ZERO_ADDRESS,
-    c: ZERO32,
-    state: 1,
-    endedBecause: 0,
-    providerId: PROVIDER_ID,
-    designated: 0,
-    modelId: 1,
-    rateIn: 0n,
-    rateOut: 0n,
-    unitsIn: 0,
-    unitsOut: 0,
-    completionTok: 0,
-    promptTok: 0,
-    cachedTok: 0,
-    rateInCached: 0n,
-    slaSecs: 3600,
-    expiresAt: BigInt(NOW_SECONDS + 86_400),
-    claimedAt: BigInt(NOW_SECONDS - 60),
-    taskCid: "0x",
-    resultCid: "0x",
-    gasFee: 0n,
-    ...over,
-  }) as unknown as JobView;
+/** One job: the chain's `getJob` answer, and the row this node holds for it. */
+type JobFixture = JobView & { owner: Address; designated: number; expiresAt: bigint };
 
-const MISSING_JOB = jobView({ found: false, state: 0, providerId: 0, expiresAt: 0n, claimedAt: 0n });
+const jobView = (over: Partial<JobFixture>): JobFixture => ({
+  found: true,
+  jobId: ZERO32,
+  state: 1,
+  endedBecause: 0,
+  providerId: PROVIDER_ID,
+  claimedAt: BigInt(NOW_SECONDS - 60),
+  owner: ZERO_ADDRESS,
+  designated: 0,
+  expiresAt: BigInt(NOW_SECONDS + 86_400),
+  ...over,
+});
+
+const MISSING_JOB = jobView({ found: false, state: 0, providerId: 0, claimedAt: 0n });
+
+/** The six members `getJob` answers, and nothing of the row. */
+const chainView = (job: JobFixture): JobView => ({
+  found: job.found,
+  jobId: job.jobId,
+  state: job.state,
+  endedBecause: job.endedBecause,
+  providerId: job.providerId,
+  claimedAt: job.claimedAt,
+});
 
 /** A chain whose soundness facts pass, for driving `bootEscrow`. */
 const bootChain = () =>
@@ -194,7 +210,7 @@ interface NodeOptions {
   allowlist?: Record<string, number>;
   /** The curation read fails at the endpoint instead of answering (R77). */
   allowlistError?: () => unknown;
-  jobs?: Record<string, JobView>;
+  jobs?: Record<string, JobFixture>;
   indexer?: Indexer;
   config?: Config;
   keyEpochStart?: KeyEpochStart | null;
@@ -223,7 +239,8 @@ function escrowNode(options: NodeOptions = {}) {
         if (options.allowlistError !== undefined) throw options.allowlistError();
         return allowlist.get(String(args[0]).toLowerCase()) ?? NEVER_LISTED;
       },
-      getJob: (args: readonly unknown[]) => jobs.get(String(args[0]).toLowerCase()) ?? MISSING_JOB,
+      getJob: (args: readonly unknown[]) =>
+        chainView(jobs.get(String(args[0]).toLowerCase()) ?? MISSING_JOB),
       idOf: (args: readonly unknown[]) =>
         String(args[0]).toLowerCase() === OPERATOR.address.toLowerCase() ? PROVIDER_ID : 0,
     },
@@ -234,7 +251,7 @@ function escrowNode(options: NodeOptions = {}) {
 
   let epoch = options.keyEpochStart ?? null;
   const app = buildApp({
-    db: hostileDb,
+    db: rowStore(jobs),
     indexer: options.indexer ?? READY,
     config,
     chain: stub.chain,
@@ -367,9 +384,9 @@ async function releaseOn(node: EscrowNode, container: ReturnType<typeof containe
   return { status: 200, dek: openDek(sealed, response.publicKey, response.secretKey) };
 }
 
-/** The job the chain reports for a container, so `/release` can authorise it. */
+/** The job the chain reports for a container, and its row, so `/release` can authorise it. */
 const jobFor = (container: ReturnType<typeof containerFor>, owner: Address) => ({
-  [container.jobId]: jobView({ jobId: container.jobId, owner, c: container.c }),
+  [container.jobId]: jobView({ jobId: container.jobId, owner }),
 });
 
 // ---------------------------------------------------------------------------

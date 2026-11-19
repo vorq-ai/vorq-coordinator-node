@@ -8,7 +8,7 @@ The coordinator's view of the market is an **index**: a projection of the VORQ c
 ## Two kinds of route
 
 - **Index-backed** routes read the index: the job book, job reads, providers, the catalog, asks, the allowlist and batch reads. They answer only when the index is fresh, and every response carries `as_of_block`.
-- **Chain-backed and write** routes read the chain or relay to it: `/evm/chain`, `/evm/ops`, `/evm/simulate/claim`, `POST /v1/jobs` and its cancel, file routes, `POST /v1/batches`, `PUT /evm/asks`, the auth handshake and the escrow routes. They are never held back by index lag and carry no `as_of_block`.
+- **Chain-backed and write** routes read the chain or relay to it: `/evm/chain`, `/evm/ops`, `/evm/simulate/claim`, `POST /v1/jobs` and its cancel, the balance routes, file routes, `POST /v1/batches`, `PUT /evm/asks`, the auth handshake and the escrow routes. They are never held back by index lag and carry no `as_of_block`.
 
 `POST /evm/simulate/claim` reads the chain on purpose: it stays accurate while the index trails, which is exactly when a provider needs it.
 
@@ -32,7 +32,7 @@ While not ready, index-backed routes answer `503` with type `not_ready` (or `cha
 
 ## Your own writes
 
-When a post relayed by this coordinator is mined, the coordinator writes the new job to its index from the receipt before it answers. A job posted through a coordinator can normally be read from it as soon as the `201` returns. Every other change, including claims, settlements and cancels, and jobs posted through another coordinator, appears once the indexer reaches its block.
+An order submitted to this coordinator is a row from the moment it answers `202`, and a cancel ends it before the `200` returns. A claim relayed by this coordinator is written to the job from its receipt before the answer goes out. Every other change, including settlements, fails and reclaims, and jobs claimed through another coordinator, appears once the indexer reaches its block.
 
 ## Reorgs
 

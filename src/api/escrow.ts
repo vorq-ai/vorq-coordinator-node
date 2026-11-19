@@ -1,6 +1,7 @@
 import { Type } from "typebox";
 import type { Chain } from "../chain/client.js";
 import type { Config, EscrowMode } from "../config.js";
+import type { Db } from "../db/db.js";
 import { mockEvidence, staticEvidence, type Evidence } from "../escrow/attest.js";
 import {
   HANDOVER_BODY_LIMIT_BYTES,
@@ -96,6 +97,8 @@ export interface EscrowDeps {
   keys: EscrowKeys | null;
   /** `/release`'s authorisation reads. Absent answers `503 chain_unreachable`. */
   chain?: Chain;
+  /** `/release` reads the job's owner from its row, and proves it against the id. */
+  db: Db;
   /** Injected so `issued_at` is testable. Milliseconds, as `Date.now`. */
   clock?: () => number;
   /**
@@ -357,6 +360,7 @@ function escrowDoors(app: App, deps: EscrowDeps): void {
         {
           keys,
           chain,
+          db: deps.db,
           config: deps.config,
           nowMs: clock(),
           keyEpochStart: deps.keyEpochStart?.() ?? null,

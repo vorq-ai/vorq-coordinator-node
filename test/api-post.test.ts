@@ -3,21 +3,15 @@ import { formatUsd } from "../src/money.js";
 import {
   createPublicClient,
   custom,
-  decodeFunctionData,
   encodeAbiParameters,
-  encodeEventTopics,
   hashDomain,
   keccak256,
-  parseTransaction,
-  type Abi,
-  type AbiEvent,
   type Address,
   type Hex,
   type PublicClient,
 } from "viem";
 import { privateKeyToAccount } from "viem/accounts";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
-import { jobRegistryAbi } from "../src/abi/jobRegistry.js";
 import { buildApp } from "../src/api/app.js";
 import { MAX_POST_QUEUE_DEPTH } from "../src/api/routes/post.js";
 import { ENVELOPE_RESERVE_BYTES, INLINE_MAX_BYTES, MAX_BODY_BYTES } from "../src/api/limits.js";
@@ -31,18 +25,14 @@ import {
   MIN_CONTAINER_BYTES,
   SEED_WRAP_BYTES,
 } from "../src/container.js";
-import { cidForBytes } from "../src/pin/cid.js";
 import { MAX_CID_CHARS } from "../src/pin/pinner.js";
 import { externallyMintedCid, startStubStore, type StubStore } from "./support/stub-store.js";
 import { EIP712_NAMES } from "../src/orders.js";
 import {
-  refusedBroadcast,
   refusedCall,
   stubChain,
-  stubTxHash,
   testConfig,
   unreachableEndpoint,
-  type Simulate,
   type StubChain,
 } from "./support/stub-chain.js";
 
@@ -50,10 +40,11 @@ import {
  * `POST /v1/jobs` and `POST /v1/jobs/{id}/cancel` — the client's write doors.
  *
  * Driven against a canned endpoint and a canned store, so every assertion is
- * about **what the node would have sent**. "Nothing was relayed" is the property
- * most of these tests exist to prove, and it is proved by the absence of an
- * `eth_sendRawTransaction` in the recorded request log rather than by a status
- * code that could be right for the wrong reason.
+ * about **what the node would have done**. Neither door relays anything: a
+ * complete submission is held as a `jobs` row until a provider's claim puts it
+ * on chain, and a cancel ends that row. "Nothing was relayed" is proved by the
+ * absence of an `eth_sendRawTransaction` in the recorded request log, and
+ * "nothing was held" by the store's own record of inserts.
  *
  * The EIP-712 domains and type strings below are written out **literally**, from
  * `JobRegistry.sol`, rather than imported from `src/orders.ts`. Importing them
@@ -64,6 +55,12 @@ import {
 
 const config = testConfig();
 const { chainId, jobRegistry, usdc } = config.addresses;
+
+/** A session of the owner's, for the balance doors. */
+const SESSION = "vorq_sess_0123456789abcdef0123456789abcdef";
+
+/** The harness's deposit fee, 0.002 USD — what a short balance's deposit adds on top. */
+const DEPOSIT_FEE = 2_000n;
 
 /** Throwaway scalars. Neither has ever held value on any chain. */
 const owner = privateKeyToAccount(`0x${"66".repeat(32)}`);
@@ -140,7 +137,7 @@ const terms = (overrides: Partial<Terms> = {}): Terms => ({
  *
  * `cap = ceil((30000*1000 + 90000*2000)/1e6) = 210`, and the protocol fee is
  * charged **on top** of it: at the harness's 100 bps (the protocol's real fee)
- * `210 * 100 / 10000 = 2`, floored, so the pull is `210 + 2 + gasFee`. The
+ * `210 * 100 / 10000 = 2`, floored, so the lock is `210 + 2 + gasFee`. The
  * harness quotes a gas fee of `0` unless a test asks for one, which is why the
  * bare call is the common one.
  */
@@ -166,8 +163,8 @@ const orderDomain = {
  * `JobRegistry.ORDER_TYPEHASH`, member for member, **and `taskCid` is not one of
  * them**. Written out here from the contract source rather than imported from
  * `src/orders.ts`, so a wrong member list cannot agree with itself (R32, R64) —
- * and the ABI cannot tell you either, because `post` still takes the same struct
- * and its selector never moved. The type string is the whole difference, and the
+ * and the ABI cannot tell you either, because the `Order` struct `claim` takes
+ * still carries the member. The type string is the whole difference, and the
  * two tests below sign over each version to prove it.
  */
 const orderTypes = {
@@ -224,48 +221,6 @@ const signLegacyOrder = (t: Terms, taskCid: string, signer = owner): Promise<Hex
 const jobIdFor = (address: Hex, c: Hex): Hex =>
   keccak256(`0x${address.slice(2)}${c.slice(2)}` as Hex);
 
-/**
- * The payment token's own domain — four members, the token as
- * `verifyingContract` — and EIP-3009's `ReceiveWithAuthorization`, written out
- * from the token rather than imported from `src/orders.ts` (R32, R64).
- */
-const authDomain = { name: "USDC", version: "2", chainId, verifyingContract: usdc } as const;
-
-const authTypes = {
-  ReceiveWithAuthorization: [
-    { name: "from", type: "address" },
-    { name: "to", type: "address" },
-    { name: "value", type: "uint256" },
-    { name: "validAfter", type: "uint256" },
-    { name: "validBefore", type: "uint256" },
-    { name: "nonce", type: "bytes32" },
-  ],
-} as const;
-
-/**
- * `validBefore` is `expiresAt + 1`: the token requires `now < validBefore`, and
- * a claim may land on `expiresAt` itself.
- */
-const signAuthorization = (
-  jobId: Hex,
-  value: bigint,
-  expiresAt: bigint,
-  signer = owner,
-): Promise<Hex> =>
-  signer.signTypedData({
-    domain: authDomain,
-    types: authTypes,
-    primaryType: "ReceiveWithAuthorization",
-    message: {
-      from: owner.address,
-      to: jobRegistry,
-      value,
-      validAfter: 0n,
-      validBefore: expiresAt + 1n,
-      nonce: jobId,
-    },
-  });
-
 const cancelTypes = {
   Cancel: [
     { name: "jobId", type: "bytes32" },
@@ -299,13 +254,11 @@ interface Upload {
 interface StoreOptions {
   /** Model ids the catalog knows, mapped to their `enabled` flag. */
   models?: Map<bigint, boolean>;
-  /** Job ids the index already holds, confirmed by the indexer. */
-  jobs?: Set<string>;
   /**
-   * Job ids the index holds only as write-through rows, ahead of the cursor and
-   * still reorg-able — the rows the duplicate pre-check must not refuse on.
+   * Job ids this node already holds a row for. A held insert adds its own id, so
+   * a second post of the same order finds the first one's row.
    */
-  unconfirmedJobs?: Set<string>;
+  jobs?: Set<string>;
   /** What the candidate ranking answers on the challenge. */
   candidates?: Candidate[];
   /** The parameters of every candidate ranking the door ran. */
@@ -318,76 +271,67 @@ interface StoreOptions {
   attached?: unknown[][];
   /** Cids the sweep deletes between the lookup and the attach — `attachFile` then answers false. */
   swept?: Set<string>;
-  /**
-   * Every `jobs` row the write-through committed: `[job_id, posted_block]`.
-   * Pushed only once the transaction resolves, so a row recorded here is a row
-   * the door waited for.
-   */
-  written?: unknown[][];
-  /** Makes the write-through transaction fail. */
-  writeError?: Error;
-  /**
-   * What the ranking answers at the relay, where the door asks whether any live
-   * ask clears the order. Defaults to one provider, so a paid post relays; `[]`
-   * makes the door hold the order instead.
-   */
-  clearing?: Candidate[];
   /** Every held row the door wrote: the `INSERT INTO jobs` parameters. */
   held?: unknown[][];
+  /** The text of every held insert, so the `posted_block` source can be read off it. */
+  heldText?: string[];
   /** Makes the held insert find a row already there. */
   heldConflict?: boolean;
-  /** The owner of a held, unleased row the cancel door finds for its `job_id`. */
-  heldOwner?: Buffer;
-  /** The held row has a live lease: a poll is posting it. */
+  /** How long the held insert takes, so two concurrent holds overlap. */
+  heldDelayMs?: number;
+  /** The row the cancel door locks for its `job_id`; absent is no row at all. */
+  cancelRow?: { owner: Buffer; state?: number; held?: boolean };
+  /** The row has a live lease: a provider may be claiming it. */
   heldLeased?: boolean;
-  /** Every held row the cancel door cancelled: `[job_id]`. */
+  /** Every row the cancel door ended: `[job_id]`. */
   heldCancelled?: unknown[][];
-  /** The owner's open, unexpired jobs the funds check sums: `jobs` rows' price columns. */
+  /** Every lease the cancel door gave back: `[job_id]`. */
+  leasesDropped?: unknown[][];
+  /** The owner's open, unexpired orders the funds check sums: `jobs` rows' price columns. */
   openJobs?: { rate_in: string; rate_out: string; units_in: string; units_out: string; gas_fee: string }[];
 }
 
 /**
- * The reads the post door makes — the catalog row, the duplicate pre-check, and
- * the `files` row behind a `container_cid` — plus the write the pin makes into
- * the `pins` name book and the `expires_at` bump that attaches an upload.
- *
- * **There is no blob read on any path, and its absence is the change.** The door
- * used to resolve a `task_cid` the caller had already pinned; it now checks the
- * container against the commitment the caller signed — its own hash of the
- * inline bytes, or the one `POST /v1/files` wrote down — and never reads an
- * object back. A stub rather than a schema, so a read this door is not supposed
- * to make is a hard failure instead of an empty result set.
+ * The reads the post door makes — the catalog row, the duplicate check, the
+ * owner's open orders and the `files` row behind a `container_cid` — plus the
+ * held insert, the write the pin makes into the `pins` name book and the
+ * `expires_at` bump that attaches an upload. A stub rather than a schema, so a
+ * read this door is not supposed to make is a hard failure instead of an empty
+ * result set.
  */
-/** A provider whose ask clears every order this file posts. */
-const CLEARING: Candidate = {
-  provider_id: 1n,
-  box_key: Buffer.alloc(32, 9),
-  rate_in: 0n,
-  rate_out: 0n,
-  rate_in_cached: 0n,
-};
-
 function stubDb(options: StoreOptions = {}): Db {
   const models = options.models ?? new Map([[1n, true]]);
   const jobs = options.jobs ?? new Set<string>();
-  const unconfirmed = options.unconfirmedJobs ?? new Set<string>();
   const uploads = options.uploads ?? new Map<string, Upload>();
+
+  // The open orders every held insert adds, as the funds check's sum reads them.
+  const heldOpen: { rate_in: string; rate_out: string; units_in: string; units_out: string; gas_fee: string }[] = [];
 
   const query = (async (text: string, params?: readonly unknown[]) => {
     // The challenge's one store read (the candidate ranking) and its one bounded
     // write (the round-robin cursor). Checked first: the ranking's LATERAL
     // subquery reads `jobs` too, and must not be mistaken for the duplicate
-    // pre-check below.
+    // check below.
     if (text.includes("FROM providers p")) {
-      // The relay-time check asks for one row; the challenge and the probe ask
-      // for `MATCH_CANDIDATES`.
-      if (params?.[6] === 1) return { rows: options.clearing ?? [CLEARING] };
       options.ranked?.push([...(params ?? [])]);
       return { rows: options.candidates ?? [] };
     }
     if (text.includes("INSERT INTO jobs")) {
-      if (options.heldConflict === true) return { rows: [], rowCount: 0 };
+      if (options.heldDelayMs !== undefined) {
+        await new Promise((resolve) => setTimeout(resolve, options.heldDelayMs));
+      }
+      const id = `0x${(params?.[0] as Buffer).toString("hex")}`;
+      if (options.heldConflict === true || jobs.has(id)) return { rows: [], rowCount: 0 };
+      jobs.add(id);
+      heldOpen.push({
+        rate_in: params?.[6] as string,
+        rate_out: params?.[7] as string,
+        units_in: params?.[8] as string,
+        units_out: params?.[9] as string,
+        gas_fee: params?.[12] as string,
+      });
       options.held?.push([...(params ?? [])]);
+      options.heldText?.push(text);
       return { rows: [], rowCount: 1 };
     }
 
@@ -399,20 +343,31 @@ function stubDb(options: StoreOptions = {}): Db {
       const enabled = models.get(BigInt(params?.[0] as bigint | number));
       return { rows: enabled === undefined ? [] : [{ enabled }] };
     }
-    // The funds check's sum over the owner's open jobs, ahead of the duplicate
-    // pre-check, which reads `jobs` by id.
+    // The funds check's sum over the owner's open orders, ahead of the duplicate
+    // check, which reads `jobs` by id.
     if (text.includes("FROM jobs") && text.includes("state = 0")) {
-      return { rows: options.openJobs ?? [] };
+      return { rows: [...(options.openJobs ?? []), ...heldOpen] };
+    }
+    // The bearer the balance doors' session gate reads, for the owner.
+    if (text.includes("FROM sessions")) {
+      return {
+        rows:
+          params?.[0] === SESSION
+            ? [
+                {
+                  token: SESSION,
+                  address: Buffer.from(owner.address.slice(2), "hex"),
+                  role: "client",
+                  provider_id: null,
+                  expires_at: 4_102_444_800n,
+                },
+              ]
+            : [],
+      };
     }
     if (text.includes("FROM jobs")) {
-      const jobId = params?.[0] as Buffer;
-      const id = `0x${jobId.toString("hex")}`;
-      // The stub applies the pre-check's own guard rather than trusting it: the
-      // query excludes rows the indexer has not reached, so a query that lost
-      // that clause finds the unconfirmed row here and the test goes red.
-      const confirmedOnly = text.includes("NOT (posted_block >");
-      const hit = jobs.has(id) || (unconfirmed.has(id) && !confirmedOnly);
-      return { rows: hit ? [{ job_id: jobId }] : [] };
+      const id = `0x${(params?.[0] as Buffer).toString("hex")}`;
+      return { rows: jobs.has(id) ? [{ "?column?": 1 }] : [] };
     }
     // `findUpload`: the whole predicate, owner and purpose included, so a test
     // that expects a miss gets one for the reason it named.
@@ -425,7 +380,7 @@ function stubDb(options: StoreOptions = {}): Db {
       return { rows: [{ cid, commitment: found.commitment }] };
     }
     // `attachFile`, which answers by `rowCount`: zero means the sweep got there
-    // first and the door must refuse rather than relay.
+    // first and the door must refuse rather than hold.
     if (text.includes("UPDATE files")) {
       const [cid, , , retention] = params as [string, Buffer, string, number];
       options.attached?.push([...(params ?? [])]);
@@ -440,32 +395,33 @@ function stubDb(options: StoreOptions = {}): Db {
     throw new Error(`stubDb: unexpected query ${text}`);
   }) as unknown as Db["query"];
 
-  // The write-through's one transaction: the reducer's `Posted` upsert, and
-  // nothing else. Rows are recorded on commit, not on the statement.
-  const tx: Db["tx"] = async (fn) => {
-    if (options.writeError !== undefined) throw options.writeError;
-    const staged: unknown[][] = [];
-    const result = await fn({
+  // The cancel door's one transaction: the locked row, its lease, and the write.
+  const tx: Db["tx"] = async (fn) =>
+    fn({
       query: (async (text: string, params?: readonly unknown[]) => {
-        // The cancel door's held-order transaction: the locked row, its lease,
-        // and the one write.
         if (text.includes("FROM jobs") && text.includes("FOR UPDATE")) {
-          return { rows: options.heldOwner === undefined ? [] : [{ owner: options.heldOwner }] };
+          const row = options.cancelRow;
+          return {
+            rows:
+              row === undefined
+                ? []
+                : [{ owner: row.owner, state: row.state ?? 0, held: row.held ?? true }],
+          };
         }
-        if (text.includes("FROM job_leases")) return { rows: options.heldLeased === true ? [{}] : [] };
+        if (text.includes("SELECT 1 FROM job_leases")) {
+          return { rows: options.heldLeased === true ? [{}] : [] };
+        }
         if (text.includes("UPDATE jobs SET state = 3")) {
           options.heldCancelled?.push([...(params ?? [])]);
           return { rows: [], rowCount: 1 };
         }
-        if (!text.includes("INSERT INTO jobs")) throw new Error(`stubDb: unexpected tx query ${text}`);
-        const [jobId, , , , , , , , , , , , postedBlock] = params as unknown[];
-        staged.push([`0x${(jobId as Buffer).toString("hex")}`, postedBlock]);
-        return { rows: [] };
+        if (text.includes("DELETE FROM job_leases")) {
+          options.leasesDropped?.push([...(params ?? [])]);
+          return { rows: [], rowCount: 1 };
+        }
+        throw new Error(`stubDb: unexpected tx query ${text}`);
       }) as unknown as Db["query"],
     });
-    options.written?.push(...staged);
-    return result;
-  };
 
   return {
     query,
@@ -478,9 +434,9 @@ function stubDb(options: StoreOptions = {}): Db {
 /**
  * The object store both write doors pin through, started once for this file.
  *
- * A real loopback HTTP server rather than a fake pinner: the pin is now on the
- * request path of every `201` this file asserts, so a door driven without one
- * would be driven without the step that mints the name it puts on chain.
+ * A real loopback HTTP server rather than a fake pinner: the pin is on the
+ * request path of every `202` this file asserts, so a door driven without one
+ * would be driven without the step that mints the name `claim` puts on chain.
  */
 let store: StubStore;
 
@@ -555,14 +511,14 @@ function harness(
   chainOptions: {
     gasFee?: bigint;
     feeBps?: number;
+    depositFee?: bigint;
     slaAllowed?: boolean;
-    simulate?: () => Simulate;
-    sendError?: () => unknown;
     callError?: () => unknown;
-    receiptLogs?: () => unknown[];
-    receiptMissing?: boolean;
-    code?: Record<string, Hex>;
+    /** Called per broadcast, as the stub chain's own `sendError`. */
+    sendError?: () => unknown;
     tokenBalance?: Record<string, bigint>;
+    /** Job ids the chain has a row for: `getJob` answers `found` for these. */
+    onChain?: Set<string>;
   } = {},
   nodeOptions: { partBytes?: number; maxBlobBytes?: number; jobRateLimit?: number } = {},
 ): Harness {
@@ -575,22 +531,28 @@ function harness(
     ...(nodeOptions.maxBlobBytes === undefined ? {} : { maxBlobBytes: nodeOptions.maxBlobBytes }),
     ...(nodeOptions.jobRateLimit === undefined ? {} : { jobRateLimit: nodeOptions.jobRateLimit }),
   });
+  const onChain = chainOptions.onChain ?? new Set<string>();
   const stub = stubChain(appConfig, {
-    // A getter, so the value can change between the quote and the relay — which
-    // is the whole of the drift case, and a static record cannot express it.
+    // A getter, so the value can change between the quote and the submission —
+    // which is the whole of the drift case, and a static record cannot express it.
     views: {
       get gasFee() {
         return gasFee;
       },
       feeBps: chainOptions.feeBps ?? 100,
+      depositFee: chainOptions.depositFee ?? DEPOSIT_FEE,
       allowedSla: chainOptions.slaAllowed ?? true,
+      getJob: ([jobId]: readonly unknown[]) => ({
+        found: onChain.has(String(jobId).toLowerCase()),
+        jobId: jobId as Hex,
+        state: onChain.has(String(jobId).toLowerCase()) ? 1 : 0,
+        endedBecause: 0,
+        providerId: 0,
+        claimedAt: 0n,
+      }),
     },
-    simulate: chainOptions.simulate,
-    sendError: chainOptions.sendError,
     callError: chainOptions.callError,
-    receiptLogs: chainOptions.receiptLogs,
-    receiptMissing: chainOptions.receiptMissing,
-    code: chainOptions.code,
+    sendError: chainOptions.sendError,
     tokenBalance: chainOptions.tokenBalance,
   });
   const app = buildApp({
@@ -625,9 +587,9 @@ const wire = (t: Terms, signature: Hex, jobId?: Hex, ownerAddress = owner.addres
 });
 
 /**
- * A paid submission, as the wire carries it: one flat JSON body — the order
- * fields, the payment fields, and the container as base64. `null` for a payment
- * that forgot its bytes.
+ * A complete submission, as the wire carries it: one flat JSON body — the order
+ * fields, the echoed `amount`, and the container as base64. `null` for a
+ * submission that forgot its bytes.
  */
 const submission = (
   order: Record<string, unknown>,
@@ -639,30 +601,32 @@ const submission = (
   ...(container === null ? {} : { container: b64(container) }),
 });
 
+/** `{amount}` for a complete submission, in USD. */
+const amountField = (amount: bigint) => ({ amount: formatUsd(amount, 6) });
+
 const post = (app: FastifyInstance, payload: unknown) =>
   app.inject({ method: "POST", url: "/v1/jobs", payload: payload as Record<string, unknown> });
 
-const broadcastCall = (raw: string) => {
-  const tx = parseTransaction(raw as Hex);
-  return { to: tx.to, ...decodeFunctionData({ abi: jobRegistryAbi, data: tx.data as Hex }) };
-};
+/** The `eth_call`s a request made. */
+const ethCalls = (stub: StubChain) => stub.requests.filter((r) => r.method === "eth_call");
 
 // ---------------------------------------------------------------------------
 // The 402 challenge
 // ---------------------------------------------------------------------------
 
 describe("POST /v1/jobs — the 402 quote", () => {
-  it("quotes cap, fee, gas_fee and amount, and the exact payment authorization", async () => {
+  it("quotes cap, fee, gas_fee, amount, the available balance and the deposit to make", async () => {
     const { app, stub } = harness({}, { gasFee: 7n });
     const t = terms();
     const signature = await signOrder(t);
-    const jobId = jobIdFor(owner.address, t.c);
 
     const response = await post(app, wire(t, signature));
 
     expect(response.statusCode).toBe(402);
     // cap = ceil((30000*1000 + 90000*2000)/1e6) = ceil(210) = 210
     // fee = 210 * 100 / 10000 = 2, on top of the cap; amount = 210 + 2 + 7
+    // The stub's owner holds $1000, so the balance covers it and nothing is to
+    // be deposited.
     expect(response.json()).toEqual({
       quote: {
         cap: "0.00021",
@@ -670,19 +634,53 @@ describe("POST /v1/jobs — the 402 quote", () => {
         fee: "0.000002",
         gas_fee: "0.000007",
         amount: "0.000219",
-        authorization: {
-          domain: { name: "USDC", version: "2", chainId, verifyingContract: usdc },
-          to: jobRegistry,
-          value: 219,
-          valid_after: 0,
-          valid_before: Number(t.expiresAt + 1n),
-          nonce: jobId,
-        },
+        balance: "1000",
+        deposit: "0",
+        deposit_fee: "0.002",
       },
       candidates: [],
       accepts: [{ scheme: "eip3009", network: `eip155:${chainId}` }],
     });
+    expect(response.json().quote.authorization).toBeUndefined();
     expect(stub.broadcasts).toEqual([]);
+  });
+
+  it("quotes the shortfall plus the deposit fee when the balance does not cover the order", async () => {
+    // 100 held, an open order locking 50 of it: 50 available against a lock of
+    // 212, so 162 short — and the deposit names 162 + the 2000 fee the registry
+    // takes from the deposit itself, so it credits exactly the shortfall.
+    const openJobs = [{ rate_in: "0", rate_out: "1000000", units_in: "0", units_out: "50", gas_fee: "0" }];
+    const { app } = harness({ openJobs }, { tokenBalance: { [owner.address.toLowerCase()]: 100n } });
+    const t = terms();
+
+    const response = await post(app, wire(t, await signOrder(t)));
+
+    expect(response.statusCode).toBe(402);
+    expect(response.json().quote).toMatchObject({
+      amount: "0.000212",
+      balance: "0.00005",
+      deposit: "0.002162",
+      deposit_fee: "0.002",
+    });
+  });
+
+  it("quotes a zero balance, never a negative one, for an owner whose open orders exceed it", async () => {
+    const openJobs = [{ rate_in: "0", rate_out: "1000000", units_in: "0", units_out: "500", gas_fee: "0" }];
+    const { app } = harness({ openJobs }, { tokenBalance: { [owner.address.toLowerCase()]: 100n } });
+    const t = terms();
+
+    const response = await post(app, wire(t, await signOrder(t)));
+
+    expect(response.json().quote).toMatchObject({ balance: "0", deposit: "0.002212" });
+  });
+
+  it("quotes no deposit when the balance covers the order exactly", async () => {
+    const { app } = harness({}, { tokenBalance: { [owner.address.toLowerCase()]: 212n } });
+    const t = terms();
+
+    const response = await post(app, wire(t, await signOrder(t)));
+
+    expect(response.json().quote).toMatchObject({ amount: "0.000212", balance: "0.000212", deposit: "0" });
   });
 
   it("floors the cap at one atomic unit for a zero-priced order", async () => {
@@ -724,6 +722,14 @@ describe("POST /v1/jobs — the 402 quote", () => {
     expect(response.json().quote).toMatchObject({ cap: "0.00021", gas_fee: "0.0005", amount: "0.000712" });
   });
 
+  it("reads deposit_fee from the chain, never from a literal", async () => {
+    const { app } = harness({}, { depositFee: 7_000n, tokenBalance: { [owner.address.toLowerCase()]: 0n } });
+    const t = terms();
+    const response = await post(app, wire(t, await signOrder(t)));
+
+    expect(response.json().quote).toMatchObject({ deposit_fee: "0.007", deposit: "0.007212" });
+  });
+
   it("quotes the protocol fee on top of the cap", async () => {
     const { app } = harness({}, { gasFee: 5n, feeBps: 250 });
     const t = terms();
@@ -741,10 +747,10 @@ describe("POST /v1/jobs — the 402 quote", () => {
   /**
    * **The guard: a body that carried a container is never answered with a quote.**
    *
-   * `402` is the one status a client is expected to loop on — it means "sign this
-   * and send the same request again" — so answering one to a body that already
-   * carried the payload costs the client the whole upload a second time, and a
-   * client obeying the protocol correctly is what makes it happen.
+   * `402` is the one status a client is expected to loop on — it means "cover
+   * this and send the same request again" — so answering one to a body that
+   * already carried the payload costs the client the whole upload a second time,
+   * and a client obeying the protocol correctly is what makes it happen.
    *
    * The mechanism is the route's `onSend` hook, not a condition beside the quote
    * branch, because the branch that sends today's `402` is not the one that will
@@ -756,8 +762,8 @@ describe("POST /v1/jobs — the 402 quote", () => {
     const { app, stub } = harness();
     const t = terms();
 
-    // The container inline and no `auth_sig`: the shape of a client that
-    // built the whole submission and forgot the payment.
+    // The container inline and no `amount`: the shape of a client that built
+    // the whole submission and forgot the amount it accepted.
     const response = await post(app, submission(wire(t, await signOrder(t)), CONTAINER, {}));
 
     expect(response.statusCode).toBe(400);
@@ -766,7 +772,7 @@ describe("POST /v1/jobs — the 402 quote", () => {
       error: {
         message: expect.stringContaining("complete submission") as unknown as string,
         type: "invalid_request_error",
-        param: "auth_sig",
+        param: "amount",
         code: "container_without_payment",
       },
     });
@@ -795,17 +801,18 @@ describe("POST /v1/jobs — the 402 quote", () => {
     ]);
   });
 
-  it("reads only the candidate ranking from the store, and never the SLA, on the quote path", async () => {
-    // A store that answers the ranking and its cursor bump and throws on every
-    // other query, and an `allowedSla` the stub has no answer for: the quote
-    // path is arithmetic, two cached config reads — `gasFee` and `feeBps` — and
-    // one bounded ranking read, and this is what pins that bound (see the
-    // report's bounds analysis).
-    const stub = stubChain(config, { views: { gasFee: 0n, feeBps: 100 } });
+  it("reads only the ranking and the owner's open orders from the store, and never the SLA, on the quote path", async () => {
+    // A store that answers the ranking, its cursor bump and the open-orders sum
+    // and throws on every other query, and an `allowedSla` the stub has no answer
+    // for: the quote path is arithmetic, three cached config reads — `gasFee`,
+    // `feeBps` and `depositFee` — the owner's balance, and two bounded store
+    // reads, and this is what pins that bound.
+    const stub = stubChain(config, { views: { gasFee: 0n, feeBps: 100, depositFee: DEPOSIT_FEE } });
     const app = buildApp({
       db: {
         query: (text: string) => {
           if (text.includes("FROM providers p")) return Promise.resolve({ rows: [] });
+          if (text.includes("FROM jobs") && text.includes("state = 0")) return Promise.resolve({ rows: [] });
           return Promise.reject(new Error(`the quote path must not read the store: ${text}`));
         },
         tx: () => Promise.reject(new Error("no")),
@@ -822,25 +829,22 @@ describe("POST /v1/jobs — the 402 quote", () => {
     const response = await post(app, wire(t, await signOrder(t)));
 
     expect(response.statusCode).toBe(402);
-    expect(stub.requests.filter((r) => r.method === "eth_call")).toHaveLength(2);
+    expect(ethCalls(stub)).toHaveLength(4);
   });
 });
 
 // ---------------------------------------------------------------------------
-// Local validation — every one of these must relay nothing
+// Local validation
 // ---------------------------------------------------------------------------
 
 describe("POST /v1/jobs — validation", () => {
-  const payment = async (t: Terms, amount: bigint) => ({
-    auth_sig: await signAuthorization(jobIdFor(owner.address, t.c), amount, t.expiresAt),
-    amount: formatUsd(amount, 6),
-  });
+  const payment = async (_t: Terms, amount: bigint) => amountField(amount);
 
   /**
    * **The type string, proved in both directions.**
    *
-   * The ABI cannot tell you this changed: `post` still takes the same struct and
-   * its selector never moved, so regenerating it carries nothing. The EIP-712
+   * The ABI cannot tell you this changed: the `Order` struct `claim` takes still
+   * carries `taskCid`, so regenerating it carries nothing. The EIP-712
    * type string is the whole difference, and a signature made over the old one
    * recovers a different address — which on chain is a silent `400` a client
    * cannot diagnose. Both halves matter: the old string must fail, and the new
@@ -867,8 +871,8 @@ describe("POST /v1/jobs — validation", () => {
 
     const response = await post(app, submission(wire(t, await signOrder(t)), CONTAINER, await payment(t, amountFor())));
 
-    expect(response.statusCode).toBe(201);
-    expect(stub.broadcasts).toHaveLength(1);
+    expect(response.statusCode).toBe(202);
+    expect(stub.broadcasts).toEqual([]);
   });
 
   it("refuses an order signed by somebody other than the owner", async () => {
@@ -882,49 +886,6 @@ describe("POST /v1/jobs — validation", () => {
     expect(response.json().error.code).toBe("invalid_order_signature");
     expect(response.headers["x-vorq-retryable"]).toBe("false");
     expect(stub.broadcasts).toEqual([]);
-  });
-
-  it("refuses a payment signature that does not recover to the owner", async () => {
-    const { app, stub } = harness();
-    const t = terms();
-    const body = submission(wire(t, await signOrder(t)), CONTAINER, {
-        auth_sig: await signAuthorization(jobIdFor(owner.address, t.c), 210n, t.expiresAt, stranger),
-        amount: "0.00021",
-      });
-
-    const response = await post(app, body);
-
-    expect(response.statusCode).toBe(400);
-    expect(response.json().error.code).toBe("invalid_payment_signature");
-    expect(stub.broadcasts).toEqual([]);
-    expect(stub.simulated).toEqual([]);
-  });
-
-  it("refuses a payment signature made over a different amount", async () => {
-    const { app, stub } = harness();
-    const t = terms();
-    // Signed over 209, echoed as 210: the recover fails at the echoed amount,
-    // which is what makes an honest drift and a forged authorization distinguishable
-    // (R7).
-    const body = submission(wire(t, await signOrder(t)), CONTAINER, {
-      auth_sig: await signAuthorization(jobIdFor(owner.address, t.c), 209n, t.expiresAt),
-      amount: "0.00021",
-    });
-
-    const response = await post(app, body);
-
-    expect(response.statusCode).toBe(400);
-    expect(response.json().error.code).toBe("invalid_payment_signature");
-    expect(stub.broadcasts).toEqual([]);
-  });
-
-  it("requires the echoed amount", async () => {
-    const { app } = harness();
-    const t = terms();
-    const response = await post(app, submission(wire(t, await signOrder(t)), CONTAINER, { auth_sig: await signAuthorization(jobIdFor(owner.address, t.c), 210n, t.expiresAt) }));
-
-    expect(response.statusCode).toBe(400);
-    expect(response.json().error.param).toBe("amount");
   });
 
   it("refuses a job_id that is not keccak256(owner ‖ c)", async () => {
@@ -973,12 +934,12 @@ describe("POST /v1/jobs — validation", () => {
    * The two tests above probe `now - 1` and `now + 86_401` — one *past* each
    * bound, which leaves the bound itself free to move by a second with nothing
    * going red. This is one of only two places the node **restates a frozen
-   * contract's comparison**: `JobRegistry.sol:179-180` is `expiresAt <= block
-   * .timestamp` and `expiresAt > block.timestamp + MAX_EXPIRY`, and 86 400 is
+   * contract's comparison**: `JobRegistry` refuses `block.timestamp > expiresAt`
+   * and `expiresAt > block.timestamp + MAX_EXPIRY`, and 86 400 is
    * written out here from that source rather than imported from `src/orders.ts`,
    * so a wrong constant cannot agree with itself (R32, R64). An off-by-one on
    * the upper edge refuses an order the chain would accept; on the lower it
-   * relays one the chain refuses and the node pays the gas.
+   * holds one no claim can land.
    */
   it("admits an expiry exactly at now+86400, the contract's own upper bound", async () => {
     const { app, stub } = harness();
@@ -1037,74 +998,47 @@ describe("POST /v1/jobs — validation", () => {
   });
 
   /**
-   * **The payer's code, read before a byte is pinned or a wei of gas is fronted.**
-   *
-   * The payment token validates `receiveWithAuthorization` through
-   * `SignatureChecker`, which routes an authorizer **with code** — an
-   * EIP-7702-delegated wallet, a smart account — to ERC-1271 and never to
-   * `ecrecover`. `recovers()` is viem's pure `verifyTypedData`, so such an
-   * authorization passes every check this node makes and then fails inside the
-   * token at `claim`. Without this read the node pins the container, fronts the
-   * gas, posts, and the job rests Open to expiry with nothing naming the cause.
-   *
-   * The fail-open mutation is deleting the check: this becomes a `201` with a
-   * broadcast and a pinned object.
+   * **A balance that cannot cover the order is a re-quote, and nothing is filed.**
+   * The claim locks the order's amount out of the prepaid balance, so without this
+   * an empty balance would have its order held, and resting until it expired with
+   * no claim able to land.
    */
-  it("refuses a payer that carries contract code, before pinning or relaying", async () => {
-    const { app, stub } = harness({}, { code: { [owner.address.toLowerCase()]: "0x6080604052" } });
-    const t = terms();
-    const response = await post(app, submission(wire(t, await signOrder(t)), CONTAINER, await payment(t, amountFor())));
-
-    expect(response.statusCode).toBe(400);
-    expect(response.json().error.code).toBe("payer_has_code");
-    expect(response.json().error.param).toBe("owner");
-    // The remedy is in the message, not only in the code.
-    expect(response.json().error.message).toMatch(/undelegated EOA/);
-    expect(response.headers["x-vorq-retryable"]).toBe("false");
-    expect(stub.broadcasts).toEqual([]);
-    expect(stub.simulated).toEqual([]);
-    expect(store.objects.size).toBe(0);
-    expect(store.uploads.size).toBe(0);
-  });
-
-  /**
-   * **A wallet that cannot fund the claim is refused before anything is filed.**
-   * The claim pulls the escrow, not the post, so without this an empty wallet
-   * posts perfectly and its job rests Open until it expires — measured on Base
-   * Sepolia 2026-10-17, fifteen of them.
-   */
-  it("refuses insufficient_funds when the owner cannot cover the claim on top of its open jobs", async () => {
+  it("answers a short balance with the 409 re-quote, holding and filing nothing", async () => {
     const holder = owner.address.toLowerCase();
-    // One open job pulling 110 + 1 + 0, so 211 short of 212 + 111 = 323.
+    const held: unknown[][] = [];
+    // One open order locking 110 + 1 + 0, so 322 leaves 211 for an order of 212.
     const openJobs = [{ rate_in: "0", rate_out: "1000000", units_in: "0", units_out: "110", gas_fee: "0" }];
-    const { app, stub } = harness({ openJobs }, { tokenBalance: { [holder]: 322n } });
+    const { app, stub } = harness({ openJobs, held }, { tokenBalance: { [holder]: 322n } });
     const t = terms();
     const response = await post(app, submission(wire(t, await signOrder(t)), CONTAINER, await payment(t, amountFor())));
 
-    expect(response.statusCode).toBe(400);
-    expect(response.json().error.code).toBe("insufficient_funds");
-    expect(response.json().error.param).toBe("owner");
-    expect(response.json().error.message).toMatch(/can fund 0\.000211 USDC after its open jobs, and the claim of this order pulls 0\.000212/);
+    expect(response.statusCode).toBe(409);
+    expect(response.json().quote).toMatchObject({
+      amount: "0.000212",
+      balance: "0.000211",
+      // 1 short, plus the deposit fee the registry takes from the deposit.
+      deposit: "0.002001",
+      deposit_fee: "0.002",
+    });
+    expect(response.json().error).toBeUndefined();
     expect(response.headers["x-vorq-retryable"]).toBe("false");
-    expect(stub.simulated).toEqual([]);
+    expect(held).toEqual([]);
     expect(stub.broadcasts).toEqual([]);
     expect(store.objects.size).toBe(0);
 
-    // Exactly enough posts.
+    // Exactly enough is held.
     const funded = harness({ openJobs }, { tokenBalance: { [holder]: 323n } });
     const ok = await post(funded.app, submission(wire(t, await signOrder(t)), CONTAINER, await payment(t, amountFor())));
-    expect(ok.statusCode).toBe(201);
+    expect(ok.statusCode).toBe(202);
   });
 
-  it("reads the payer's code at latest and posts when it is empty", async () => {
+  it("never reads the payer's code: an order moves no tokens, the deposit door does", async () => {
     const { app, stub } = harness();
     const t = terms();
     const response = await post(app, submission(wire(t, await signOrder(t)), CONTAINER, await payment(t, amountFor())));
 
-    expect(response.statusCode).toBe(201);
-    const reads = stub.requests.filter((r) => r.method === "eth_getCode");
-    expect(reads).toHaveLength(1);
-    expect(reads[0]?.params).toEqual([owner.address, "latest"]);
+    expect(response.statusCode).toBe(202);
+    expect(stub.requests.filter((r) => r.method === "eth_getCode")).toEqual([]);
   });
 
   it("refuses an SLA past MAX_SLA_SECONDS without asking the chain", async () => {
@@ -1125,13 +1059,12 @@ describe("POST /v1/jobs — validation", () => {
    * Neither is hypothetical and neither is caught by anything else on this door:
    * a length check and a version check both pass, the order signature is perfectly
    * valid, and the chain cannot look at a container at all. What a miss produces
-   * is a job **every provider refuses to claim** — each re-derives
+   * is an order **every provider refuses to claim** — each re-derives
    * `keccak256(owner ‖ c) == jobId` from the bytes it fetched and gets a
-   * different id — with the escrow already committed and the relayer's gas
-   * already spent. Nothing downstream repairs that.
+   * different id. Nothing downstream repairs that.
    *
    * The fail-open mutation is deleting the `assertCommitment` call: both of these
-   * become `201`s with a broadcast.
+   * become `202`s with a held row.
    */
   it("refuses a container whose seed_wrap came from another order", async () => {
     // Identical ciphertext, another order's 80-byte wrap. This is the case that
@@ -1149,9 +1082,7 @@ describe("POST /v1/jobs — validation", () => {
     expect(response.json().error.param).toBe("container");
     expect(response.json().error.code).toBe("commitment_mismatch");
     expect(stub.broadcasts).toEqual([]);
-    // Two keccaks over a buffer this process already holds: no chain call, and
-    // nothing in the store.
-    expect(stub.simulated).toEqual([]);
+    // Two keccaks over a buffer this process already holds: nothing in the store.
     expect(store.objects.size).toBe(0);
     expect(store.uploads.size).toBe(0);
   });
@@ -1189,7 +1120,7 @@ describe("POST /v1/jobs — validation", () => {
     expect(tagged.json().error.code).toBe("bad_version");
   });
 
-  it("refuses a payment with no container, rather than relaying a name it cannot mint", async () => {
+  it("refuses an amount with no container, rather than holding an order with no name", async () => {
     const { app, stub } = harness();
     const t = terms();
     const response = await post(app, submission(wire(t, await signOrder(t)), null, await payment(t, amountFor())));
@@ -1207,15 +1138,6 @@ describe("POST /v1/jobs — validation", () => {
 
     expect(response.statusCode).toBe(400);
     expect(response.json().error.param).toBe("signature");
-  });
-
-  it("refuses an auth_sig that is not 65 bytes", async () => {
-    const { app } = harness();
-    const t = terms();
-    const response = await post(app, submission(wire(t, await signOrder(t)), CONTAINER, { auth_sig: `0x${"ab".repeat(10)}`, amount: "0.00021" }));
-
-    expect(response.statusCode).toBe(400);
-    expect(response.json().error.param).toBe("auth_sig");
   });
 
   it("refuses a body past this door's own limit, well above the app-wide one", async () => {
@@ -1250,19 +1172,16 @@ describe("POST /v1/jobs — validation", () => {
     const big = containerOf(0xd7, "z".repeat(INLINE_MAX_BYTES - MIN_CONTAINER_BYTES));
     expect(big.length).toBe(INLINE_MAX_BYTES);
     const t = terms({ c: commitmentOf(big) });
-    const body = submission(wire(t, await signOrder(t)), big, {
-      auth_sig: await signAuthorization(jobIdFor(owner.address, t.c), amountFor(), t.expiresAt),
-      amount: formatUsd(amountFor(), 6),
-    });
+    const body = submission(wire(t, await signOrder(t)), big, amountField(amountFor()));
     const onTheWire = JSON.stringify(body).length;
     expect(onTheWire).toBeLessThan(MAX_BODY_BYTES);
     expect(onTheWire).toBeGreaterThan(MAX_BODY_BYTES - ENVELOPE_RESERVE_BYTES);
 
     const response = await post(app, body);
 
-    expect(response.statusCode, JSON.stringify(response.json())).toBe(201);
+    expect(response.statusCode, JSON.stringify(response.json())).toBe(202);
     expect(response.json().task_cid).toBe(externallyMintedCid(big));
-    expect(stub.broadcasts).toHaveLength(1);
+    expect(stub.broadcasts).toEqual([]);
   });
 
   it("refuses a cap past 2^53 − 1, the largest amount the wire carries", async () => {
@@ -1290,94 +1209,55 @@ describe("POST /v1/jobs — validation", () => {
 });
 
 // ---------------------------------------------------------------------------
-// Duplicates, drift, and the relay
+// Duplicates, drift, and the hold
 // ---------------------------------------------------------------------------
 
-describe("POST /v1/jobs — relay", () => {
-  const signed = async (t: Terms, amount: bigint) => (submission(wire(t, await signOrder(t)), CONTAINER, {
-      auth_sig: await signAuthorization(jobIdFor(owner.address, t.c), amount, t.expiresAt),
-      amount: formatUsd(amount, 6),
-    }));
+describe("POST /v1/jobs — the hold", () => {
+  const signed = async (t: Terms, amount: bigint) =>
+    submission(wire(t, await signOrder(t)), CONTAINER, amountField(amount));
 
-  it("relays post with the exact struct field order and answers 201", async () => {
-    const { app, stub } = harness({}, { gasFee: 5n });
+  it("holds the order: 202, a row carrying its signature and quoted gas fee, nothing relayed", async () => {
+    const held: unknown[][] = [];
+    const heldText: string[] = [];
+    const { app, stub } = harness({ held, heldText }, { gasFee: 5n });
     const t = terms();
     const jobId = jobIdFor(owner.address, t.c);
-    const signature = await signOrder(t);
-    const authSig = await signAuthorization(jobId, amountFor(5n), t.expiresAt);
-    const body = submission(wire(t, signature), CONTAINER, {
-      auth_sig: authSig,
-      amount: formatUsd(amountFor(5n), 6),
-    });
+    const body = await signed(t, amountFor(5n));
 
     const response = await post(app, body);
 
-    expect(response.statusCode).toBe(201);
+    expect(response.statusCode).toBe(202);
     // `task_cid` is on the success body and nowhere else it could be: this node
     // minted it, so a caller that is not told cannot learn the name of its own
-    // object — it cannot compute one, and until the post is indexed there is
-    // nothing to read it from. Deleting it from the body is the fail-open
-    // mutation, and this is the assertion that goes red.
-    expect(response.json()).toEqual({
-      job_id: jobId,
-      task_cid: MINTED_CID,
-      tx_hash: stubTxHash(1),
-    });
-    // And it is the store's name, not one this node computed for itself.
-    expect(MINTED_CID).not.toBe(cidForBytes(CONTAINER));
+    // object. Deleting it from the body is the fail-open mutation, and this is
+    // the assertion that goes red.
+    expect(response.json()).toEqual({ job_id: jobId, task_cid: MINTED_CID });
     expect(response.json().as_of_block).toBeUndefined();
+    // No transaction of any kind: the order goes on chain inside the claim.
+    expect(stub.simulated).toEqual([]);
+    expect(stub.broadcasts).toEqual([]);
 
-    expect(stub.broadcasts).toHaveLength(1);
-    const call = broadcastCall(stub.broadcasts[0] as string);
-    expect(call.to?.toLowerCase()).toBe(jobRegistry.toLowerCase());
-    expect(call.functionName).toBe("post");
-    expect(call.args?.[0]).toEqual({
-      c: t.c,
-      modelId: Number(t.modelId),
-      slaSecs: Number(t.slaSecs),
-      rateIn: t.rateIn,
-      rateOut: t.rateOut,
-      unitsIn: Number(t.unitsIn),
-      unitsOut: Number(t.unitsOut),
-      designated: Number(t.designated),
-      expiresAt: t.expiresAt,
-      // A `post` **parameter** and no longer a signed member: the name did not
-      // exist when the client signed, because this node had not minted it yet.
-      taskCid: cidHex(MINTED_CID),
-    });
-    expect(call.args?.[1]).toBe(owner.address);
-    expect(call.args?.[2]).toBe(signature);
-    expect(call.args?.[3]).toBe(authSig);
+    expect(held).toHaveLength(1);
+    const row = held[0] as unknown[];
+    const hexOf = (value: unknown) => `0x${(value as Buffer).toString("hex")}`;
+    expect(hexOf(row[0])).toBe(jobId);
+    expect(hexOf(row[1])).toBe(owner.address.toLowerCase());
+    expect(hexOf(row[2])).toBe(t.c);
+    expect(row.slice(3, 11)).toEqual(
+      [t.modelId, t.slaSecs, t.designated, t.rateIn, t.rateOut, t.unitsIn, t.unitsOut, t.expiresAt].map(String),
+    );
+    expect((row[11] as Buffer).toString("utf8")).toBe(MINTED_CID);
+    // The gas fee the order was quoted at, which the claim is checked against.
+    expect(row[12]).toBe("5");
+    // The order signature `claim` will carry — and nothing else signed.
+    expect(hexOf(row[13])).toBe(body.signature);
+    expect(row).toHaveLength(14);
+    // `posted_block` and `as_of_block` are the index cursor at acceptance.
+    expect(heldText[0]).toMatch(/at\.block, at\.block/);
+    expect(heldText[0]).toMatch(/SELECT block_number FROM cursor WHERE id = 1/);
   });
 
-  it("simulates the exact transaction before spending any gas", async () => {
-    const { app, stub } = harness();
-    const t = terms();
-    const response = await post(app, await signed(t, amountFor()));
-
-    expect(response.statusCode).toBe(201);
-    // Twice for an inline container: the preflight, which runs before the bytes
-    // are filed and so cannot carry the name the store has yet to mint, and the
-    // relay's own, over exactly the bytes that were broadcast.
-    expect(stub.simulated).toHaveLength(2);
-    const broadcast = parseTransaction(stub.broadcasts[0] as Hex);
-    expect(stub.simulated[1]).toBe(broadcast.data);
-
-    // The two differ in the `taskCid` and in nothing else — that is what makes
-    // the preflight a verdict on this transaction rather than on another one.
-    const preflight = decodeFunctionData({ abi: jobRegistryAbi, data: stub.simulated[0] as Hex });
-    const relayed = decodeFunctionData({ abi: jobRegistryAbi, data: broadcast.data as Hex });
-    const [preflightOrder, ...preflightRest] = (preflight.args ?? []) as readonly unknown[];
-    const [relayedOrder, ...relayedRest] = (relayed.args ?? []) as readonly unknown[];
-    expect(preflightRest).toEqual(relayedRest);
-    const relayedTaskCid = (relayedOrder as { taskCid: Hex }).taskCid;
-    expect({ ...(preflightOrder as object), taskCid: relayedTaskCid }).toEqual(relayedOrder);
-    // Non-empty, which is all the contract reads of it, and not a name a store
-    // would mint.
-    expect((preflightOrder as { taskCid: Hex }).taskCid).toBe(cidHex("-"));
-  });
-
-  it("refuses a job_id the index already holds, and relays nothing", async () => {
+  it("refuses a job_id this node already holds, and files nothing", async () => {
     const t = terms();
     const jobId = jobIdFor(owner.address, t.c);
     const { app, stub } = harness({ jobs: new Set([jobId]) });
@@ -1388,72 +1268,12 @@ describe("POST /v1/jobs — relay", () => {
     expect(response.json().error.code).toBe("DuplicateJob");
     expect(response.headers["x-vorq-retryable"]).toBe("false");
     expect(stub.broadcasts).toEqual([]);
-    expect(stub.simulated).toEqual([]);
-  });
-
-  it("holds an order no live ask clears: 202, a row carrying both signatures, nothing relayed", async () => {
-    const held: unknown[][] = [];
-    const { app, stub } = harness({ clearing: [], held }, { gasFee: 5n });
-    const t = terms();
-    const jobId = jobIdFor(owner.address, t.c);
-    const body = await signed(t, amountFor(5n));
-
-    const response = await post(app, body);
-
-    expect(response.statusCode).toBe(202);
-    expect(response.json()).toEqual({ job_id: jobId, task_cid: MINTED_CID });
-    // The chain passed its verdict and the bytes were filed, but no gas was spent.
-    expect(stub.simulated).toHaveLength(1);
-    expect(stub.broadcasts).toEqual([]);
-
-    expect(held).toHaveLength(1);
-    const row = held[0] as unknown[];
-    const hexOf = (value: unknown) => `0x${(value as Buffer).toString("hex")}`;
-    expect(hexOf(row[0])).toBe(jobId);
-    expect(hexOf(row[1])).toBe(owner.address.toLowerCase());
-    expect(row.slice(3, 11)).toEqual(
-      [t.modelId, t.slaSecs, t.designated, t.rateIn, t.rateOut, t.unitsIn, t.unitsOut, t.expiresAt].map(String),
-    );
-    expect((row[11] as Buffer).toString("utf8")).toBe(MINTED_CID);
-    expect(row[12]).toBe("5");
-    expect(hexOf(row[13])).toBe(body.signature);
-    expect(hexOf(row[14])).toBe(body.auth_sig);
+    // Refused before a byte was filed.
+    expect(store.requests).toEqual([]);
   });
 
   it("refuses a second post of a held job_id as the duplicate it is", async () => {
-    const { app, stub } = harness({ clearing: [], heldConflict: true });
-    const t = terms();
-
-    const response = await post(app, await signed(t, amountFor()));
-
-    expect(response.statusCode).toBe(409);
-    expect(response.json().error.code).toBe("DuplicateJob");
-    expect(stub.broadcasts).toEqual([]);
-  });
-
-  it("refuses a wallet past JOB_RATE_LIMIT at the challenge, before it signs a payment", async () => {
-    const { app, stub } = harness({}, {}, { jobRateLimit: 1 });
-    const t = terms();
-
-    expect((await post(app, await signed(t, amountFor()))).statusCode).toBe(201);
-    const response = await post(app, wire(t, await signOrder(t)));
-
-    expect(response.statusCode).toBe(429);
-    expect(response.json().error.type).toBe("rate_limit_exceeded");
-    expect(response.headers["x-vorq-retryable"]).toBe("false");
-    expect(stub.broadcasts).toHaveLength(1);
-  });
-
-  it("does not count a refused post against JOB_RATE_LIMIT", async () => {
-    const t = terms();
-    const { app } = harness({ jobs: new Set([jobIdFor(owner.address, t.c)]) }, {}, { jobRateLimit: 1 });
-
-    expect((await post(app, await signed(t, amountFor()))).statusCode).toBe(409);
-    expect((await post(app, wire(t, await signOrder(t)))).statusCode).toBe(402);
-  });
-
-  it("maps an on-chain DuplicateJob to the same 409 as the index check", async () => {
-    const { app, stub } = harness({}, { simulate: () => ({ kind: "revert", errorName: "DuplicateJob" }) });
+    const { app, stub } = harness({ heldConflict: true });
     const t = terms();
 
     const response = await post(app, await signed(t, amountFor()));
@@ -1464,21 +1284,124 @@ describe("POST /v1/jobs — relay", () => {
   });
 
   /**
-   * The row a reorg can still take away is not evidence the job exists, and
-   * refusing on it would cost the client a fresh `c` — a fresh DEK, a fresh
-   * container and a full re-upload — for a post that never survived. The chain
-   * still gets to refuse: the simulate inside the queue runs before a byte is
-   * pinned and reverts `DuplicateJob` whenever the job is really there.
+   * **One owner's funds decisions run one at a time** (`underOwnerFunds`). Two
+   * orders a balance covers only one of, submitted together, would otherwise
+   * both read the same `available` and both be held — and one of them could
+   * never be claimed.
    */
-  it("relays over a write-through row the indexer has not confirmed yet", async () => {
+  it("holds one of two orders submitted together when the balance covers one", async () => {
+    const held: unknown[][] = [];
+    const { app } = harness(
+      { held, heldDelayMs: 100 },
+      { tokenBalance: { [owner.address.toLowerCase()]: amountFor() } },
+    );
+    const other = containerOf(0xd2, "another sealed prompt envelope");
+    const first = terms();
+    const second = terms({ c: commitmentOf(other) });
+
+    const answers = await Promise.all([
+      post(app, await signed(first, amountFor())),
+      post(app, submission(wire(second, await signOrder(second)), other, amountField(amountFor()))),
+    ]);
+
+    expect(answers.map((res) => res.statusCode).sort()).toEqual([202, 409]);
+    expect(answers.find((res) => res.statusCode === 409)?.json().quote).toMatchObject({ balance: "0" });
+    expect(held).toHaveLength(1);
+  });
+
+  it("lets a withdrawal racing a post leave the balance covering every held order", async () => {
+    // The balance covers the order or the withdrawal, not both. The relayed
+    // withdrawal moves the balance on its broadcast, as the chain would.
+    const holder = owner.address.toLowerCase();
+    const balances = { [holder]: amountFor() };
+    const held: unknown[][] = [];
+    const { app } = harness(
+      { held },
+      {
+        tokenBalance: balances,
+        sendError: () => {
+          balances[holder] -= amountFor();
+          return undefined;
+        },
+      },
+    );
+    const t = terms();
+
+    const [posted, withdrawn] = await Promise.all([
+      post(app, await signed(t, amountFor())),
+      app.inject({
+        method: "POST",
+        url: "/v1/withdrawals",
+        headers: { authorization: `Bearer ${SESSION}` },
+        payload: {
+          owner: owner.address,
+          amount: formatUsd(amountFor(), 6),
+          issued_at: Math.floor(Date.now() / 1000),
+          signature: `0x${"ab".repeat(65)}`,
+        },
+      }),
+    ]);
+
+    // Exactly one of the two drew on the balance, and the other was refused.
+    expect([posted.statusCode === 202, withdrawn.statusCode === 200].filter(Boolean)).toHaveLength(1);
+    if (posted.statusCode === 202) {
+      expect(withdrawn.json().error.code).toBe("insufficient_balance");
+    } else {
+      expect(posted.json().quote).toMatchObject({ balance: "0" });
+      expect(held).toEqual([]);
+    }
+  });
+
+  it("refuses a wallet past JOB_RATE_LIMIT at the challenge, before it deposits", async () => {
+    const { app } = harness({}, {}, { jobRateLimit: 1 });
+    const t = terms();
+
+    expect((await post(app, await signed(t, amountFor()))).statusCode).toBe(202);
+    const response = await post(app, wire(t, await signOrder(t)));
+
+    expect(response.statusCode).toBe(429);
+    expect(response.json().error.type).toBe("rate_limit_exceeded");
+    expect(response.headers["x-vorq-retryable"]).toBe("false");
+  });
+
+  it("does not count a refused post against JOB_RATE_LIMIT", async () => {
+    const t = terms();
+    const { app } = harness({ jobs: new Set([jobIdFor(owner.address, t.c)]) }, {}, { jobRateLimit: 1 });
+
+    expect((await post(app, await signed(t, amountFor()))).statusCode).toBe(409);
+    expect((await post(app, wire(t, await signOrder(t)))).statusCode).toBe(402);
+  });
+
+  /**
+   * An id the chain has a row for is spent even when this node holds none — an
+   * owner's own on-chain `cancel`, or a claim relayed by another coordinator.
+   * `getJob` is the second half of the duplicate check, after the row.
+   */
+  it("refuses a job_id the chain already has, though this node holds no row for it", async () => {
     const t = terms();
     const jobId = jobIdFor(owner.address, t.c);
-    const { app, stub } = harness({ unconfirmedJobs: new Set([jobId]) });
+    const held: unknown[][] = [];
+    const { app, stub } = harness({ held }, { onChain: new Set([jobId]) });
 
     const response = await post(app, await signed(t, amountFor()));
 
-    expect(response.statusCode, JSON.stringify(response.json())).toBe(201);
-    expect(stub.broadcasts).toHaveLength(1);
+    expect(response.statusCode).toBe(409);
+    expect(response.json().error.code).toBe("DuplicateJob");
+    expect(held).toEqual([]);
+    expect(store.requests).toEqual([]);
+    expect(stub.broadcasts).toEqual([]);
+  });
+
+  it("asks the chain only once the row has said nothing", async () => {
+    // The row is free and it is where every order this node accepted lives; a
+    // hit there must not spend a `getJob`, whose calldata is the only chain call
+    // that carries the job id.
+    const t = terms();
+    const jobId = jobIdFor(owner.address, t.c);
+    const { app, stub } = harness({ jobs: new Set([jobId]) });
+
+    expect((await post(app, await signed(t, amountFor()))).statusCode).toBe(409);
+    expect(stub.requests.some((r) => JSON.stringify(r.params).includes(jobId.slice(2)))).toBe(false);
   });
 
   it("answers the byte-identical 409 whichever side noticed the duplicate", async () => {
@@ -1491,18 +1414,14 @@ describe("POST /v1/jobs — relay", () => {
     const body = await signed(t, amountFor());
 
     const fromIndex = await post(harness({ jobs: new Set([jobId]) }).app, body);
-    const fromChain = await post(
-      harness({}, { simulate: () => ({ kind: "revert", errorName: "DuplicateJob" }) }).app,
-      body,
-    );
+    const fromChain = await post(harness({}, { onChain: new Set([jobId]) }).app, body);
 
     expect(fromIndex.statusCode).toBe(fromChain.statusCode);
     expect(fromIndex.json()).toEqual(fromChain.json());
     expect(fromIndex.headers["x-vorq-retryable"]).toBe(fromChain.headers["x-vorq-retryable"]);
-    // And the shared body is the one the contract's own error name produces.
     expect(fromIndex.json()).toEqual({
       error: {
-        message: "the chain refused this transaction: DuplicateJob",
+        message: "this job_id is already taken: sign a new order with a fresh c",
         type: "invalid_request_error",
         param: "job_id",
         code: "DuplicateJob",
@@ -1669,12 +1588,12 @@ describe("POST /v1/jobs — relay", () => {
     expect(response.json().error.param).toBe("expires_at");
   });
 
-  it("answers 409 with a fresh quote when gasFee drifts, and relays nothing", async () => {
+  it("answers 409 with a fresh quote when gasFee drifts, and holds nothing", async () => {
     const { app, stub, setGasFee } = harness({}, { gasFee: 5n });
     const t = terms();
     const body = await signed(t, amountFor(5n));
 
-    // The quote the client signed said 5; the chain now says 9.
+    // The quote the client accepted said 5; the chain now says 9.
     setGasFee(9n);
     const response = await post(app, body);
 
@@ -1687,23 +1606,18 @@ describe("POST /v1/jobs — relay", () => {
         gas_fee: "0.000009",
         // 210 + 2 + 9, the fresh gas fee
         amount: "0.000221",
-        authorization: {
-          domain: { name: "USDC", version: "2", chainId, verifyingContract: usdc },
-          to: jobRegistry,
-          value: 221,
-          valid_after: 0,
-          valid_before: Number(t.expiresAt + 1n),
-          nonce: jobIdFor(owner.address, t.c),
-        },
+        balance: "1000",
+        deposit: "0",
+        deposit_fee: "0.002",
       },
       candidates: [],
       accepts: [{ scheme: "eip3009", network: `eip155:${chainId}` }],
     });
     expect(stub.broadcasts).toEqual([]);
-    expect(stub.simulated).toEqual([]);
+    expect(store.requests).toEqual([]);
   });
 
-  it("answers 409 when the signed amount leaves the protocol fee out", async () => {
+  it("answers 409 when the amount leaves the protocol fee out", async () => {
     const { app, stub } = harness({}, { gasFee: 5n, feeBps: 250 });
     const t = terms();
     const response = await post(app, await signed(t, 215n)); // cap + gas fee, no fee
@@ -1725,7 +1639,7 @@ describe("POST /v1/jobs — relay", () => {
     const { app, stub, setGasFee } = harness({}, { gasFee: 5n });
     const t = terms();
 
-    // The quote populates the cell; the TTL is 60 s, so without a bust the relay
+    // The quote populates the cell; the TTL is 60 s, so without a bust the submission
     // would read 5 from memory and never see the drift.
     const quote = await post(app, wire(t, await signOrder(t)));
     expect(quote.json().quote.gas_fee).toBe("0.000005");
@@ -1738,7 +1652,7 @@ describe("POST /v1/jobs — relay", () => {
     expect(stub.broadcasts).toEqual([]);
   });
 
-  it("relays when the echoed amount still matches the current gasFee", async () => {
+  it("holds when the echoed amount still matches the current gasFee", async () => {
     const { app, stub, setGasFee } = harness({}, { gasFee: 5n });
     const t = terms();
     const body = await signed(t, amountFor(5n));
@@ -1746,28 +1660,12 @@ describe("POST /v1/jobs — relay", () => {
 
     const response = await post(app, body);
 
-    expect(response.statusCode).toBe(201);
-    expect(stub.broadcasts).toHaveLength(1);
-  });
-
-  it("reports a refused broadcast as a retryable relay failure, not a verdict (R70)", async () => {
-    const { app, stub } = harness(
-      {},
-      { sendError: () => refusedBroadcast("insufficient funds for gas * price + value") },
-    );
-    const t = terms();
-
-    const response = await post(app, await signed(t, amountFor()));
-
-    expect(response.statusCode).toBe(503);
-    expect(response.json().error.type).toBe("relay_unavailable");
-    expect(response.json().error.code).toBe("relayer_funds");
-    expect(response.headers["x-vorq-retryable"]).toBe("true");
+    expect(response.statusCode).toBe(202);
     expect(stub.broadcasts).toEqual([]);
   });
 
   it("reports a dead endpoint on the config reads as retryable, never as a 500 (R72)", async () => {
-    // The payment path's first chain call is `allowedSla`, so this is the test
+    // The submission's first chain call is `allowedSla`, so this is the test
     // of the config-read wrapper: unwrapped, it answers `500 internal_error,
     // retryable=false` — a third answer to a cause this door already answers
     // correctly twice.
@@ -1799,7 +1697,7 @@ describe("POST /v1/jobs — relay", () => {
     // may not be `400 invalid_request`: `allowedSla` reverts when the node's
     // `job_registry` address points at some other contract, or when the endpoint
     // reports unavailable historical state as a revert, and in both cases every
-    // caller of a perfectly well-formed post would be told, non-retryably and
+    // caller of a perfectly well-formed submission would be told, non-retryably and
     // with no field named, that its own request is malformed.
     const { app, stub } = harness({}, { callError: () => refusedCall("execution reverted", 3, "0x") });
     const t = terms();
@@ -1816,48 +1714,30 @@ describe("POST /v1/jobs — relay", () => {
     expect(stub.broadcasts).toEqual([]);
   });
 
-  it("reports a verdict at the broadcast as the same 409 as a verdict at the simulate", async () => {
-    // One door must not hold two mappings for one cause: a revert that reaches
-    // the send stage is still the chain pronouncing, and answering it `400`
-    // there while the simulate two lines above answers `409` tells a client two
-    // different things about the same refusal.
-    const { app } = harness({}, { sendError: () => refusedBroadcast("execution reverted", 3) });
-    const t = terms();
-
-    const response = await post(app, await signed(t, amountFor()));
-
-    expect(response.statusCode).toBe(409);
-    expect(response.json().error.code).toBe("unknown");
-    expect(response.headers["x-vorq-retryable"]).toBe("false");
-  });
-
-  it("serialises concurrent posts of one job_id, so the loser is refused for free", async () => {
-    // The discriminator is the **broadcast**, not the call count: a simulate
-    // that flipped on its own second invocation would answer `[201, 409]` with
-    // the queue deleted, because the two simulates are ordered by the stub
-    // whatever the node does. Keyed on `broadcasts.length`, the chain the second
-    // post meets is the one the first *landed* — so with no queue both simulate
-    // before either broadcasts, both pass, and the tuple goes `[201, 201]` with
-    // two broadcasts (R65, R67).
-    let harnessRef: StubChain | undefined;
-    const { app, stub } = harness(
-      {},
-      {
-        simulate: () =>
-          (harnessRef as StubChain).broadcasts.length === 0
-            ? { kind: "ok" }
-            : { kind: "revert", errorName: "DuplicateJob" },
-      },
-    );
-    harnessRef = stub;
+  it("serialises concurrent posts of one job_id, so the loser files nothing", async () => {
+    // The discriminator is the **store**, not the status pair: without the queue
+    // both posts pass the duplicate check before either is held, both file the
+    // container, and the held insert's own conflict refuses the second only after
+    // its bytes were stored. Behind the queue the second finds the first's row
+    // and is refused before it files anything — so the pair costs exactly the
+    // store requests one post costs (R65, R67).
     const t = terms();
     const body = await signed(t, amountFor());
 
+    const alone = harness();
+    expect((await post(alone.app, body)).statusCode).toBe(202);
+    const onePost = store.requests.length;
+    store.requests.length = 0;
+    store.objects.clear();
+
+    const held: unknown[][] = [];
+    const { app, stub } = harness({ held });
     const [first, second] = await Promise.all([post(app, body), post(app, body)]);
 
-    expect([first.statusCode, second.statusCode].sort()).toEqual([201, 409]);
-    // One broadcast, not two: the loser never reached the send stage.
-    expect(stub.broadcasts).toHaveLength(1);
+    expect([first.statusCode, second.statusCode].sort()).toEqual([202, 409]);
+    expect([first, second].find((r) => r.statusCode === 409)?.json().error.code).toBe("DuplicateJob");
+    expect(held).toHaveLength(1);
+    expect(store.requests).toHaveLength(onePost);
     // And the stub really did have both requests in flight at once — without
     // this the ordering above could be the harness's doing (R65).
     expect(stub.maxInFlight).toBeGreaterThan(1);
@@ -1880,153 +1760,6 @@ describe("POST /v1/jobs — relay", () => {
 });
 
 // ---------------------------------------------------------------------------
-// Write-through
-// ---------------------------------------------------------------------------
-
-/**
- * The job's row, written from the post's own receipt before the `201`.
- *
- * This is what lets `GET /v1/jobs/{id}` answer a client's first poll without
- * asking the chain: the indexer reaches the receipt's block a poll later, and
- * this door answers off the receipt.
- */
-describe("POST /v1/jobs — write-through", () => {
-  const paid = async (t: Terms) =>
-    submission(wire(t, await signOrder(t)), CONTAINER, {
-      auth_sig: await signAuthorization(jobIdFor(owner.address, t.c), amountFor(), t.expiresAt),
-      amount: formatUsd(amountFor(), 6),
-    });
-
-  /** The registry's `Posted` for `t`, as the receipt carries it. */
-  const postedLog = (t: Terms, address: Address = jobRegistry) => {
-    const args: Record<string, unknown> = {
-      jobId: jobIdFor(owner.address, t.c),
-      modelId: Number(t.modelId),
-      designated: Number(t.designated),
-      owner: owner.address,
-      c: t.c,
-      expiresAt: t.expiresAt,
-      slaSecs: Number(t.slaSecs),
-      rateIn: t.rateIn,
-      rateOut: t.rateOut,
-      unitsIn: Number(t.unitsIn),
-      unitsOut: Number(t.unitsOut),
-      gasFee: 0n,
-      taskCid: cidHex(MINTED_CID),
-    };
-    // Off the vendored ABI, so the log is the one the contract really emits.
-    const event = (jobRegistryAbi as Abi).find(
-      (item): item is AbiEvent => item.type === "event" && item.name === "Posted",
-    ) as AbiEvent;
-    const topics = encodeEventTopics({ abi: jobRegistryAbi, eventName: "Posted", args });
-    const body = event.inputs.filter((input) => !input.indexed);
-    const data = encodeAbiParameters(body, body.map((input) => args[input.name as string]));
-    return {
-      address,
-      topics,
-      data,
-      blockNumber: "0x3e8",
-      blockHash: `0x${"ab".repeat(32)}`,
-      transactionHash: stubTxHash(1),
-      transactionIndex: "0x0",
-      logIndex: "0x0",
-      removed: false,
-    };
-  };
-
-  it("commits the job's row from the receipt before it answers 201", async () => {
-    const written: unknown[][] = [];
-    const t = terms();
-    const { app } = harness({ written }, { receiptLogs: () => [postedLog(t)] });
-    // **The ordering is the whole point**, so it is what the assertion reads: the
-    // client's first poll lands milliseconds after this body goes out, and a hook
-    // that ran after `send` — or was left un-awaited — would leave the row
-    // uncommitted at exactly that moment. Counted at `onSend`, a write that
-    // happens afterwards reads as zero here.
-    let rowsAtSend = -1;
-    app.addHook("onSend", async () => {
-      rowsAtSend = written.length;
-    });
-
-    const response = await post(app, await paid(t));
-
-    expect(response.statusCode).toBe(201);
-    expect(rowsAtSend).toBe(1);
-    // At the receipt's own block (the stub mines everything at 1000), which is
-    // what the indexed log will say too.
-    expect(written).toEqual([[jobIdFor(owner.address, t.c), 1000n]]);
-  });
-
-  it("writes nothing from a Posted another contract emitted", async () => {
-    const written: unknown[][] = [];
-    const t = terms();
-    const { app } = harness(
-      { written },
-      { receiptLogs: () => [postedLog(t, "0x9999999999999999999999999999999999999999")] },
-    );
-
-    const response = await post(app, await paid(t));
-
-    expect(response.statusCode).toBe(201);
-    expect(written).toEqual([]);
-  });
-
-  it("still answers 201 when the write fails: the transaction mined either way", async () => {
-    const t = terms();
-    const { app } = harness(
-      { writeError: new Error("database gone") },
-      { receiptLogs: () => [postedLog(t)] },
-    );
-
-    const response = await post(app, await paid(t));
-
-    expect(response.statusCode).toBe(201);
-    expect(response.json().job_id).toBe(jobIdFor(owner.address, t.c));
-  });
-
-  /**
-   * The one post that writes no row. Nothing repairs it here on purpose: the
-   * transaction is on the wire, the caller is told not to re-send it, and the
-   * indexer writes the row when it reaches that block like it always has.
-   */
-  it("writes nothing when the receipt never arrives, and answers the non-retryable 504", async () => {
-    const written: unknown[][] = [];
-    const t = terms();
-    const { app, stub } = harness({ written }, { receiptMissing: true });
-    const body = await paid(t);
-
-    // Only the timers are faked, and the clock is stepped with a real `setImmediate`
-    // between steps: the pin ahead of the relay is loopback I/O, so the receipt
-    // wait's 60 s timer does not exist yet when the request starts.
-    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "setInterval", "clearInterval"] });
-    let response;
-    try {
-      let settled = false;
-      const inFlight = post(app, body).finally(() => {
-        settled = true;
-      });
-      for (let step = 0; step < 200 && !settled; step++) {
-        await vi.advanceTimersByTimeAsync(1_000);
-        await new Promise((resolve) => setImmediate(resolve));
-      }
-      response = await inFlight;
-    } finally {
-      vi.useRealTimers();
-    }
-
-    expect(response.statusCode).toBe(504);
-    expect(response.headers["x-vorq-retryable"]).toBe("false");
-    expect(response.json().error.type).toBe("receipt_timeout");
-    expect(stub.broadcasts).toHaveLength(1);
-    expect(written).toEqual([]);
-  });
-});
-
-// ---------------------------------------------------------------------------
-// Cancel
-// ---------------------------------------------------------------------------
-
-// ---------------------------------------------------------------------------
 // The container: inline, and by name
 // ---------------------------------------------------------------------------
 
@@ -2044,31 +1777,31 @@ describe("POST /v1/jobs — the container", () => {
     container: Buffer | null,
     extra: Record<string, unknown> = {},
   ): Promise<Record<string, unknown>> => ({
-    ...submission(wire(t, await signOrder(t)), container, {
-      auth_sig: await signAuthorization(jobIdFor(owner.address, t.c), amountFor(), t.expiresAt),
-      amount: formatUsd(amountFor(), 6),
-    }),
+    ...submission(wire(t, await signOrder(t)), container, amountField(amountFor())),
     ...extra,
   });
 
-  it("files a container past one part and relays the name the store minted", async () => {
-    const { app, stub } = harness({}, {}, { partBytes: SMALL_PART });
+  it("files a container past one part and holds the name the store minted", async () => {
+    const held: unknown[][] = [];
+    const { app, stub } = harness({ held }, {}, { partBytes: SMALL_PART });
     const t = terms({ c: commitmentOf(BIG) });
 
     const response = await post(app, await paid(t, BIG));
 
-    expect(response.statusCode, JSON.stringify(response.json())).toBe(201);
+    expect(response.statusCode, JSON.stringify(response.json())).toBe(202);
     expect(response.json().task_cid).toBe(externallyMintedCid(BIG));
     // It went past the seam rather than landing in one put.
     expect(store.requests.filter((r) => r.url.includes("partNumber=")).length).toBeGreaterThan(1);
     expect([...store.objects.values()].some((object) => object.equals(BIG))).toBe(true);
-    expect(stub.broadcasts).toHaveLength(1);
+    expect(((held[0] as unknown[])[11] as Buffer).toString("utf8")).toBe(externallyMintedCid(BIG));
+    expect(stub.broadcasts).toEqual([]);
   });
 
   it("answers a store that refuses a part as the retryable 503 a failed completion gets", async () => {
     // A refusal mid-put is a store failure like any other and must not surface
     // as a `500` the client reads as "never retry".
-    const { app, stub } = harness({}, {}, { partBytes: SMALL_PART });
+    const held: unknown[][] = [];
+    const { app } = harness({ held }, {}, { partBytes: SMALL_PART });
     const t = terms({ c: commitmentOf(BIG) });
     store.failPartNumber = 2;
     try {
@@ -2077,39 +1810,35 @@ describe("POST /v1/jobs — the container", () => {
       expect(response.statusCode).toBe(503);
       expect(response.json().error.type).toBe("pinner_unavailable");
       expect(response.headers["x-vorq-retryable"]).toBe("true");
-      // The preflight is ahead of the pin, so it ran; the relay's own never did,
-      // and nothing was broadcast.
-      expect(stub.simulated).toHaveLength(1);
-      expect(stub.broadcasts).toEqual([]);
+      // A failed pin holds nothing.
+      expect(held).toEqual([]);
       expect(store.uploads.size).toBe(0);
     } finally {
       store.failPartNumber = null;
     }
   });
 
-  it("files nothing for an order the chain refuses, and answers as the relay would", async () => {
-    // The whole point of the preflight. Without it, any keypair that can sign an
-    // order and an authorization but holds no funds makes this node store the megabytes
-    // its body carried and hold them for the file retention — the refusal only
-    // arrives at the relay, one put too late.
+  it("files nothing for an order the balance cannot cover, inline or by cid", async () => {
+    // Without the balance check ahead of the bytes, any keypair that can sign an
+    // order but holds no balance makes this node store the megabytes its body
+    // carried and hold them for the file retention.
     //
-    // Driven by posting the same refused order both ways: inline, where the pin
+    // Driven by posting the same short order both ways: inline, where the pin
     // must not happen, and by cid, where the **attach** must not happen. The
     // upload-first path is the one the 300 s orphan window does not save: an
     // attach grants the full retention, so a refused order that reached it has
     // bought 30 days of storage for free. The two answers must also be the same
     // response.
-    const refusing = { simulate: () => ({ kind: "revert" as const, errorName: "TransferFailed" }) };
+    const short = { tokenBalance: { [owner.address.toLowerCase()]: 0n } };
     const t = terms({ c: commitmentOf(BIG) });
 
-    const { app, stub } = harness({}, refusing);
+    const { app, stub } = harness({}, short);
     const inline = await post(app, await paid(t, BIG));
 
     expect(inline.statusCode).toBe(409);
-    expect(inline.json().error.code).toBe("TransferFailed");
+    expect(inline.json().quote.deposit).toBe("0.002212");
     expect(inline.headers["x-vorq-retryable"]).toBe("false");
-    // Not one request reached the store, so not one object is held: this is the
-    // assertion the preflight exists for.
+    // Not one request reached the store, so not one object is held.
     expect(store.requests).toEqual([]);
     expect(store.objects.size).toBe(0);
     expect(stub.broadcasts).toEqual([]);
@@ -2128,7 +1857,7 @@ describe("POST /v1/jobs — the container", () => {
       ],
     ]);
     const byCid = await post(
-      harness({ uploads, attached }, refusing).app,
+      harness({ uploads, attached }, short).app,
       await paid(t, null, { container_cid: UPLOAD_CID }),
     );
 
@@ -2141,21 +1870,17 @@ describe("POST /v1/jobs — the container", () => {
     expect(uploads.get(UPLOAD_CID)?.expiresAt).toBe(UPLOADED_AT + 300);
   });
 
-  it("refuses a bad authorization before a byte of the container is filed", async () => {
-    const { app, stub } = harness();
-    const t = terms();
-    const body = submission(wire(t, await signOrder(t)), BIG, {
-      auth_sig: await signAuthorization(jobIdFor(owner.address, t.c), 210n, t.expiresAt, stranger),
-      amount: "0.00021",
-    });
+  it("refuses a bad order signature before a byte of the container is filed", async () => {
+    const { app } = harness();
+    const t = terms({ c: commitmentOf(BIG) });
+    const body = submission(wire(t, await signOrder(t, stranger)), BIG, amountField(amountFor()));
 
     const response = await post(app, body);
 
     expect(response.statusCode).toBe(400);
-    expect(response.json().error.code).toBe("invalid_payment_signature");
+    expect(response.json().error.code).toBe("invalid_order_signature");
     // Not one request reached the store: the bytes were never filed.
     expect(store.requests).toEqual([]);
-    expect(stub.simulated).toEqual([]);
   });
 
   it("refuses a body that names both a container and a container_cid", async () => {
@@ -2169,7 +1894,7 @@ describe("POST /v1/jobs — the container", () => {
     expect(response.statusCode).toBe(400);
     expect(response.json().error.code).toBe("container_ambiguous");
     expect(store.requests).toEqual([]);
-    expect(stub.simulated).toEqual([]);
+    expect(stub.broadcasts).toEqual([]);
   });
 
   /**
@@ -2179,7 +1904,7 @@ describe("POST /v1/jobs — the container", () => {
    * path files nothing and reads no object back. What stands in for hashing them
    * is `files.commitment`, which `POST /v1/files` computed while they streamed
    * past it, and the upload is moved off its 300 s orphan window in the same
-   * breath as the relay.
+   * breath as the hold.
    */
   describe("by cid", () => {
     const uploaded = (upload: Partial<Upload> = {}): Map<string, Upload> =>
@@ -2202,18 +1927,20 @@ describe("POST /v1/jobs — the container", () => {
       return paid(t, null, { container_cid: cid });
     };
 
-    it("relays the uploaded cid as task_cid, attaches the file, and files nothing", async () => {
+    it("holds the uploaded cid as task_cid, attaches the file, and files nothing", async () => {
       const attached: unknown[][] = [];
+      const held: unknown[][] = [];
       const uploads = uploaded();
-      const { app, stub } = harness({ uploads, attached });
+      const { app, stub } = harness({ uploads, attached, held });
 
       const response = await post(app, await byCid());
 
-      expect(response.statusCode, JSON.stringify(response.json())).toBe(201);
+      expect(response.statusCode, JSON.stringify(response.json())).toBe(202);
       expect(response.json().task_cid).toBe(UPLOAD_CID);
-      // The name on chain is the upload's, not one minted for a second copy.
-      const call = broadcastCall(stub.broadcasts[0] as string);
-      expect((call.args?.[0] as { taskCid: Hex }).taskCid).toBe(cidHex(UPLOAD_CID));
+      // The name `claim` will put on chain is the upload's, not one minted for a
+      // second copy.
+      expect(((held[0] as unknown[])[11] as Buffer).toString("utf8")).toBe(UPLOAD_CID);
+      expect(stub.broadcasts).toEqual([]);
       // Nothing was written to the store: no second copy of bytes the client
       // already paid to upload.
       expect(store.requests).toEqual([]);
@@ -2249,7 +1976,6 @@ describe("POST /v1/jobs — the container", () => {
           code: "unknown_container",
         });
         expect(stub.broadcasts).toEqual([]);
-        expect(stub.simulated).toEqual([]);
       }
     });
 
@@ -2269,21 +1995,19 @@ describe("POST /v1/jobs — the container", () => {
       expect(stub.broadcasts).toEqual([]);
     });
 
-    it("relays nothing when the sweep deletes the upload between the lookup and the attach", async () => {
+    it("holds nothing when the sweep deletes the upload between the lookup and the attach", async () => {
       // `attachFile` answers `false` when it updated no row, which is the 300 s
       // window closing on a file the door is in the middle of referencing. The
-      // fail-open mutation is ignoring that answer: the node then relays a job
+      // fail-open mutation is ignoring that answer: the node then holds an order
       // whose `task_cid` names an object it has just deleted.
-      const { app, stub } = harness({ uploads: uploaded(), swept: new Set([UPLOAD_CID]) });
+      const held: unknown[][] = [];
+      const { app } = harness({ uploads: uploaded(), swept: new Set([UPLOAD_CID]), held });
 
       const response = await post(app, await byCid());
 
       expect(response.statusCode).toBe(400);
       expect(response.json().error.code).toBe("unknown_container");
-      expect(stub.broadcasts).toEqual([]);
-      // The preflight is ahead of the attach on this path too, so it ran; the
-      // relay's own simulate never did.
-      expect(stub.simulated).toHaveLength(1);
+      expect(held).toEqual([]);
     });
 
     it("refuses a container_cid longer than a name this node could have minted", async () => {
@@ -2321,90 +2045,103 @@ describe("POST /v1/jobs/{id}/cancel", () => {
     });
 
   const now = () => BigInt(Math.floor(Date.now() / 1000));
-
-  it("relays cancel and answers 200 with the same shape as post (R16)", async () => {
-    const { app, stub } = harness();
-    const jobId = jobIdFor(owner.address, C);
+  const jobId = jobIdFor(owner.address, C);
+  const mine = { owner: Buffer.from(owner.address.slice(2), "hex") };
+  const signedNow = async () => {
     const issuedAt = now();
+    return { issued_at: Number(issuedAt), signature: await signCancel(jobId, issuedAt) };
+  };
 
-    const response = await cancel(app, jobId, {
-      issued_at: Number(issuedAt),
-      signature: await signCancel(jobId, issuedAt),
-    });
-
-    expect(response.statusCode).toBe(200);
-    expect(response.json()).toEqual({ job_id: jobId, tx_hash: stubTxHash(1) });
-
-    const call = broadcastCall(stub.broadcasts[0] as string);
-    expect(call.functionName).toBe("cancel");
-    expect(call.args?.[0]).toBe(jobId);
-    expect(call.args?.[1]).toBe(issuedAt);
-  });
-
-  it("cancels a held order in the row, relaying nothing", async () => {
+  it("ends an open order in its row and answers 200 with the post's job_id (R16), relaying nothing", async () => {
     const heldCancelled: unknown[][] = [];
-    const jobId = jobIdFor(owner.address, C);
-    const { app, stub } = harness({
-      heldOwner: Buffer.from(owner.address.slice(2), "hex"),
-      heldCancelled,
-    });
-    const issuedAt = now();
+    const leasesDropped: unknown[][] = [];
+    const { app, stub } = harness({ cancelRow: mine, heldCancelled, leasesDropped });
 
-    const response = await cancel(app, jobId, {
-      issued_at: Number(issuedAt),
-      signature: await signCancel(jobId, issuedAt),
-    });
+    const response = await cancel(app, jobId, await signedNow());
 
     expect(response.statusCode).toBe(200);
     expect(response.json()).toEqual({ job_id: jobId });
     expect(heldCancelled).toHaveLength(1);
+    expect(`0x${((heldCancelled[0] as unknown[])[0] as Buffer).toString("hex")}`).toBe(jobId);
+    expect(leasesDropped).toHaveLength(1);
+    // One view read — `getJob`, under the row's lock — and no transaction.
+    expect(ethCalls(stub)).toHaveLength(1);
     expect(stub.simulated).toEqual([]);
     expect(stub.broadcasts).toEqual([]);
   });
 
-  it("sends the cancel of a leased held order to the chain: a poll is posting it", async () => {
-    const heldCancelled: unknown[][] = [];
-    const jobId = jobIdFor(owner.address, C);
-    const { app, stub } = harness({
-      heldOwner: Buffer.from(owner.address.slice(2), "hex"),
-      heldLeased: true,
-      heldCancelled,
-    });
-    const issuedAt = now();
+  it("answers 404 for an id this node holds no order under", async () => {
+    const { app, stub } = harness();
 
-    const response = await cancel(app, jobId, {
-      issued_at: Number(issuedAt),
-      signature: await signCancel(jobId, issuedAt),
-    });
+    const response = await cancel(app, jobId, await signedNow());
 
-    expect(response.statusCode).toBe(200);
-    expect(heldCancelled).toEqual([]);
-    expect(broadcastCall(stub.broadcasts[0] as string).functionName).toBe("cancel");
+    expect(response.statusCode).toBe(404);
+    expect(response.json().error.type).toBe("not_found");
+    expect(stub.broadcasts).toEqual([]);
   });
 
-  it("refuses to cancel a held order for anyone but its owner", async () => {
+  it("refuses to cancel an order for anyone but its owner", async () => {
     const heldCancelled: unknown[][] = [];
-    const jobId = jobIdFor(owner.address, C);
     const { app, stub } = harness({
-      heldOwner: Buffer.from(stranger.address.slice(2), "hex"),
+      cancelRow: { owner: Buffer.from(stranger.address.slice(2), "hex") },
       heldCancelled,
     });
-    const issuedAt = now();
 
-    const response = await cancel(app, jobId, {
-      issued_at: Number(issuedAt),
-      signature: await signCancel(jobId, issuedAt),
-    });
+    const response = await cancel(app, jobId, await signedNow());
 
     expect(response.statusCode).toBe(409);
     expect(response.json().error.code).toBe("NotTheOwner");
+    expect(response.json().error.param).toBe("signature");
     expect(heldCancelled).toEqual([]);
     expect(stub.broadcasts).toEqual([]);
   });
 
+  it.each([
+    ["claimed", { state: 1, held: true }],
+    ["already cancelled", { state: 3, held: true }],
+    ["indexed from the chain", { state: 1, held: false }],
+  ])("refuses an order that is %s as NotOpen", async (_, row) => {
+    const heldCancelled: unknown[][] = [];
+    const { app } = harness({ cancelRow: { ...mine, ...row }, heldCancelled });
+
+    const response = await cancel(app, jobId, await signedNow());
+
+    expect(response.statusCode).toBe(409);
+    expect(response.json().error.code).toBe("NotOpen");
+    expect(response.headers["x-vorq-retryable"]).toBe("false");
+    expect(heldCancelled).toEqual([]);
+  });
+
+  it("refuses a leased order: its claim may be in flight, and the row is not ended under it", async () => {
+    const heldCancelled: unknown[][] = [];
+    const { app, stub } = harness({ cancelRow: mine, heldLeased: true, heldCancelled });
+
+    const response = await cancel(app, jobId, await signedNow());
+
+    expect(response.statusCode).toBe(409);
+    expect(response.json().error.code).toBe("order_leased");
+    expect(heldCancelled).toEqual([]);
+    // Decided on the lease alone: the chain was not asked.
+    expect(ethCalls(stub)).toEqual([]);
+  });
+
+  it("refuses an order the chain already has: a claim landed past its lease", async () => {
+    // The row still reads open — the indexer has not reached the claim — and no
+    // lease is live, but `getJob` has the row. Ending ours under it would tell
+    // the client a claimed job was cancelled.
+    const heldCancelled: unknown[][] = [];
+    const { app } = harness({ cancelRow: mine, heldCancelled }, { onChain: new Set([jobId]) });
+
+    const response = await cancel(app, jobId, await signedNow());
+
+    expect(response.statusCode).toBe(409);
+    expect(response.json().error.code).toBe("NotOpen");
+    expect(heldCancelled).toEqual([]);
+  });
+
   it("refuses an issued_at outside the ±600 s job-op window (R24, R33)", async () => {
-    const { app, stub } = harness();
-    const jobId = jobIdFor(owner.address, C);
+    const heldCancelled: unknown[][] = [];
+    const { app, stub } = harness({ cancelRow: mine, heldCancelled });
     const issuedAt = now() - 601n;
 
     const response = await cancel(app, jobId, {
@@ -2414,22 +2151,21 @@ describe("POST /v1/jobs/{id}/cancel", () => {
 
     expect(response.statusCode).toBe(409);
     expect(response.json().error.code).toBe("StaleOp");
-    expect(stub.broadcasts).toEqual([]);
+    expect(heldCancelled).toEqual([]);
+    expect(stub.requests).toEqual([]);
   });
 
   /**
    * The ±600 s window, probed **at** both edges (R78).
    *
    * The test above probes `now - 601`, one past the edge. The window is
-   * inclusive on both sides — `JobRegistry.sol:553` refuses only
-   * `issuedAt + 600 < now` and `issuedAt > now + 600` — and this is the second
-   * place the node restates the contract's own comparison, so an off-by-one here
-   * refuses a cancel the chain would have accepted. 600 is written out from that
-   * source rather than imported.
+   * inclusive on both sides — the contract's `_freshJobOp` refuses only
+   * `issuedAt + 600 < now` and `issuedAt > now + 600` — and the node restates
+   * that comparison, so an off-by-one here refuses a cancel the owner signed
+   * inside it. 600 is written out from that source rather than imported.
    */
   it("admits an issued_at exactly at the lower ±600 s edge", async () => {
-    const { app, stub } = harness();
-    const jobId = jobIdFor(owner.address, C);
+    const { app } = harness({ cancelRow: mine });
     const at = now();
     const issuedAt = at - 600n;
     const body = { issued_at: Number(issuedAt), signature: await signCancel(jobId, issuedAt) };
@@ -2437,12 +2173,10 @@ describe("POST /v1/jobs/{id}/cancel", () => {
     const response = await atSecond(at, () => cancel(app, jobId, body));
 
     expect(response.statusCode).toBe(200);
-    expect(stub.broadcasts).toHaveLength(1);
   });
 
   it("admits an issued_at exactly at the upper ±600 s edge", async () => {
-    const { app, stub } = harness();
-    const jobId = jobIdFor(owner.address, C);
+    const { app } = harness({ cancelRow: mine });
     const at = now();
     const issuedAt = at + 600n;
     const body = { issued_at: Number(issuedAt), signature: await signCancel(jobId, issuedAt) };
@@ -2450,12 +2184,10 @@ describe("POST /v1/jobs/{id}/cancel", () => {
     const response = await atSecond(at, () => cancel(app, jobId, body));
 
     expect(response.statusCode).toBe(200);
-    expect(stub.broadcasts).toHaveLength(1);
   });
 
   it("refuses a malformed signature without spending an eth_call", async () => {
-    const { app, stub } = harness();
-    const jobId = jobIdFor(owner.address, C);
+    const { app, stub } = harness({ cancelRow: mine });
 
     const response = await cancel(app, jobId, {
       issued_at: Number(now()),
@@ -2464,79 +2196,44 @@ describe("POST /v1/jobs/{id}/cancel", () => {
 
     expect(response.statusCode).toBe(400);
     expect(response.json().error.param).toBe("signature");
-    expect(stub.requests.filter((r) => r.method === "eth_call")).toEqual([]);
-  });
-
-  it("hands the chain's own refusal back as a 409", async () => {
-    const { app, stub } = harness({}, { simulate: () => ({ kind: "revert", errorName: "NotOpen" }) });
-    const jobId = jobIdFor(owner.address, C);
-    const issuedAt = now();
-
-    const response = await cancel(app, jobId, {
-      issued_at: Number(issuedAt),
-      signature: await signCancel(jobId, issuedAt),
-    });
-
-    expect(response.statusCode).toBe(409);
-    expect(response.json().error.code).toBe("NotOpen");
-    expect(stub.broadcasts).toEqual([]);
+    expect(ethCalls(stub)).toEqual([]);
   });
 
   /**
-   * The cancel door makes **no view call at all** — parse, staleness, simulate,
-   * relay — so `callError` here refuses precisely the simulate. That is what
-   * makes these two the tests of the *classification* (R72) rather than of the
-   * config reads: with `isVerdict` deleted from `chainFailure` both answer
-   * `409 {code:"unknown"}`, telling a client the chain refused its cancel when
-   * nothing on the chain ever saw it.
+   * `getJob` is a view read (R77): whatever the endpoint does with it, the
+   * answer is the node's failure and retryable, never a verdict on the cancel —
+   * and the row is not ended on a read that did not complete.
    */
-  it("reports a dead endpoint at the simulate as retryable, never as a verdict (R72)", async () => {
-    const { app, stub } = harness({}, { callError: () => unreachableEndpoint() });
-    const jobId = jobIdFor(owner.address, C);
-    const issuedAt = now();
+  it("reports a dead endpoint at the getJob read as retryable, and ends nothing (R72)", async () => {
+    const heldCancelled: unknown[][] = [];
+    const { app } = harness({ cancelRow: mine, heldCancelled }, { callError: () => unreachableEndpoint() });
 
-    const response = await cancel(app, jobId, {
-      issued_at: Number(issuedAt),
-      signature: await signCancel(jobId, issuedAt),
-    });
+    const response = await cancel(app, jobId, await signedNow());
 
     expect(response.statusCode).toBe(503);
     expect(response.json().error.type).toBe("chain_unreachable");
     expect(response.headers["x-vorq-retryable"]).toBe("true");
-    expect(stub.broadcasts).toEqual([]);
+    expect(heldCancelled).toEqual([]);
   });
 
-  it("reports an endpoint that refuses the simulate as retryable, not as a verdict (R72)", async () => {
-    const { app } = harness({}, { callError: () => refusedCall("txpool is full") });
-    const jobId = jobIdFor(owner.address, C);
-    const issuedAt = now();
+  it("reports an endpoint that refuses the getJob read as retryable, not as a verdict (R72)", async () => {
+    const { app } = harness({ cancelRow: mine }, { callError: () => refusedCall("txpool is full") });
 
-    const response = await cancel(app, jobId, {
-      issued_at: Number(issuedAt),
-      signature: await signCancel(jobId, issuedAt),
-    });
+    const response = await cancel(app, jobId, await signedNow());
 
     expect(response.statusCode).toBe(503);
     expect(response.json().error.type).toBe("relay_unavailable");
     expect(response.headers["x-vorq-retryable"]).toBe("true");
   });
 
-  it("keeps a bare revert on the 409 path — a verdict is the endpoint answering, not raw bytes", async () => {
-    // `revert()` with no reason: code 3, data `0x`. Classifying on the absence
-    // of decodable data would turn every bare `require(false)` into a retryable
-    // 503 a client would retry forever (R72).
-    const { app, stub } = harness({}, { simulate: () => ({ kind: "opaque", data: "0x" }) });
-    const jobId = jobIdFor(owner.address, C);
-    const issuedAt = now();
+  it("reports a getJob the endpoint answered with a revert as 503, never as a verdict (R77)", async () => {
+    const { app } = harness({ cancelRow: mine }, { callError: () => refusedCall("execution reverted", 3, "0x") });
 
-    const response = await cancel(app, jobId, {
-      issued_at: Number(issuedAt),
-      signature: await signCancel(jobId, issuedAt),
-    });
+    const response = await cancel(app, jobId, await signedNow());
 
-    expect(response.statusCode).toBe(409);
-    expect(response.json().error.code).toBe("unknown");
-    expect(stub.broadcasts).toEqual([]);
+    expect(response.statusCode).toBe(503);
+    expect(response.json().error.code).toBe("job_read");
+    expect(response.headers["x-vorq-retryable"]).toBe("true");
   });
 
   it("refuses a malformed job_id in the path", async () => {
@@ -2554,24 +2251,17 @@ describe("POST /v1/jobs/{id}/cancel", () => {
    * The per-route `bodyLimit`, asserted rather than assumed — the sibling of the
    * bound `POST /v1/jobs` carries, on the door that shares its constant.
    *
-   * `MAX_ORDER_ENVELOPE_BYTES` is 8 KiB: a JSON body on these doors is flat
-   * fields and never carries bytes, so the bound is generous for what this door
-   * legitimately takes; what it is actually doing is keeping the door from
-   * inheriting the app-wide 1 MiB. Deleting `{ bodyLimit: MAX_ORDER_ENVELOPE_BYTES }`
-   * at `src/api/routes/post.ts` widens it to that 1 MiB and the padded body
-   * below is **accepted** — the unknown field is ignored and the cancel relays
-   * 200. The `toBeLessThan` states that fail-open direction as an assertion:
-   * this payload is one the app-wide limit would take, so a green 413 can only
-   * be the per-route option still being there.
+   * `MAX_ORDER_ENVELOPE_BYTES` is 8 KiB: a JSON body on this door is flat fields
+   * and never carries bytes. Deleting `{ bodyLimit: MAX_ORDER_ENVELOPE_BYTES }`
+   * at `src/api/routes/post.ts` widens it to the app-wide 1 MiB and the padded
+   * body below is **accepted** — the unknown field is ignored and the cancel
+   * answers 200. The `toBeLessThan` states that fail-open direction as an
+   * assertion: this payload is one the app-wide limit would take, so a green 413
+   * can only be the per-route option still being there.
    */
   it("refuses a body past this door's own limit, not the app-wide one", async () => {
-    const { app, stub } = harness();
-    const jobId = jobIdFor(owner.address, C);
-    const issuedAt = now();
-    const body = {
-      issued_at: Number(issuedAt),
-      signature: await signCancel(jobId, issuedAt),
-    };
+    const { app } = harness({ cancelRow: mine });
+    const body = await signedNow();
 
     // 64 kB of padding over the 8 kB envelope allowance, so this clears
     // `MAX_ORDER_ENVELOPE_BYTES` without the test needing the private constant.
@@ -2594,11 +2284,9 @@ describe("POST /v1/jobs/{id}/cancel", () => {
     // "internal error" for its own oversized body would retry it.
     expect(response.json().error.type).toBe("invalid_request_error");
     expect(response.headers["x-vorq-retryable"]).toBe("false");
-    // Refused before the body was read, so nothing was simulated or relayed.
-    expect(stub.broadcasts).toEqual([]);
 
     // The control, on the same node: the identical body without the padding is
-    // relayed. The refusal above is the size and nothing else.
+    // accepted. The refusal above is the size and nothing else.
     const unpadded = await cancel(app, jobId, body);
     expect(unpadded.statusCode).toBe(200);
   });

@@ -23,7 +23,6 @@ import {
 import { cid } from "../wire.js";
 import { usdParam } from "../usd.js";
 import { formatUsd } from "../../money.js";
-import { publishHeld } from "../../match/held.js";
 import { leaseOpenJobs } from "../../match/lease.js";
 import { upsertPresence } from "../../match/rank.js";
 
@@ -39,7 +38,7 @@ import { upsertPresence } from "../../match/rank.js";
  * **The comparison is the contract's, to the second** (R78, A-D). `JobRegistry`
  * derives an ending only when `block.timestamp > j.expiresAt` (`:526`), and
  * `claim` lets a claim landing *at* `expiresAt` through with a comment saying so
- * (`:242`, which agrees with the payment authorization's `validBefore = expiresAt + 1` at that instant).
+ * (`AlreadyExpired` is strictly past `expiresAt`).
  * So a job whose `expires_at` is exactly now is **still open**. This node said
  * the opposite for one second: `expires_at > now` for Open and
  * `expires_at <= now` for expired, which hid a job the chain would still let a
@@ -221,9 +220,9 @@ const STATE_FILTERS = new Map<JobState, string>([
  * The two orders the listing serves. Both are total (`job_id` breaks every
  * tie), which is what makes offset paging over them stable.
  *
- * `newest` puts an UNKNOWN block first: `posted_block = 0` is a row reconcile
- * inserted ahead of its log — the newest job on the book, not the oldest
- * (see `posted_before` below). `oldest` is the ascending order this route has
+ * `newest` puts an UNKNOWN block first: `posted_block = 0` is an order a node
+ * accepted before it had indexed anything — the newest job on the book, not the
+ * oldest (see `posted_before` below). `oldest` is the ascending order this route has
  * always served, where 0 is first for the same reason.
  */
 const ORDERS = new Map<"oldest" | "newest", string>([
@@ -261,7 +260,8 @@ const EvmJob = Type.Object({
   result_cid: Cid,
   posted_block: Int("0 when not yet known."),
   gas_fee: UsdOut(
-    "The relay gas fee snapshotted at post: the treasury keeps it on every exit of a claimed job.",
+    "The relay gas fee: the one quoted for an open order, the one `claim` locked once claimed. The " +
+      "treasury keeps it on every exit of a claimed job.",
   ),
   fee: UsdOut("The protocol fee settlement took on top of the charge; 0 for a job that did not settle."),
 });
@@ -405,18 +405,17 @@ export function jobRoutes(
     }
 
     /**
-     * Bid age, in the only unit the row actually carries. `posted_block` is
-     * chain data the indexer already stores and this projection already serves,
-     * and the envelope carries `as_of_block` — so age is
+     * Bid age, in the only unit the row actually carries. `posted_block` is the
+     * index cursor when an open order was accepted (the claim's block once it is
+     * claimed), and the envelope carries `as_of_block` — so age is
      * `as_of_block - posted_block` from data already on the wire. Nothing here
      * derives or stores a time, and no column is added. `<=`, so the named block
      * is included: "posted by block N".
      *
      * **{@link POSTING_KNOWN} is not optional here (I9).** `posted_block` is
-     * `DEFAULT 0` and 0 means *unknown*, never *ancient*: `reconcileJob` inserts
-     * a row from `getJob` — which carries no posting block — ahead of the
-     * reducer's `Posted` event, so the column reads 0 on exactly the newest jobs
-     * in the book. Without the guard every reconciled, not-yet-reduced bid
+     * `DEFAULT 0` and 0 means *unknown*, never *ancient*: an order accepted by a
+     * node that had indexed nothing yet reads 0 on exactly the newest jobs in
+     * the book. Without the guard every such bid
      * satisfies *every* `posted_before` bound and is served to an age-filtering
      * caller as maximally old, which is the answer inverted. Excluding it is the
      * right call and costs nothing: a caller asking for old bids is not asking
@@ -449,9 +448,9 @@ export function jobRoutes(
      * else sees those rows on their poll until the lease lapses; the chain
      * still decides every claim.
      *
-     * Some of those jobs are **held orders** — paid orders no live ask cleared
-     * when they arrived, kept as open rows off chain (`match/held.ts`). The
-     * poll posts the ones it leased before it answers.
+     * Every open job is a **held order** — an order this node accepted and no
+     * provider has claimed yet, kept as an open row off chain
+     * (`match/held.ts`). The claim the daemon signs puts it on chain.
      *
      * The same call is the heartbeat: it records the caller's presence for the
      * model — free slots and freshness, never the floors, which are used here
@@ -498,18 +497,6 @@ export function jobRoutes(
           params,
         });
       });
-      // Held orders among those leases go on chain now, so every job this poll
-      // answers is one the caller can claim. A relay that fails drops their
-      // leases and the poll answers the rest; the next poll tries again.
-      try {
-        await publishHeld(
-          { db, chain: deps.chain, jobRegistry: deps.config.addresses.jobRegistry },
-          providerId,
-          BigInt(model),
-        );
-      } catch (error) {
-        request.log.error({ err: error, providerId, model }, "publishing held orders failed");
-      }
       where.push(
         "job_id IN (SELECT job_id FROM job_leases" +
           ` WHERE provider_id = ${bind(providerId.toString())} AND expires_at > now())`,
@@ -625,23 +612,10 @@ export function jobRoutes(
   /**
    * One job from the projection, or a 404. **Never a chain read.**
    *
-   * A miss used to reconcile against `getJob`, to bridge the finality window: a
-   * post answers off the latest receipt while the indexer reaches that block a
-   * poll later.
-   * Both post doors now write the row from that receipt before answering (see
-   * `index/write-through.ts`), so a miss is a job **this node** has no record of:
-   * either nobody posted it, or its row has not been written yet. That also retires the scan concern the chain read carried: a
-   * caller walking random ids costs one indexed `SELECT` each, not two RPC round
-   * trips.
-   *
-   * What that gives up, named rather than implied: a job posted to the registry
-   * by somebody else — a client relaying its own `post`, or a second coordinator
-   * — has no receipt this node ever saw, so it now `404`s until its indexed log
-   * reaches the indexer where the reconcile used to serve it inside that window.
-   * The same holds for the two swallowed write-throughs (`routes/post.ts`,
-   * `batches/worker.ts`) and for a crash between a broadcast and its timeout
-   * marker. Every one of them is a job this node is not the source of truth for,
-   * and the indexer closes all of them.
+   * Every order this node accepts is a row from the moment it is accepted
+   * (`match/held.ts`), so a miss is a job **this node** has no record of. A job
+   * claimed through another coordinator `404`s until its indexed log reaches the
+   * index. A caller walking random ids costs one indexed `SELECT` each.
    */
   async function jobRow(jobId: string): Promise<JobRow> {
     const key = Buffer.from(jobId.slice(2), "hex");
@@ -667,9 +641,9 @@ export function jobRoutes(
     },
     async (request) => {
     const row = await jobRow(request.params.job_id);
-    // Read **after** the row, unlike the listings: a write-through row can sit
-    // past the cursor, and a stamp taken before the read would understate the
-    // freshness of the answer it goes out with.
+    // Read **after** the row, unlike the listings: a row this node wrote itself
+    // can be newer than the cursor, and a stamp taken before the read would
+    // understate the freshness of the answer it goes out with.
     const asOf = await asOfBlock();
     return { ...evmJob(row, decimals), as_of_block: asOf };
     },

@@ -1,5 +1,6 @@
 import { readdirSync, readFileSync } from "node:fs";
 import { Pool, types, type QueryResult, type QueryResultRow } from "pg";
+import { HELD } from "../match/held.js";
 
 /** Anything that can run a statement: the pool itself, or one transaction. */
 export interface Queryable {
@@ -49,14 +50,17 @@ export const SCHEMA_LOCK_KEY = 0x564f5251_5343484dn;
  * handshake to re-obtain, or is advisory and regenerated within one provider
  * poll.
  *
- * The two lists together must name **every** table in `migrations/`: the test that
- * pins this reads the file, and a new table that joins neither list fails it
- * rather than defaulting into one.
+ * `jobs` is in neither list: it is {@link PRUNED}. An order nobody has claimed
+ * exists only in this node's database — `claim` is what puts it on chain — so a
+ * rebuild keeps those rows and drops every row the chain can give back.
+ *
+ * The three lists together must name **every** table in `migrations/`: the test
+ * that pins this reads the file, and a new table that joins none of them fails
+ * it rather than defaulting into one.
  */
 export const DROPPABLE: readonly string[] = [
   // A pure function of the chain: replayed from the book's `deployBlock`.
   "cursor",
-  "jobs",
   "providers",
   "models",
   "allowlist",
@@ -76,6 +80,15 @@ export const DROPPABLE: readonly string[] = [
   "schema_migrations",
 ];
 
+/**
+ * Tables a rebuild prunes rather than drops, with the rows it keeps. `jobs`
+ * keeps the held orders (`match/held.ts`): every unclaimed order, and every
+ * order cancelled before a claim — rows no chain log will ever describe. The
+ * rest are replayed from `Posted`, `Claimed`, `Settled` and `Ended`, and a held
+ * order whose claim is in the replayed range is upserted by its `Posted`.
+ */
+export const PRUNED: Readonly<Record<string, string>> = { jobs: HELD };
+
 /** Tables a rebuild must carry across. See {@link DROPPABLE}. */
 export const PRESERVED: readonly string[] = [
   "batch_lines",
@@ -90,9 +103,10 @@ export const PRESERVED: readonly string[] = [
  * The rebuild path, discharging R47's *"whichever task implements the rebuild
  * owns enumerating the drop set"*.
  *
- * Drops every table in {@link DROPPABLE} and **nothing else**, so the next
- * `migrate()` + cold start rebuilds the projection from `deploy_block` while
- * {@link PRESERVED}'s tables keep their rows. This is what makes *"delete the
+ * Drops every table in {@link DROPPABLE}, prunes every table in {@link PRUNED}
+ * to the rows it keeps, and touches **nothing else**, so the next `migrate()` +
+ * cold start rebuilds the projection from `deploy_block` while
+ * {@link PRESERVED}'s tables and the held orders keep their rows. This is what makes *"delete the
  * database and the node rebuilds it from the chain"* a procedure rather than a
  * slogan, and it is why it is **not** `DROP SCHEMA public CASCADE`: `pins` is the
  * only record of where a store-minted CID's object lives (R73) — drop it and
@@ -104,12 +118,18 @@ export const PRESERVED: readonly string[] = [
  * own indexes and constraints, which is what {@link DROPPABLE} means, and reaches
  * nothing outside the list because no `PRESERVED` table references one.
  *
- * One statement, so it is atomic: a rebuild interrupted half way through would
- * leave a schema `migrate()` recreates piecemeal and a cursor whose blocks are
- * only partly applied.
+ * One simple query, so it runs as one implicit transaction: a rebuild
+ * interrupted half way through would leave a schema `migrate()` recreates
+ * piecemeal and a cursor whose blocks are only partly applied.
  */
 export async function dropDerived(db: Queryable): Promise<void> {
-  await db.query(`DROP TABLE IF EXISTS ${DROPPABLE.join(", ")} CASCADE`);
+  const prunes = Object.entries(PRUNED).map(
+    ([table, keep]) =>
+      `IF to_regclass('${table}') IS NOT NULL THEN DELETE FROM ${table} WHERE NOT (${keep}); END IF;`,
+  );
+  await db.query(
+    `DO $$ BEGIN ${prunes.join(" ")} END $$; DROP TABLE IF EXISTS ${DROPPABLE.join(", ")} CASCADE`,
+  );
 }
 
 type TypeId = Parameters<typeof types.getTypeParser>[0];

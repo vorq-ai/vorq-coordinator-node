@@ -107,7 +107,7 @@ describe("escrow decay", () => {
     const keyA = await escrowPublicKeyOf(a);
     const old = escrowContainer(client.address, keyA, `sealed to the old generation — ${Date.now()}`);
     const posted = await postJob(a, old, freshTerms(old.c, { designated: 0n }), client);
-    await claimOnChain(addresses, posted.jobId);
+    await claimOnChain(addresses, posted);
 
     // The baseline. Without it, "C cannot open this" is indistinguishable from
     // "nothing could ever have opened this".
@@ -171,7 +171,7 @@ describe("escrow decay", () => {
     expect(keyC.equals(keyA)).toBe(false);
     const fresh = escrowContainer(client.address, keyC, `sealed to the successor — ${Date.now()}`);
     const freshPosted = await postJob(a, fresh, freshTerms(fresh.c, { designated: 0n }), client);
-    await claimOnChain(addresses, freshPosted.jobId);
+    await claimOnChain(addresses, freshPosted);
 
     const onC = await releaseFor(fresh, addresses.chainId);
     const served = await c.json<{ dek_sealed: string }>("/release", jsonBody(onC.body));

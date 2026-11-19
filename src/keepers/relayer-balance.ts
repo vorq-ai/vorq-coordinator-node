@@ -5,9 +5,11 @@ import type { Chain } from "../chain/client.js";
  * The relayer balance watch: says the gas wallet is running low before it is
  * empty.
  *
- * The relayer pays for every post, claim, settle, fail and reclaim, and nothing
- * on chain pays it back — the gas fee a job carries goes to the treasury. So the
- * wallet only drains, and an empty one stops every settle on the node at once.
+ * The relayer pays for every post, claim, settle, fail and reclaim in the native
+ * gas token. What the chain pays it back — the gas fee of every job it claimed
+ * and the deposit fee of every deposit it landed — arrives in the payment token
+ * through `payRelayer`, never as gas. So the gas balance only drains, and an
+ * empty one stops every settle on the node at once.
  * This reads the balance on a timer and reports a low one; the caller logs it at
  * `error`, which is what reaches Sentry.
  */

@@ -7,7 +7,9 @@ Clients post signed, sealed orders; providers poll, claim and settle them with s
 ## Features
 
 - Job book, providers, model catalog and published asks, indexed from chain events into Postgres
-- Two-step order flow: `402` payment quote (EIP-3009), then post with the sealed payload
+- Two-step order flow: `402` quote, then submit with the sealed payload; the provider's claim puts the order on chain
+- Prepaid client balances: gasless EIP-3009 deposits and signed withdrawals, relayed
+- Provider, relayer and treasury payouts on a schedule
 - Gasless provider operations: claim, settle, fail, identity and capacity updates
 - Provider matching with poll-based job leases and ranked candidates
 - File uploads and OpenAI-style batches

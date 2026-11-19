@@ -1,117 +1,58 @@
-import { decodeErrorResult, encodeFunctionData, parseEventLogs, type Hex, type Log } from "viem";
-import { jobRegistryAbi } from "../abi/jobRegistry.js";
+import type { Hex } from "viem";
 import { chainParams, type Chain } from "../chain/client.js";
 import type { Config } from "../config.js";
 import type { Db } from "../db/db.js";
-import { fundsLeft } from "../api/funding.js";
-import { writePostedRows } from "../index/write-through.js";
-import { taskCidHex } from "../orders.js";
+import { fundsLeft, underOwnerFunds } from "../api/funding.js";
+import { holdOrder } from "../match/held.js";
 import { put, type Pinner } from "../pin/pinner.js";
 import { attachFile } from "../api/routes/files.js";
 import { finalizeBatch } from "./finalize.js";
 import { admitLine, type AdmittedLine, type LineContext } from "./lines.js";
 
 /**
- * The batch worker's **posting pass**: a `validating` batch becomes `in_progress`.
+ * The batch worker's **holding pass**: a `validating` batch becomes `in_progress`.
  *
  * ```
  *   read the input object   one fetch, by the CID the `files` row names
  *   split                   one line, one prospective job
  *   admit                   no store, no chain (`lines.ts`)
+ *   fund                    each owner's balance, less its open orders, in file order
  *   file                    one container per admitted line that inlined one;
  *                           the name minted for it IS that line's `task_cid`,
  *                           and a line that named an upload already has one
- *   record                  a `batch_lines` row per line, BEFORE the relay
- *   post                    `postMany`, chunked; PostSkipped takes lines back
+ *   hold                    under each owner's funds queue, funded again in file
+ *                           order, then a `batch_lines` row and a held order per
+ *                           line, together
  *   stamp                   in_progress, and the fold owns the batch from here
  * ```
+ *
+ * Nothing is relayed. Each line becomes a held order exactly as a single
+ * `POST /v1/jobs` does (`match/held.ts`), and goes on chain inside the claim a
+ * provider signs for it.
  *
  * ## Why this cannot be the create request
  *
  * 50 000 lines is 50 000 pins against a service rate-limited to 100 req/s —
- * eight minutes at the ceiling, before a single transaction is signed. `POST
- * /v1/batches` answers `validating` and returns; this runs behind it. OpenAI's
- * own `validating → in_progress` lifecycle exists for exactly this, and it is
- * what makes skip-with-receipt the only coherent create semantics: an
- * all-or-nothing refusal would throw away 49 999 good lines, and the pinning
- * already spent on them, for one line with a typo.
+ * eight minutes at the ceiling. `POST /v1/batches` answers `validating` and
+ * returns; this runs behind it. OpenAI's own `validating → in_progress`
+ * lifecycle exists for exactly this, and it is what makes skip-with-receipt the
+ * only coherent create semantics: an all-or-nothing refusal would throw away
+ * 49 999 good lines, and the pinning already spent on them, for one line with a
+ * typo.
  *
  * ## `batch_lines` is the record, and it is preserved
  *
  * **Nothing on chain says a job belongs to a batch** — every line is an
- * independent designated order, which is exactly what lets one batch spread
- * across providers with no coordination. So `batch_lines` is the only record of
- * which line is which job, it is in `PRESERVED` (`src/db/db.ts`), and this pass
- * writes it rather than a manifest object anybody would have to read back.
+ * independent order, which is exactly what lets one batch spread across
+ * providers with no coordination. So `batch_lines` is the only record of which
+ * line is which job, it is in `PRESERVED` (`src/db/db.ts`), and this pass writes
+ * it rather than a manifest object anybody would have to read back.
  *
- * ## The rows are written before the relay, and that ordering is the whole
- * crash story
- *
- * A `postMany` that lands and a `batch_lines` row that names its job are two
- * writes to two different systems, and a process can die between them. Written
- * **after** the relay, a crash in that window leaves lines that are posted,
- * escrow-committed and unrecorded — and a resumed pass would post them a second
- * time. On chain that is answered `DuplicateJob`, which is indistinguishable from
- * a client that genuinely reused a `c`; one reading strands a paid job as
- * "skipped", the other attributes an unrelated job's result to this line. Neither
- * is acceptable, so the ambiguity is removed rather than resolved.
- *
- * Written **before**, the worst case is the opposite and it is bounded: a line
- * recorded with a `job_id` that never posted. Nothing on chain will ever move it,
- * so the fold reads it as in flight until the batch's own `expires_at`, at which
- * point it counts as failed and lands in the error file. One chunk's lines, one
- * window late, and no line is ever posted twice.
- *
- * A resumed pass therefore reprocesses **only lines with no row at all**: a row
- * is a decision, and a decision is not revisited.
- *
- * ## No simulate
- *
- * Deliberately, and for `AskRegistry.setAsks`' reason (R29): `postMany` skips
- * rather than reverting, so a simulate proves nothing about any individual line —
- * it would answer "success" for a call in which every line is refused. The
- * receipt's `PostSkipped` logs are the only per-line verdict there is, and they
- * exist only after the transaction has mined.
+ * A line's `batch_lines` row and its held order are written in **one
+ * transaction**, so a crash leaves a line either decided and held or undecided
+ * and absent. A resumed pass therefore reprocesses **only lines with no row at
+ * all**: a row is a decision, and a decision is not revisited.
  */
-
-/**
- * How many lines ride in one `postMany`.
- *
- * `post` writes a full `Job` struct — fourteen slots, several of them cold — and
- * a twelve-argument `Posted` event, which measures at roughly 250 000 gas a line
- * before the self-call's own overhead. Fifty of them is ~13 M, comfortably inside
- * a 30 M block and leaving room for a line that costs more than the average
- * (a long `authSig`, a long `taskCid`). It is a line count rather than a gas
- * estimate because the estimate would have to be made per line against a chain
- * this pass has deliberately not asked anything yet — and being wrong about it
- * means an unmineable transaction, not a slow one.
- */
-export const MAX_LINES_PER_TRANSACTION = 50;
-
-/**
- * The gas budget one line is sent with, and **why this pass does not estimate**.
- *
- * `eth_estimateGas` searches for the least gas at which the transaction succeeds.
- * `postMany` succeeds however many of its lines it skipped — that is what a
- * `try/catch` per line means — so the search converges on a limit at which the
- * tail of the chunk runs out of gas *inside its sub-call*, is caught, and is
- * reported as `PostSkipped` on a receipt that says success. The estimate is not
- * wrong about the question it was asked. It is the wrong question.
- *
- * Measured on the devnet: a two-line chunk estimated at 449 299, used exactly
- * 449 299, landed line 1 and skipped line 2 with empty revert data. The same
- * calldata traced with 5 000 000 gas lands both for 588 052 — 278 350 and 267 850
- * in the two sub-calls, the first paying the cold-slot premium.
- *
- * 350 000 is that measurement with room for a line that costs more than the
- * average (a long `authSig`, a long `taskCid`). Fifty of them is 17.6 M, inside
- * a 30 M block. Unused gas is not spent — this is a limit, not a price — so the
- * only cost of the headroom is block space the chunk was going to ask for anyway.
- */
-export const GAS_PER_LINE = 350_000n;
-
-/** Intrinsic cost, calldata and the loop itself, on top of {@link GAS_PER_LINE}. */
-export const GAS_OVERHEAD = 150_000n;
 
 /**
  * How many containers are filed at once.
@@ -120,18 +61,23 @@ export const GAS_OVERHEAD = 150_000n;
  * to 50 000 objects; this is the backpressure. Deliberately well under the
  * ceiling: the same service is on the request path of `POST /v1/jobs` and the
  * settle door, and a worker that saturated it would answer `503 pinner_unavailable`
- * to every live client for the eight minutes it spent posting a batch.
+ * to every live client for the eight minutes it spent filing a batch.
  */
 const PIN_CONCURRENCY = 8;
 
-/** How long the worker waits for one chunk's receipt. */
-const RECEIPT_TIMEOUT_MS = 120_000;
+/**
+ * How many of one owner's lines are funded and held per turn of its funds queue.
+ *
+ * The queue is the one that owner's posts and withdrawals wait in, so a batch of
+ * 50 000 lines holds it a chunk at a time rather than for the whole file.
+ */
+const HOLD_CHUNK = 256;
 
 /**
  * How often the worker looks for work.
  *
  * Not configurable, and it does not need to be: it bounds how long a batch sits
- * in `validating` before its first line is posted, and against a 1 h floor on the
+ * in `validating` before its first line is held, and against a 1 h floor on the
  * completion window fifteen seconds is noise. A shorter interval would only poll
  * an empty table faster.
  */
@@ -145,16 +91,11 @@ export interface BatchWorkerDeps {
 }
 
 /** What one pass did. Returned for the log, and for the tests to assert on. */
-export interface PostRun {
+export interface HoldRun {
   batchId: string;
-  posted: number;
+  /** Lines held as orders. */
+  held: number;
   skipped: number;
-  /**
-   * Lines the transaction ran out of gas on. They carry no row, no verdict and no
-   * job; the batch stays `validating` and the next pass posts them.
-   */
-  undecided: number;
-  transactions: number;
 }
 
 interface BatchRow {
@@ -168,11 +109,15 @@ interface BatchRow {
 
 /** One line's decision, before anything is written down. */
 type Decision =
-  | { lineNo: number; kind: "post"; line: AdmittedLine; taskCid: string }
+  /**
+   * `gasFee` is the one this batch was priced at: what the line's amount
+   * includes. `feeBps` prices the owner's other open orders when it is funded.
+   */
+  | { lineNo: number; kind: "hold"; line: AdmittedLine; taskCid: string; gasFee: bigint; feeBps: number }
   | { lineNo: number; kind: "skip"; reason: string };
 
 /**
- * Post one batch. `null` when there was nothing to do — the batch is not
+ * Hold one batch's lines. `null` when there was nothing to do — the batch is not
  * `validating`, or its input object is gone and the batch has been failed.
  *
  * Throws on an outage — a store that will not file bytes, an endpoint that will
@@ -180,7 +125,7 @@ type Decision =
  * retry, and it is free: object names are content hashes, so re-filing the same
  * container is the same object under the same name.
  */
-export async function postBatch(deps: BatchWorkerDeps, batchId: string): Promise<PostRun | null> {
+export async function holdBatch(deps: BatchWorkerDeps, batchId: string): Promise<HoldRun | null> {
   const { rows } = await deps.db.query<BatchRow>(
     `SELECT b.batch_id, b.endpoint, b.owner, b.input_file_id, b.cancelling_at, f.cid
        FROM batches b LEFT JOIN files f ON f.file_id = b.input_file_id
@@ -219,25 +164,8 @@ export async function postBatch(deps: BatchWorkerDeps, batchId: string): Promise
   const skips = pending.filter((decision) => decision.kind === "skip");
   if (skips.length > 0) await writeSkips(deps.db, batchId, skips);
 
-  const posts = pending.filter((decision) => decision.kind === "post");
-  let posted = 0;
-  let undecided = 0;
-  let transactions = 0;
-  for (let start = 0; start < posts.length; start += MAX_LINES_PER_TRANSACTION) {
-    const chunk = posts.slice(start, start + MAX_LINES_PER_TRANSACTION);
-    const run = await postChunk(deps, batchId, chunk);
-    posted += run.posted;
-    undecided += run.undecided;
-    transactions += 1;
-  }
-
-  // A line with no verdict is a line this batch is not finished with, and
-  // `in_progress` is the promise that every line has one — it is what the fold
-  // counts against. So the batch stays `validating` and the next pass posts the
-  // rest, which costs nothing: a line that already has a row is already decided.
-  if (undecided > 0) {
-    return { batchId, posted, skipped: pending.length - posted - undecided, undecided, transactions };
-  }
+  const holds = pending.flatMap((decision) => (decision.kind === "hold" ? [decision] : []));
+  const held = await holdFunded(deps, batchId, holds);
 
   await deps.db.query(
     `UPDATE batches
@@ -246,7 +174,7 @@ export async function postBatch(deps: BatchWorkerDeps, batchId: string): Promise
     [batchId, nowSeconds()],
   );
 
-  return { batchId, posted, skipped: pending.length - posted, undecided, transactions };
+  return { batchId, held, skipped: pending.length - held };
 }
 
 // ---------------------------------------------------------------------------
@@ -258,7 +186,7 @@ export async function postBatch(deps: BatchWorkerDeps, batchId: string): Promise
  *
  * The same rule `POST /v1/files` counted the file's lines by, and it has to be
  * the same rule: the create door refuses a batch past the cap using that count,
- * and a splitter that disagreed would post a different number of lines than the
+ * and a splitter that disagreed would hold a different number of lines than the
  * count the door admitted.
  */
 function splitLines(content: Buffer): string[] {
@@ -290,7 +218,7 @@ async function decide(
   batch: BatchRow,
   lines: string[],
 ): Promise<Decision[]> {
-  // A batch cancelled while it was still validating never posts. Its lines are
+  // A batch cancelled while it was still validating holds nothing. Its lines are
   // recorded as skipped so the fold has something to count — a batch with no
   // lines at all reads as `0 of 0 done`, which is `completed`, which is a lie
   // about a batch nobody ran.
@@ -301,13 +229,6 @@ async function decide(
   const chain = requireChain(deps.chain);
   const params = chainParams(chain, deps.config.addresses);
   const [gasFee, feeBps] = await Promise.all([params.gasFee(), params.feeBps()]);
-  // One `eth_getCode` per payer for the whole file, the way `gasFee` and `feeBps`
-  // are read once for the whole file. A batch's lines may be signed by several
-  // wallets, so this is keyed by the payer rather than taken once — but a file of
-  // 50 000 lines from one wallet must not be 50 000 calls. The memo dies with the
-  // batch: code appears and disappears with a single 7702 transaction, and
-  // nothing here should remember it longer than the decision it feeds.
-  const codeOf = new Map<string, Promise<boolean>>();
   const context: LineContext = {
     db: deps.db,
     endpoint: batch.endpoint,
@@ -318,15 +239,6 @@ async function decide(
     now: nowSeconds(),
     gasFee,
     feeBps,
-    hasCode: (address) => {
-      const key = address.toLowerCase();
-      let answer = codeOf.get(key);
-      if (answer === undefined) {
-        answer = chain.hasCode(address);
-        codeOf.set(key, answer);
-      }
-      return answer;
-    },
   };
 
   const admitted: { lineNo: number; line: AdmittedLine }[] = [];
@@ -340,12 +252,9 @@ async function decide(
       decisions.set(lineNo, { lineNo, kind: "skip", reason: verdict.skip.code });
       continue;
     }
-    // Within the file, and only within it. `job_id` is `keccak256(owner ‖ c)`, so
-    // two lines that name it are the same job twice and the second could only ever
-    // be refused `DuplicateJob` on chain — caught here, for free, rather than for
-    // gas. A collision with a job posted *outside* this batch is left to the
-    // chain: this node's index is not the authority on what has been posted, and
-    // the receipt says so definitively.
+    // Within the file. `job_id` is `keccak256(owner ‖ c)`, so two lines that
+    // name it are the same job twice. A collision with an order held *outside*
+    // this batch is the held row's own conflict, met when the line is held.
     if (seen.has(verdict.line.jobId)) {
       decisions.set(lineNo, { lineNo, kind: "skip", reason: "duplicate_job_id" });
       continue;
@@ -355,8 +264,8 @@ async function decide(
   }
 
   // One query for the whole file rather than one per line. A model the catalog
-  // does not enable is a refusal the chain would make anyway (`ModelDisabled`),
-  // made here before the gas is fronted.
+  // does not enable is a refusal every claim would meet (`ModelDisabled`), made
+  // here before anything is held.
   const enabled = await enabledModels(
     deps.db,
     admitted.map(({ line }) => line.terms.modelId),
@@ -367,16 +276,18 @@ async function decide(
     return false;
   });
 
-  // The claim pulls each line's `amount` from its owner, so lines are funded in
-  // file order out of what each owner can still fund; the rest are skipped
-  // rather than posted to rest Open until they expire. One read per owner.
+  // The claim locks each line's `amount` from its owner's prepaid balance, so
+  // lines are funded in file order out of what each owner can still fund; the
+  // rest are skipped rather than held to rest until they expire. One read per
+  // owner, here so an unfunded line files no bytes; the read each hold rests on
+  // is made again under the owner's funds queue (`holdFunded`).
   const left = new Map<string, bigint>();
   const pinnable: typeof modelled = [];
   for (const entry of modelled) {
     const owner = entry.line.owner.toLowerCase();
     const funds =
       left.get(owner) ??
-      (await fundsLeft(chain, deps.db, deps.config.addresses.usdc, entry.line.owner, feeBps, context.now));
+      (await fundsLeft(chain, deps.db, deps.config.addresses.jobRegistry, entry.line.owner, feeBps, context.now));
     if (funds < entry.line.amount) {
       left.set(owner, funds);
       decisions.set(entry.lineNo, { lineNo: entry.lineNo, kind: "skip", reason: "insufficient_funds" });
@@ -407,7 +318,7 @@ async function decide(
       lineNo,
       taskCid === null
         ? { lineNo, kind: "skip", reason: "unknown_container" }
-        : { lineNo, kind: "post", line, taskCid },
+        : { lineNo, kind: "hold", line, taskCid, gasFee, feeBps },
     );
   }
 
@@ -445,8 +356,66 @@ async function mapLimited<T, R>(
 }
 
 // ---------------------------------------------------------------------------
-// Writing and posting
+// Writing and holding
 // ---------------------------------------------------------------------------
+
+/**
+ * The lines to hold, funded again and held under each owner's funds queue.
+ * Returns how many were held.
+ *
+ * The funding in {@link decide} ran before the pins and outside the queue, so a
+ * post or a withdrawal of the same owner may have drawn on the balance since.
+ * Under the queue nothing else decides against this owner's funds, so each line
+ * is held only while what the owner can still fund covers it, in file order,
+ * and the rest are recorded as `insufficient_funds`.
+ */
+async function holdFunded(
+  deps: BatchWorkerDeps,
+  batchId: string,
+  holds: Extract<Decision, { kind: "hold" }>[],
+): Promise<number> {
+  const chain = requireChain(deps.chain);
+  const byOwner = new Map<string, Extract<Decision, { kind: "hold" }>[]>();
+  for (const decision of holds) {
+    const key = decision.line.owner.toLowerCase();
+    const lines = byOwner.get(key) ?? [];
+    lines.push(decision);
+    byOwner.set(key, lines);
+  }
+
+  let held = 0;
+  for (const lines of byOwner.values()) {
+    for (let start = 0; start < lines.length; start += HOLD_CHUNK) {
+      const chunk = lines.slice(start, start + HOLD_CHUNK);
+      const { owner } = chunk[0].line;
+      held += await underOwnerFunds(owner, async () => {
+        let left = await fundsLeft(
+          chain,
+          deps.db,
+          deps.config.addresses.jobRegistry,
+          owner,
+          chunk[0].feeBps,
+          nowSeconds(),
+        );
+        let count = 0;
+        for (const decision of chunk) {
+          if (left < decision.line.amount) {
+            await writeSkips(deps.db, batchId, [
+              { lineNo: decision.lineNo, kind: "skip", reason: "insufficient_funds" },
+            ]);
+            continue;
+          }
+          if (await holdLine(deps, batchId, decision)) {
+            left -= decision.line.amount;
+            count += 1;
+          }
+        }
+        return count;
+      });
+    }
+  }
+  return held;
+}
 
 async function writeSkips(db: Db, batchId: string, skips: Decision[]): Promise<void> {
   await db.query(
@@ -461,153 +430,41 @@ async function writeSkips(db: Db, batchId: string, skips: Decision[]): Promise<v
   );
 }
 
-/** What one `postMany` did. See {@link postChunk}. */
-interface ChunkRun {
-  /** Lines that landed as jobs. */
-  posted: number;
-  /** Lines the contract refused, with a reason. */
-  skipped: number;
-  /**
-   * Lines the transaction ran out of gas on — no verdict, no row, and the next
-   * pass posts them again.
-   */
-  undecided: number;
-}
-
 /**
- * One `postMany`: record the chunk, relay it, then take back the lines the
- * contract refused.
- */
-async function postChunk(
-  deps: BatchWorkerDeps,
-  batchId: string,
-  chunk: Decision[],
-): Promise<ChunkRun> {
-  const lines = chunk.flatMap((decision) => (decision.kind === "post" ? [decision] : []));
-
-  // **Before the relay** — see the header. The row claims the job the chunk is
-  // about to post, so a crash cannot leave a posted job unrecorded.
-  await deps.db.query(
-    `INSERT INTO batch_lines (batch_id, line_no, job_id, task_cid)
-     SELECT $1, * FROM unnest($2::bigint[], $3::bytea[], $4::text[])
-     ON CONFLICT (batch_id, line_no) DO NOTHING`,
-    [
-      batchId,
-      lines.map((decision) => decision.lineNo),
-      lines.map((decision) => Buffer.from(decision.line.jobId.slice(2), "hex")),
-      lines.map((decision) => decision.taskCid),
-    ],
-  );
-
-  const chain = requireChain(deps.chain);
-  const data = encodeFunctionData({
-    abi: jobRegistryAbi,
-    functionName: "postMany",
-    args: [
-      lines.map(({ line, taskCid }) => ({
-        c: line.terms.c,
-        modelId: Number(line.terms.modelId),
-        slaSecs: Number(line.terms.slaSecs),
-        rateIn: line.terms.rateIn,
-        rateOut: line.terms.rateOut,
-        unitsIn: Number(line.terms.unitsIn),
-        unitsOut: Number(line.terms.unitsOut),
-        designated: Number(line.terms.designated),
-        expiresAt: line.terms.expiresAt,
-        // The name this node minted, not one the client chose: `taskCid` is a
-        // `post` parameter and not a signed member, precisely because the client
-        // cannot know it.
-        taskCid: taskCidHex(taskCid),
-      })),
-      lines.map(({ line }) => line.owner),
-      lines.map(({ line }) => line.signature),
-      lines.map(({ line }) => line.authSig),
-    ],
-  });
-
-  const txHash = await chain.relay({
-    to: deps.config.addresses.jobRegistry,
-    data,
-    gas: GAS_OVERHEAD + GAS_PER_LINE * BigInt(lines.length),
-  });
-  const receipt = await chain.receipt(txHash, RECEIPT_TIMEOUT_MS);
-
-  const run = await takeBackRefused(deps, batchId, lines, receipt.logs);
-
-  // The member jobs' rows, from this receipt, so each is readable by id at once
-  // rather than after finality. **After** the lines are settled above, so a
-  // failure here cannot leave a refused line recorded as posted: it throws to the
-  // pass, which logs it, and the next pass finds every line decided.
-  await writePostedRows(deps.db, deps.config.addresses.jobRegistry, receipt.logs, receipt.blockNumber);
-  return run;
-}
-
-/** Takes back the lines the receipt's `PostSkipped` logs refused. */
-async function takeBackRefused(
-  deps: BatchWorkerDeps,
-  batchId: string,
-  lines: Extract<Decision, { kind: "post" }>[],
-  logs: Log[],
-): Promise<ChunkRun> {
-  const refused = parseEventLogs({ abi: jobRegistryAbi, eventName: "PostSkipped", logs });
-  if (refused.length === 0) return { posted: lines.length, skipped: 0, undecided: 0 };
-
-  let undecided = 0;
-  for (const event of refused) {
-    const { index, reason } = event.args as { index: bigint; reason: Hex };
-    const decision = lines[Number(index)];
-    if (decision === undefined) continue;
-    if (reason === "0x") {
-      // **Empty revert data is not a verdict.** Every way `post` refuses a line
-      // names itself with a custom error selector, so nothing coming back means
-      // the sub-call died without returning — out of gas — and the contract never
-      // formed an opinion about this line. Recording that as a skip would tell the
-      // caller its line was refused when nothing about it was wrong, and would do
-      // it permanently: a row is a decision and a later pass does not revisit one.
-      //
-      // Deleting the row instead is sound for exactly the reason the row exists.
-      // Its whole job is to answer "did this line post?" without asking the chain,
-      // and here the receipt has already answered: the sub-call reverted, so there
-      // is no job and no escrow commitment, and re-posting cannot collide with
-      // one. The next pass re-decides the line and posts it again.
-      undecided += 1;
-      await deps.db.query("DELETE FROM batch_lines WHERE batch_id = $1 AND line_no = $2", [
-        batchId,
-        decision.lineNo,
-      ]);
-      continue;
-    }
-    // The contract's own error name, decoded from the revert data `try/catch`
-    // handed it — the same vocabulary `POST /v1/jobs` answers a refused post
-    // with, so one cause reads the same however it was met.
-    await deps.db.query(
-      "UPDATE batch_lines SET job_id = NULL, task_cid = NULL, skip_reason = $3 WHERE batch_id = $1 AND line_no = $2",
-      [batchId, decision.lineNo, errorNameOf(reason)],
-    );
-  }
-  return {
-    posted: lines.length - refused.length,
-    skipped: refused.length - undecided,
-    undecided,
-  };
-}
-
-/**
- * The contract's own error name, out of the revert data `postMany`'s `catch`
- * handed the event.
+ * One line, held: its `batch_lines` row and its held order in one transaction.
+ * `false` when the line was recorded as a skip instead.
  *
- * Not `decodeRevert`: that reads the data off a thrown RPC error, and this is not
- * an error — it is a `bytes` argument of a log on a transaction that **succeeded**.
- * The vocabulary is the same one `POST /v1/jobs` answers a refused post with, so
- * one cause reads the same however it was met. `"unknown"` for revert data no ABI
- * decodes, which is the honest answer and never a guess.
+ * A line whose `job_id` is already held outside this batch is recorded as a
+ * skip rather than as this batch's job: the row under that id belongs to
+ * another order, and attributing its result to this line would be wrong.
  */
-export function errorNameOf(data: Hex): string {
-  try {
-    return decodeErrorResult({ abi: jobRegistryAbi, data }).errorName;
-  } catch {
-    return "unknown";
-  }
+async function holdLine(
+  deps: BatchWorkerDeps,
+  batchId: string,
+  decision: Extract<Decision, { kind: "hold" }>,
+): Promise<boolean> {
+  const { line, taskCid, lineNo, gasFee } = decision;
+  return deps.db.tx(async (tx) => {
+    const held = await holdOrder(tx, {
+      jobId: line.jobId,
+      owner: line.owner,
+      terms: line.terms,
+      taskCid,
+      gasFee,
+      orderSig: line.signature,
+    });
+    await tx.query(
+      held
+        ? `INSERT INTO batch_lines (batch_id, line_no, job_id, task_cid) VALUES ($1, $2, $3, $4)
+           ON CONFLICT (batch_id, line_no) DO NOTHING`
+        : `INSERT INTO batch_lines (batch_id, line_no, skip_reason) VALUES ($1, $2, 'DuplicateJob')
+           ON CONFLICT (batch_id, line_no) DO NOTHING`,
+      held
+        ? [batchId, lineNo, Buffer.from(line.jobId.slice(2), "hex"), taskCid]
+        : [batchId, lineNo],
+    );
+    return held;
+  });
 }
 
 // ---------------------------------------------------------------------------
@@ -616,14 +473,14 @@ export function errorNameOf(data: Hex): string {
 
 /** What one pass over every batch did. */
 export interface TickResult {
-  /** The batches this pass posted. */
-  posted: string[];
+  /** The batches this pass held. */
+  held: string[];
   /** The batches this pass froze. */
   finalized: string[];
 }
 
 /**
- * One pass: post everything `validating`, freeze everything finished.
+ * One pass: hold everything `validating`, freeze everything finished.
  *
  * **A failure in one batch does not stop the next.** One client's unresolvable
  * input, or one endpoint hiccup on one chunk, must not hold up every other
@@ -636,14 +493,14 @@ export async function batchWorkerTick(
   deps: BatchWorkerDeps,
   onError: (error: unknown, batchId: string) => void,
 ): Promise<TickResult> {
-  const result: TickResult = { posted: [], finalized: [] };
+  const result: TickResult = { held: [], finalized: [] };
 
   const { rows: validating } = await deps.db.query<{ batch_id: string }>(
     "SELECT batch_id FROM batches WHERE status = 'validating' ORDER BY created_at",
   );
   for (const { batch_id: batchId } of validating) {
     try {
-      if ((await postBatch(deps, batchId)) !== null) result.posted.push(batchId);
+      if ((await holdBatch(deps, batchId)) !== null) result.held.push(batchId);
     } catch (error) {
       onError(error, batchId);
     }
@@ -676,9 +533,8 @@ export async function batchWorkerTick(
  * `unref` so a background timer cannot hold the process open through a SIGTERM,
  * and a re-entrancy guard because one pass can take minutes — a second pass
  * starting on top of the first would read the same `validating` rows and try to
- * post the same lines twice. The `batch_lines` rows written before each relay
- * make that harmless rather than catastrophic, but harmless is not a reason to do
- * it.
+ * hold the same lines twice. The `batch_lines` rows and the held rows' own
+ * conflicts make that harmless, but harmless is not a reason to do it.
  */
 export function startBatchWorker(
   deps: BatchWorkerDeps,
@@ -706,6 +562,6 @@ export function startBatchWorker(
 const nowSeconds = (): bigint => BigInt(Math.floor(Date.now() / 1000));
 
 function requireChain(chain: Chain | null): Chain {
-  if (chain === null) throw new Error("the batch worker needs a chain to post with");
+  if (chain === null) throw new Error("the batch worker needs a chain to read balances and fees from");
   return chain;
 }

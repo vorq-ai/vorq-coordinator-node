@@ -1,9 +1,9 @@
 ---
 title: Submit a job
-description: Quote an order, sign the payment, post the sealed payload inline or by upload, and collect the result.
+description: Quote an order, cover it from the prepaid balance, post the sealed payload inline or by upload, and collect the result.
 ---
 
-Submitting a job is two calls to [`POST /v1/jobs`](../reference/client-api.md#post-v1jobs) with the same order: the first returns a quote, the second carries the payment signature and the sealed payload.
+Submitting a job is two calls to [`POST /v1/jobs`](../reference/client-api.md#post-v1jobs) with the same order: the first returns a quote, the second carries the quoted `amount` and the sealed payload. The job is paid from your prepaid balance in the `JobRegistry`; when the quote names a `deposit`, make it with [`POST /v1/deposits`](../reference/client-api.md#post-v1deposits) between the two calls.
 
 This guide assumes the shell variables from the [Quickstart](../quickstart.md) (`VORQ`, `KEY`, `ADDR`, `CHAIN_ID`, `JOB_REGISTRY`).
 
@@ -33,28 +33,42 @@ A fresh `c` gives a fresh `job_id`. Reusing one answers `409 DuplicateJob`.
 
 ## 3. Sign the order and get a quote
 
-Sign the `Order` (see [Signed messages](../reference/signed-messages.md#order)) and post the order fields without `auth_sig`, as in the [Quickstart](../quickstart.md#5-get-a-quote). The answer is `402` with a `quote`.
+Sign the `Order` (see [Signed messages](../reference/signed-messages.md#order)) and post the order fields without `amount`, as in the [Quickstart](../quickstart.md#5-get-a-quote). The answer is `402` with a `quote`.
 
 If you seal to a candidate, set `designated` to its `provider_id` before signing: the order you quote must be the order you submit.
 
-## 4. Sign the payment
+## 4. Cover the quote
 
-Sign the EIP-3009 `ReceiveWithAuthorization` described by `quote.authorization`, using the payment token's own domain (`quote.authorization.domain`):
+`quote.amount` is what the job locks from your prepaid balance when a provider claims it. `quote.balance` is what your balance has available after your other open orders, and `quote.deposit` is what to deposit first: `"0"` when the balance covers `amount`, otherwise the shortfall plus `quote.deposit_fee`.
+
+When `deposit` is above zero, sign an EIP-3009 [`ReceiveWithAuthorization`](../reference/signed-messages.md#receivewithauthorization) for exactly `deposit`, in the payment token's own domain (`token_domain` on [`GET /evm/chain`](../reference/provider-api.md#get-evmchain)):
 
 | Field | Value |
 | --- | --- |
 | `from` | the order `owner` |
-| `to` | `quote.authorization.to` (the `JobRegistry`) |
-| `value` | `quote.amount` |
+| `to` | the `JobRegistry` |
+| `value` | `quote.deposit`, in the token's smallest units |
 | `validAfter` | `0` |
-| `validBefore` | `expires_at + 1` |
-| `nonce` | `job_id` |
+| `validBefore` | a deadline, for example now + 3600 |
+| `nonce` | 32 random bytes |
 
-The owner must be an account with no contract code: a smart account or an EIP-7702-delegated account is refused with `400 payer_has_code`. Funds move only when a provider claims the job, so the owner needs a balance of at least `amount` by then.
+Send it with a [session](./authenticate-with-a-wallet.md) for the owner:
+
+```sh
+curl -s -X POST "$VORQ/v1/deposits" \
+  -H "authorization: Bearer $TOKEN" -H 'content-type: application/json' \
+  -d "{\"owner\": \"$ADDR\", \"value\": \"0.004007\", \"valid_before\": $VALID_BEFORE, \"nonce\": \"$NONCE\", \"auth_sig\": \"$AUTH_SIG\"}"
+```
+
+```json
+{ "owner": "0x…", "balance": "0.002007", "reserved": "0", "available": "0.002007", "deposit_fee": "0.002" }
+```
+
+The coordinator relays the deposit and pays its gas; the registry credits `value − deposit_fee`. The owner must be an account with no contract code: a smart account or an EIP-7702-delegated account is refused with `400 payer_has_code`. Read the balance at any time with [`GET /v1/balance`](../reference/client-api.md#get-v1balance), and withdraw what is available with [`POST /v1/withdrawals`](../reference/client-api.md#post-v1withdrawals).
 
 ## 5. Submit
 
-Send the same order fields again, plus `auth_sig`, `amount` and the container.
+Send the same order fields again, plus `amount` and the container.
 
 **Inline**, for containers up to 15 679 488 bytes, as base64:
 
@@ -67,12 +81,12 @@ curl -s -X POST "$VORQ/v1/jobs" -H 'content-type: application/json' -d @submit.j
   "c": "0x…", "model_id": 3, "sla_secs": 3600, "rate_in": "0.0012", "rate_out": "0.005",
   "units_in": 1000, "units_out": 1000, "designated": 7, "expires_at": 1786003600,
   "owner": "0x…", "job_id": "0x…", "signature": "0x…",
-  "auth_sig": "0x…", "amount": "0.002007",
+  "amount": "0.002007",
   "container": "AQ…"
 }
 ```
 
-**By upload**, for larger containers. Open a [session](./authenticate-with-a-wallet.md), upload the container, then post its cid as `container_cid` instead of `container`:
+**By upload**, for larger containers. Upload the container under the owner's [session](./authenticate-with-a-wallet.md), then post its cid as `container_cid` instead of `container`:
 
 ```sh
 curl -s -X POST "$VORQ/v1/files" \
@@ -81,21 +95,21 @@ curl -s -X POST "$VORQ/v1/files" \
   -F file=@container.bin | jq -r .vorq.cid
 ```
 
-The upload must come from the order's owner. An upload that is not attached to a job within 300 seconds is deleted, so upload right before you post.
+The upload must come from the order's owner. An upload that is not attached to a job within 300 seconds is deleted, so make any deposit first and upload right before you post.
 
-The answer is `201`:
+The answer is `202`:
 
 ```json
-{ "job_id": "0x…", "task_cid": "bafy…", "tx_hash": "0x…" }
+{ "job_id": "0x…", "task_cid": "bafy…" }
 ```
 
-If no live provider's ask clears your rates, the answer is `202` with the same body and no `tx_hash`. The coordinator holds the order and posts it when a provider takes it. Poll the job the same way.
+The coordinator holds the order. It goes on chain in the same transaction as the claim of the provider that takes it, and only then is `amount` locked from your balance. Nothing is relayed for an order nobody claims.
 
-## 6. Handle a changed price
+## 6. Handle a changed price or a short balance
 
-If the node's `gas_fee` or the protocol `fee_bps` changed after your quote, `amount` no longer matches and the answer is `409` with a fresh `{quote, candidates, accepts}` body. Sign a new payment for the new `amount` and submit again. The order signature stays valid.
+If the node's `gas_fee` or the protocol `fee_bps` changed after your quote, or your balance no longer covers `amount`, the answer is `409` with a fresh `{quote, candidates, accepts}` body. Make the `deposit` it names, if any, and submit again with its `amount`. The order signature stays valid.
 
-For any other failure, see [Errors](../reference/errors.md). Retry only when the `x-vorq-retryable` header is `true`. A `504 receipt_timeout` means the transaction was sent: poll the job instead of posting again.
+For any other failure, see [Errors](../reference/errors.md). Retry only when the `x-vorq-retryable` header is `true`.
 
 ## 7. Collect the result
 
@@ -107,7 +121,7 @@ curl -s "$VORQ/v1/jobs/$JOB_ID" | jq '{status, result_cid}'
 
 | `status` | Meaning |
 | --- | --- |
-| `queued` | Open, waiting for a provider. |
+| `queued` | Held, waiting for a provider. |
 | `in_progress` | Claimed. |
 | `completed` | Settled. `result_cid` names the sealed result. |
 | `failed` | The provider failed it, or missed its SLA and it was reclaimed. |

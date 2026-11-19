@@ -24,6 +24,35 @@ export interface JobLimiter {
 
 /** `limit` of `0` is no limit at all. `now` is injectable for the tests. */
 export function jobLimiter(limit: number, now: () => number = Date.now): JobLimiter {
+  return slotLimiter(
+    limit,
+    (modelId) =>
+      `this wallet has posted ${limit} jobs for model ${modelId} in the last 24 hours, ` +
+      "which is this node's limit",
+    now,
+  );
+}
+
+/**
+ * The same daily bound on relayed deposits and withdrawals, one count per wallet
+ * for both: each is a transaction the relayer pays for, and a withdrawal carries
+ * no fee that repays it. Call it with `0n` for the model; the count is per wallet.
+ */
+export function moneyLimiter(limit: number, now: () => number = Date.now): JobLimiter {
+  return slotLimiter(
+    limit,
+    () =>
+      `this wallet has had ${limit} deposits and withdrawals relayed in the last 24 hours, ` +
+      "which is this node's limit",
+    now,
+  );
+}
+
+function slotLimiter(
+  limit: number,
+  describe: (scope: bigint) => string,
+  now: () => number,
+): JobLimiter {
   if (limit === 0) return { check: () => undefined, take: () => () => undefined };
 
   const slots = new Map<string, number[]>();
@@ -55,8 +84,7 @@ export function jobLimiter(limit: number, now: () => number = Date.now): JobLimi
       throw new ApiError(
         429,
         "rate_limit_exceeded",
-        `this wallet has posted ${limit} jobs for model ${modelId} in the last 24 hours, ` +
-          `which is this node's limit; the next slot opens at ${opens}`,
+        `${describe(modelId)}; the next slot opens at ${opens}`,
       );
     }
     return { key, stamps };

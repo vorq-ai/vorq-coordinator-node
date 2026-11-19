@@ -4,7 +4,6 @@ import {
   createWalletClient,
   http,
   keccak256,
-  parseAbi,
   toHex,
   type Hex,
   type PublicClient,
@@ -24,6 +23,8 @@ import { commitment, jobIdFor, sealDek } from "../../../src/escrow/container.js"
 import { newChannelKeypair } from "../../../src/escrow/channel.js";
 import { HANDOVER_AUTH_TYPES } from "../../../src/escrow/handover.js";
 import { RELEASE_TYPES, deriveDek, releaseDomain } from "../../../src/escrow/release.js";
+import type { ExitTerms } from "../../../src/orders.js";
+import { taskCidHex } from "../../../src/orders.js";
 import {
   ANVIL_KEYS,
   CLAIM_TYPES,
@@ -37,6 +38,7 @@ import {
   waitFor,
   type NodeOptions,
   type NodeProcess,
+  type PostedJob,
 } from "./harness.js";
 
 /**
@@ -53,13 +55,14 @@ import {
  *
  * **The sealed 32 bytes are a SEED** (P4a/P4b). A container built here seals a
  * random seed and encrypts under `HKDF(seed, "vorq-dek" ‖ owner)`, which is
- * what `/release` re-derives from the job's chain-read owner. A helper that
+ * what `/release` re-derives from the job's owner, proven against the job id. A helper that
  * sealed a DEK directly would produce containers no release can ever decrypt, and
  * the whole round-trip assertion would be measuring nothing.
  *
  * **`claim` and `fail` are landed directly on chain.** Both are relayer-sent
- * transactions carrying the *provider's* signature — the contract takes the
- * signature as its whole authority and never looks at `msg.sender` — so a
+ * transactions carrying the *provider's* signature — `claim` with the client's
+ * signed order beside it — and the contract takes the signatures as its whole
+ * authority and never looks at `msg.sender`, so a
  * scenario that only needs a job in a particular chain state does not have to
  * wait for a node to be ready, open a session, and relay. The one scenario about
  * the node's own op door is `job-lifecycle`, and it still goes the long way.
@@ -410,7 +413,13 @@ const nowSecondsBigInt = (): bigint => BigInt(Math.floor(Date.now() / 1000));
  * Registering the claim here rather than asking each scenario to remember is
  * deliberate: a scenario that failed halfway would be exactly the one that forgot.
  */
-const outstandingClaims: { addresses: Addresses; jobId: Hex }[] = [];
+const outstandingClaims: { addresses: Addresses; jobId: Hex; terms: ExitTerms }[] = [];
+
+/**
+ * The exit terms of every job this file claimed, by id: the order's members and
+ * the gas fee its claim locked, which `submitAndSettle` and `fail` pass back.
+ */
+const claimedTerms = new Map<Hex, ExitTerms>();
 
 /**
  * Settles every job still claimed by this file, returning the capacity.
@@ -425,7 +434,7 @@ const outstandingClaims: { addresses: Addresses; jobId: Hex }[] = [];
  */
 export async function resolveOutstandingClaims(): Promise<void> {
   const pending = outstandingClaims.splice(0, outstandingClaims.length);
-  for (const { addresses, jobId } of pending) {
+  for (const { addresses, jobId, terms } of pending) {
     try {
       if ((await jobStateOf(addresses, jobId)) !== 1) continue;
       const provider = providerAccount();
@@ -442,7 +451,7 @@ export async function resolveOutstandingClaims(): Promise<void> {
         address: addresses.jobRegistry,
         abi: jobRegistryAbi,
         functionName: "submitAndSettle",
-        args: [jobId, usage, toHex(Buffer.from(`cleanup-${jobId}`, "utf8")), issuedAt, signature],
+        args: [jobId, terms, usage, toHex(Buffer.from(`cleanup-${jobId}`, "utf8")), issuedAt, signature],
         chain: devnetChain(addresses.chainId),
         account: wallet.account,
       });
@@ -455,13 +464,18 @@ export async function resolveOutstandingClaims(): Promise<void> {
 }
 
 /**
- * Claims a job on chain: the **provider's** signature, landed from the relayer.
+ * Claims a job on chain: the client's signed order and the **provider's**
+ * signature, landed from the relayer. The claim is what puts the order on chain
+ * and locks its funds from the owner's prepaid balance.
  *
- * `JobRegistry.claim` never reads `msg.sender` — the operator's EIP-712 signature
- * is the whole authority — so this is the same transition the node's op door
- * produces, without a session or a ready index in the way.
+ * `JobRegistry.claim` authorises nothing by `msg.sender` — the two EIP-712
+ * signatures are the whole authority; the sender is only recorded as the terms'
+ * `relayer` — so this is the same transition the node's op door produces,
+ * without a session or a ready index in the way.
  */
-export async function claimOnChain(addresses: Addresses, jobId: Hex): Promise<bigint> {
+export async function claimOnChain(addresses: Addresses, posted: PostedJob): Promise<bigint> {
+  const { jobId, terms: order } = posted;
+  const gasFee = await gasFeeOf(addresses);
   const provider = providerAccount();
   const issuedAt = nowSecondsBigInt();
   const signature = await provider.signTypedData({
@@ -476,20 +490,50 @@ export async function claimOnChain(addresses: Addresses, jobId: Hex): Promise<bi
     address: addresses.jobRegistry,
     abi: jobRegistryAbi,
     functionName: "claim",
-    args: [jobId, issuedAt, signature],
+    args: [
+      {
+        c: order.c,
+        modelId: Number(order.modelId),
+        slaSecs: Number(order.slaSecs),
+        rateIn: order.rateIn,
+        rateOut: order.rateOut,
+        unitsIn: Number(order.unitsIn),
+        unitsOut: Number(order.unitsOut),
+        designated: Number(order.designated),
+        expiresAt: order.expiresAt,
+        taskCid: taskCidHex(posted.taskCid),
+      },
+      posted.owner,
+      posted.orderSig,
+      issuedAt,
+      signature,
+    ],
     chain: devnetChain(addresses.chainId),
     account: wallet.account,
   });
   const receipt = await publicClientOf(addresses.chainId).waitForTransactionReceipt({ hash });
   if (receipt.status !== "success") throw new Error(`claim reverted for ${jobId}`);
+  const terms: ExitTerms = {
+    owner: posted.owner,
+    rateIn: order.rateIn,
+    rateOut: order.rateOut,
+    unitsIn: Number(order.unitsIn),
+    unitsOut: Number(order.unitsOut),
+    slaSecs: Number(order.slaSecs),
+    gasFee,
+    relayer: wallet.account.address,
+  };
+  claimedTerms.set(jobId, terms);
   // The claim has taken one of the provider's eight capacity slots on a chain
   // nothing here can reset. See {@link resolveOutstandingClaims}.
-  outstandingClaims.push({ addresses, jobId });
+  outstandingClaims.push({ addresses, jobId, terms });
   return receipt.blockNumber;
 }
 
 /** Aborts a claimed job with the provider's `Fail` signature, landed from the relayer. */
 export async function failOnChain(addresses: Addresses, jobId: Hex): Promise<bigint> {
+  const terms = claimedTerms.get(jobId);
+  if (terms === undefined) throw new Error(`job ${jobId} was not claimed by claimOnChain`);
   const provider = providerAccount();
   const issuedAt = nowSecondsBigInt();
   const signature = await provider.signTypedData({
@@ -504,7 +548,7 @@ export async function failOnChain(addresses: Addresses, jobId: Hex): Promise<big
     address: addresses.jobRegistry,
     abi: jobRegistryAbi,
     functionName: "fail",
-    args: [jobId, issuedAt, signature],
+    args: [jobId, terms, issuedAt, signature],
     chain: devnetChain(addresses.chainId),
     account: wallet.account,
   });
@@ -513,18 +557,24 @@ export async function failOnChain(addresses: Addresses, jobId: Hex): Promise<big
   return receipt.blockNumber;
 }
 
-const ERC20 = parseAbi(["function balanceOf(address) view returns (uint256)"]);
-
-/** The payment token's balance for one address — how a refund is observed. */
-export async function tokenBalance(addresses: Addresses, holder: Address): Promise<bigint> {
+/**
+ * One owner's prepaid balance in `JobRegistry` — how a lock and a refund are
+ * observed: `claim` locks out of it and `fail` returns to it.
+ */
+export async function prepaidBalance(addresses: Addresses, holder: Address): Promise<bigint> {
   const client: PublicClient = publicClientOf(addresses.chainId);
-  return client.readContract({ address: addresses.usdc, abi: ERC20, functionName: "balanceOf", args: [holder] });
+  return client.readContract({
+    address: addresses.jobRegistry,
+    abi: jobRegistryAbi,
+    functionName: "balanceOf",
+    args: [holder],
+  });
 }
 
 /**
- * The live flat gas fee — the one leg `fail` and `reclaim` pay the treasury, so a
- * refund is `pulled − gasFee`, never `pulled`. It is snapshotted on the row at post
- * and nothing in this suite moves it, so the live read is the snapshot.
+ * The live flat gas fee — the one leg `fail` and `reclaim` keep for the claim's relayer,
+ * so a refund is `locked − gasFee`, never `locked`. `claim` locks the live one and
+ * nothing in this suite moves it, so the live read is the one locked.
  */
 export async function gasFeeOf(addresses: Addresses): Promise<bigint> {
   const client = publicClientOf(addresses.chainId);
@@ -555,7 +605,7 @@ export async function providerIdOf(addresses: Addresses, operator: Address): Pro
  *
  * `fail` prices at landing time: strictly past `claimedAt + FAIL_GRACE` it
  * applies `-40`, and inside it applies nothing. The money moves the same way either
- * way — gas fee to the treasury, the rest to the owner — so the reputation is the
+ * way — gas fee to the claim's relayer, the rest to the owner — so the reputation is the
  * only thing that distinguishes the free escape the key-loss path promises from an
  * ordinary penalised abort.
  */

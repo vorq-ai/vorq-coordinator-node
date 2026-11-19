@@ -16,21 +16,21 @@ import {
 } from "./api/schemas/common.js";
 
 /**
- * A **submission** — one signed order, its sealed content and its payment.
+ * A **submission** — one signed order, its sealed content and the amount it locks.
  *
  * This is the JSON body `POST /v1/jobs` takes, and **one line of a batch input
  * file is exactly that body**: the same flat order fields, the same
- * `container` / `container_cid` pair, the same payment. They are the
+ * `container` / `container_cid` pair, the same `amount`. They are the
  * same shape on purpose — a batch line is a single-job submission that happens
- * to arrive 50 000 at a time — so the parse and the two signature recoveries
- * live here, once, rather than once per door.
+ * to arrive 50 000 at a time — so the parse and the signature recovery live
+ * here, once, rather than once per door.
  *
  * What is deliberately *not* here is the flow. The single-job door interleaves a
  * `402` challenge between these checks and the batch worker interleaves nothing;
  * each owns its own order of operations, its own answers, and its own decision
  * about which refusals are fatal. What they must not own separately is what an
- * order *is* — the member widths, the `job_id` derivation, and which signature
- * has to recover to whom.
+ * order *is* — the member widths, the `job_id` derivation, and whom the order
+ * signature has to recover to.
  */
 
 /**
@@ -44,13 +44,13 @@ import {
  * width is wider. `designated` is the deliberately unvalidated one on chain —
  * 0 means "any provider" — so it is bounded to `uint32` and nothing more.
  *
- * The container and the payment are optional here because the challenge carries
+ * The container and the amount are optional here because the challenge carries
  * neither; which combinations a door accepts is the door's decision.
  */
 export const Submission = Type.Object(
   {
     c: Hex32({ description: "keccak256(version ‖ seed_wrap ‖ keccak256(ciphertext))." }),
-    owner: AddressIn({ description: "The payer, who signs the order and the payment." }),
+    owner: AddressIn({ description: "The payer, who signs the order and whose balance it locks." }),
     job_id: Hex32({ description: "keccak256(owner ‖ c), restated so a mismatch is refused here." }),
     model_id: Uint32(),
     sla_secs: Uint32({ description: "The window, in seconds." }),
@@ -67,18 +67,14 @@ export const Submission = Type.Object(
     container_cid: Type.Optional(
       Cid({ description: "A `POST /v1/files` upload with `purpose=input`, by this owner." }),
     ),
-    auth_sig: Type.Optional(
-      Sig65({ description: "EIP-3009 `ReceiveWithAuthorization` over the quoted payment." }),
-    ),
     amount: Type.Optional(
       Usd({
         description:
-          "The quoted amount in USD, echoed: the payment is stateless, so this is what tells a stale " +
-          "quote from a forged authorization.",
+          "The quoted amount in USD, echoed: what the claim will lock from the prepaid balance. The " +
+          "quote is stateless, so this is what tells a stale quote from the current one.",
       }),
     ),
   },
-  { dependentRequired: { auth_sig: ["amount"] } },
 );
 export type Submission = Static<typeof Submission>;
 
@@ -123,17 +119,16 @@ export function parseOrder(body: Submission, decimals: number): ParsedOrder {
 }
 
 /**
- * The payment half of a submission: the authorization signature and the echoed
- * amount. **Echoed, not remembered** (R7): the 402 is stateless, so without it
- * there is nothing at relay time to tell an honest client whose quote went
- * stale from a forged authorization.
+ * The echoed amount a complete submission accepts to lock. **Echoed, not
+ * remembered** (R7): the 402 is stateless, so without it there is nothing at
+ * submission time to tell a client whose quote went stale from a current one.
  */
-export function parsePayment(body: Submission, decimals: number): { authSig: Hex; amount: bigint } {
-  return { authSig: body.auth_sig as Hex, amount: usdParam(body.amount as string, decimals, "amount") };
+export function parseAmount(body: Submission, decimals: number): bigint {
+  return usdParam(body.amount as string, decimals, "amount");
 }
 
-/** Whether a submission carries its payment: `auth_sig` is present. */
-export const hasPayment = (body: Submission): boolean => body.auth_sig !== undefined;
+/** Whether a submission is complete rather than a challenge: `amount` is present. */
+export const hasAmount = (body: Submission): boolean => body.amount !== undefined;
 
 /**
  * How a submission carries its sealed container: the bytes, or the name of an

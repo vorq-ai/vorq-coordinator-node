@@ -22,7 +22,7 @@ export type LineState =
   | "settled"
   /** Terminal without delivery — owner cancel, provider fail, or SLA reclaim. */
   | "cancelled"
-  /** Never became a job: `postMany` answered `PostSkipped` for it. */
+  /** Never became a job: the worker skipped it, with a reason. */
   | "skipped";
 
 /** OpenAI's batch status vocabulary, unchanged. */

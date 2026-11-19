@@ -1,21 +1,22 @@
 ---
 title: Run a batch
-description: Post many signed orders from one JSONL file and read the per-line outcome files.
+description: Submit many signed orders from one JSONL file and read the per-line outcome files.
 ---
 
-A batch posts many orders from one uploaded JSONL file. Each line is posted as its own job; the batch tracks them and writes an output file and an error file when they are all done.
+A batch submits many orders from one uploaded JSONL file. Each line becomes its own job, held until a provider claims it; the batch tracks them and writes an output file and an error file when they are all done.
 
 You need a [session](./authenticate-with-a-wallet.md) for the wallet that owns the orders.
 
 ## 1. Write the input file
 
-Each non-blank line is one complete [`POST /v1/jobs`](../reference/client-api.md#post-v1jobs) submission body: the order fields, `signature`, `auth_sig`, `amount`, and `container` or `container_cid`. A line may also carry `url`; when present it must equal the batch `endpoint`.
+Each non-blank line is one complete [`POST /v1/jobs`](../reference/client-api.md#post-v1jobs) submission body: the order fields, `signature`, `amount`, and `container` or `container_cid`. A line may also carry `url`; when present it must equal the batch `endpoint`.
 
 ```jsonl
-{"url":"/v1/responses","c":"0x…","model_id":3,"sla_secs":86400,"rate_in":"0.0012","rate_out":"0.005","units_in":1000,"units_out":1000,"designated":0,"expires_at":1786003600,"owner":"0x…","job_id":"0x…","signature":"0x…","auth_sig":"0x…","amount":"0.002007","container":"AQ…"}
+{"url":"/v1/responses","c":"0x…","model_id":3,"sla_secs":86400,"rate_in":"0.0012","rate_out":"0.005","units_in":1000,"units_out":1000,"designated":0,"expires_at":1786003600,"owner":"0x…","job_id":"0x…","signature":"0x…","amount":"0.002007","container":"AQ…"}
 ```
 
 - `amount` must be exactly `cap + fee + gas_fee` at the time the batch is processed. Quote one line first to learn the current `gas_fee` and `fee_bps`.
+- Each line locks its `amount` from the owner's prepaid balance when it is claimed. Before uploading, check [`GET /v1/balance`](../reference/client-api.md#get-v1balance) and [deposit](./submit-a-job.md#4-cover-the-quote) the shortfall between the lines' summed `amount` and `available`. Lines the balance cannot cover, in file order, are skipped as `insufficient_funds`.
 - A file holds at most 50 000 lines.
 - Invalid lines are skipped and reported, never fatal to the batch.
 
@@ -39,7 +40,7 @@ curl -s -X POST "$VORQ/v1/batches" \
   | tee batch.json | jq '{id, status}'
 ```
 
-`endpoint` is `/v1/responses` or `/v1/embeddings`. `completion_window` is `1h` or `24h`; a `24h` batch usually takes minutes to a few hours, 24 hours at most. The batch starts as `validating`; the coordinator picks it up within about 15 seconds and posts its lines on chain.
+`endpoint` is `/v1/responses` or `/v1/embeddings`. `completion_window` is `1h` or `24h`; a `24h` batch usually takes minutes to a few hours, 24 hours at most. The batch starts as `validating`; the coordinator picks it up within about 15 seconds and holds each line as an order.
 
 Lines that use `container_cid` are attached only when the batch is processed, and an unattached upload is deleted after 300 seconds. Upload those containers right before creating the batch.
 
@@ -69,4 +70,4 @@ Either id is `null` when it would be empty. The output file has one line per set
 curl -s -X POST "$VORQ/v1/batches/$BATCH_ID/cancel" -H "authorization: Bearer $TOKEN"
 ```
 
-If the batch is still `validating`, none of its lines are posted. Lines already on chain are not touched: the coordinator cannot sign for you, so an open line stays open until a provider claims it or it expires. To stop those sooner, [cancel each job](./cancel-a-job.md) with your own signature. The batch reads `cancelling` until every line has ended, then `cancelled`.
+If the batch is still `validating`, none of its lines are held. Lines already held are not touched: an open line stays open until a provider claims it or it expires. To stop those sooner, [cancel each job](./cancel-a-job.md) with your own signature. The batch reads `cancelling` until every line has ended, then `cancelled`.

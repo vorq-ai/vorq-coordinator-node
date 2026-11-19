@@ -46,11 +46,11 @@ import {
  * attack P4 exists to close.
  *
  * Unit project: no database, no chain, no network. The chain reads go through
- * viem and the ABI against `test/support/stub-chain.ts`, and the database handed
- * to every app here **throws on any query** — which is P7 asserted by
- * construction rather than by a stub that would have answered. Task 7 forges a
- * `Claimed` row in Postgres and expects a refusal; the property that test checks
- * is the one this file's `hostileDb` makes impossible to violate at all.
+ * viem and the ABI against `test/support/stub-chain.ts`. The database handed to
+ * every app here answers **one** statement — the job row `/release` reads its
+ * owner, `designated` and `expires_at` from — and throws on any other (P7): the
+ * claim state and the claimant still come from the chain alone, and the row's
+ * owner is accepted only when it reproduces the job id.
  */
 
 // ---------------------------------------------------------------------------
@@ -63,6 +63,37 @@ const hostileDb = {
     throw new Error("/release must not read the store (P7)");
   },
 } as unknown as Db;
+
+/** The one statement `/release` may make: the job's row, by id. */
+const ROW_READ = /^SELECT owner, designated, expires_at FROM jobs WHERE job_id = \$1$/;
+
+/**
+ * A store holding exactly the job rows in `jobs` and answering nothing but
+ * {@link ROW_READ}, every statement it was asked recorded in `queries`.
+ */
+function rowStore(jobs: Map<string, JobFixture>) {
+  const queries: string[] = [];
+  const db = {
+    query: async (sql: string, params: readonly unknown[]) => {
+      queries.push(sql);
+      if (!ROW_READ.test(sql.trim())) throw new Error(`/release must not run ${sql} (P7)`);
+      const key = `0x${(params[0] as Buffer).toString("hex")}`;
+      const job = jobs.get(key);
+      if (job === undefined || job.row === false) return { rows: [], rowCount: 0 };
+      return {
+        rows: [
+          {
+            owner: Buffer.from(job.owner.slice(2), "hex"),
+            designated: BigInt(job.designated),
+            expires_at: job.expiresAt,
+          },
+        ],
+        rowCount: 1,
+      };
+    },
+  } as unknown as Db;
+  return { db, queries };
+}
 
 const indexerReporting = (status: IndexerStatus): Indexer => ({
   coldStart: async () => undefined,
@@ -80,6 +111,7 @@ const escrowConfig = (overrides: Partial<Config["escrow"]> = {}): Config =>
     escrow: { mode: "mock", releaseOrdinal: 1, sweepIntervalMs: ESCROW_SWEEP_INTERVAL_MS, peerUrl: null, peerRequired: false, peerSyncMs: 300_000, rotateIntervalMs: 86_400_000, operatorKeys: [], clockOffsetMs: 0, ...overrides },
     match: { leaseMs: 20_000, livenessMs: 15_000, candidates: 3 },
     jobRateLimit: 0,
+    moneyRateLimit: 24,
   });
 
 const NOW_SECONDS = 1_790_000_000;
@@ -101,37 +133,44 @@ const OTHER_OPERATOR = wallet("d5");
 const HONEST_PROVIDER_ID = 7;
 const ATTACKER_PROVIDER_ID = 9;
 
-/** A `getJob` answer, defaulted to a live claimed job so each test states one thing. */
-const jobView = (over: Partial<JobView>): JobView =>
-  ({
-    found: true,
-    jobId: ZERO32,
-    owner: ZERO_ADDRESS,
-    c: ZERO32,
-    state: 1,
-    endedBecause: 0,
-    providerId: HONEST_PROVIDER_ID,
-    designated: 0,
-    modelId: 1,
-    rateIn: 0n,
-    rateOut: 0n,
-    unitsIn: 0,
-    unitsOut: 0,
-    completionTok: 0,
-    promptTok: 0,
-    cachedTok: 0,
-    rateInCached: 0n,
-    slaSecs: 3600,
-    // Far past the epoch used below, so nothing is orphaned unless a test says so.
-    expiresAt: BigInt(NOW_SECONDS + 86_400),
-    claimedAt: BigInt(NOW_SECONDS - 60),
-    taskCid: "0x",
-    resultCid: "0x",
-    gasFee: 0n,
-    ...over,
-  }) as unknown as JobView;
+/**
+ * One job as this file states it: the chain's `getJob` answer, and the row this
+ * node holds for it — the owner, `designated` and `expires_at`. `row: false`
+ * states a job the chain has and this node holds no row for.
+ */
+type JobFixture = JobView & {
+  owner: Address;
+  designated: number;
+  expiresAt: bigint;
+  row?: false;
+};
 
-const MISSING_JOB = jobView({ found: false, state: 0, providerId: 0, expiresAt: 0n, claimedAt: 0n });
+/** A job, defaulted to a live claimed one so each test states one thing. */
+const jobView = (over: Partial<JobFixture>): JobFixture => ({
+  found: true,
+  jobId: ZERO32,
+  state: 1,
+  endedBecause: 0,
+  providerId: HONEST_PROVIDER_ID,
+  claimedAt: BigInt(NOW_SECONDS - 60),
+  owner: ZERO_ADDRESS,
+  designated: 0,
+  // Far past the epoch used below, so nothing is orphaned unless a test says so.
+  expiresAt: BigInt(NOW_SECONDS + 86_400),
+  ...over,
+});
+
+const MISSING_JOB = jobView({ found: false, state: 0, providerId: 0, claimedAt: 0n });
+
+/** The six members `getJob` answers, and nothing of the row. */
+const chainView = (job: JobFixture): JobView => ({
+  found: job.found,
+  jobId: job.jobId,
+  state: job.state,
+  endedBecause: job.endedBecause,
+  providerId: job.providerId,
+  claimedAt: job.claimedAt,
+});
 
 /**
  * A node with an escrow, a stubbed chain, and a hostile store.
@@ -140,7 +179,7 @@ const MISSING_JOB = jobView({ found: false, state: 0, providerId: 0, expiresAt: 
  * *mappings*, so both are stubbed as functions of the decoded arguments.
  */
 function escrowNode(options: {
-  jobs?: Record<string, JobView>;
+  jobs?: Record<string, JobFixture>;
   providerIds?: Record<string, number>;
   indexer?: Indexer;
   config?: Config;
@@ -167,7 +206,7 @@ function escrowNode(options: {
       getJob: (args: readonly unknown[]) => {
         const fail = failing("getJob");
         if (fail !== null) throw fail();
-        return jobs.get(String(args[0]).toLowerCase()) ?? MISSING_JOB;
+        return chainView(jobs.get(String(args[0]).toLowerCase()) ?? MISSING_JOB);
       },
       idOf: (args: readonly unknown[]) => {
         const fail = failing("idOf");
@@ -186,8 +225,9 @@ function escrowNode(options: {
     keys = minted;
   }
 
+  const store = rowStore(jobs);
   const app = buildApp({
-    db: hostileDb,
+    db: store.db,
     indexer: options.indexer ?? READY,
     config,
     chain: stub.chain,
@@ -196,7 +236,7 @@ function escrowNode(options: {
     escrowKeyEpochStart: () => options.keyEpochStart ?? null,
   });
 
-  return { app, keys, stub, config };
+  return { app, keys, stub, config, queries: store.queries };
 }
 
 /**
@@ -286,7 +326,6 @@ describe("POST /release", () => {
         [container.jobId]: jobView({
           jobId: container.jobId,
           owner,
-          c: container.c,
           state: 1,
           providerId: HONEST_PROVIDER_ID,
         }),
@@ -326,7 +365,7 @@ describe("POST /release", () => {
     expect(openCiphertext(container.ciphertext, dek)).toBe("the task");
   });
 
-  it("reads the chain at the node's floor and never touches the store (P7, P18)", async () => {
+  it("reads the chain at the node's floor and the store only for the job's row (P7, P18)", async () => {
     const { node, body } = await happyPath();
     const answer = await node.app.inject({ method: "POST", url: "/release", payload: body });
     expect(answer.statusCode).toBe(200);
@@ -337,7 +376,9 @@ describe("POST /release", () => {
     // a provider that claimed seconds ago must not be refused its own DEK for
     // the lag. Before this node has a receipt or a head poll, "now" is `latest`.
     for (const call of calls) expect((call.params as unknown[])[1]).toBe("latest");
-    // P7's other half: `hostileDb` throws on any query, so a 200 is the proof.
+    // P7's other half: the store was asked for the job's row and nothing else.
+    expect(node.queries.length).toBeGreaterThanOrEqual(1);
+    for (const sql of node.queries) expect(sql.trim()).toMatch(ROW_READ);
 
     // Once the node holds proof of a block — here, the receipt of the claim it
     // just relayed — the read is pinned there, so a load-balanced node that has
@@ -393,7 +434,6 @@ describe("POST /release", () => {
         [container.jobId]: jobView({
           jobId: container.jobId,
           owner,
-          c: container.c,
           providerId: HONEST_PROVIDER_ID,
         }),
       },
@@ -470,14 +510,14 @@ describe("P4: a wrap lifted onto an attacker's own claimed order", () => {
    *   * containers are publicly fetchable by CID, so the attacker holds the
    *     victim's `seed_wrap` `W`;
    *   * the attacker picks any `ct_hash` and computes `c' = keccak256(TAG ‖ W ‖ ct')`;
-   *   * the attacker posts a dust order under **its own** address, minting
-   *     `job_id' = keccak256(attacker ‖ c')` — so the chain-read owner is
+   *   * the attacker submits a dust order under **its own** address, minting
+   *     `job_id' = keccak256(attacker ‖ c')` — so the job's proven owner is
    *     genuinely the attacker and the weld is self-consistent;
    *   * the attacker claims it with a genuinely registered provider wallet.
    *
    * Nothing in the request is forged, so nothing in the request can be refused.
    * The defence is in the **derivation**: the sealed 32 bytes are a seed, and the
-   * working key is `HKDF(seed, info = "vorq-dek" ‖ chain-read owner)`. The
+   * working key is `HKDF(seed, info = "vorq-dek" ‖ proven owner)`. The
    * attacker's release derives under the attacker's owner and is therefore not
    * the key the victim's ciphertext was encrypted under.
    */
@@ -503,14 +543,12 @@ describe("P4: a wrap lifted onto an attacker's own claimed order", () => {
         [victim.jobId]: jobView({
           jobId: victim.jobId,
           owner: victimOwner,
-          c: victim.c,
           providerId: HONEST_PROVIDER_ID,
         }),
         // Genuinely Claimed, by a genuinely registered provider, at cap = 1.
         [liftedJobId]: jobView({
           jobId: liftedJobId,
           owner: attackerOwner,
-          c: liftedC,
           providerId: ATTACKER_PROVIDER_ID,
         }),
       },
@@ -580,25 +618,19 @@ describe("P4: a wrap lifted onto an attacker's own claimed order", () => {
   });
 
   /**
-   * **The weld that decides the KDF's owner input, and the only one left** (S1).
+   * **The weld that decides the KDF's owner input** (S1, P7).
    *
-   * C1 removed the body's `owner`, so `parseRelease`'s pre-check weld and the
-   * refusal it produced are gone: there is no caller-supplied identity left to
-   * disagree with the chain. What remains is this — the chain's own answer
-   * checked for self-consistency before a single byte of key material moves.
-   * `releaseUnder` still takes a narrow signature and still cannot see a
-   * request, and that is not redundancy: the day somebody accepts the invitation
-   * in the comment above `jobIdFor` ("cannot fail against a healthy contract"),
-   * there must still be no way for anything but `view.owner` to reach the KDF.
+   * `getJob` carries no owner, so the owner comes from the job's row — and a row
+   * is something an operator, a bug or an attacker with database access can
+   * forge. It is therefore accepted only when `keccak256(owner ‖
+   * commitment(seed_wrap, ct_hash)) == job_id`: a forged row naming any other
+   * owner names another id, and nothing is derived under it.
    */
-  it("refuses to derive under a chain answer that does not reproduce the job id", async () => {
-    // The chain's weld is now the only one, and it holds by collision resistance
-    // — **as long as the chain's own answer is self-consistent.** This is the
-    // case where it is not: `getJob` reports an
-    // owner that does not reproduce the id it was asked about. Deriving under it
-    // would hand back a key nobody can use while looking exactly like success,
-    // so the last thing this door does before touching key material is check that
-    // the identity it is about to derive under is the one welded into the id.
+  it("refuses a forged row whose owner does not reproduce the job id", async () => {
+    // The chain says the job is genuinely Claimed by the signer's provider. The
+    // row names an owner who is not the one welded into the id: deriving under it
+    // would hand back a key nobody can use, or the attacker's own key, while
+    // looking exactly like success.
     const keys = new KeyManager();
     keys.boot();
     const owner = getAddress(VICTIM.address) as Address;
@@ -609,9 +641,7 @@ describe("P4: a wrap lifted onto an attacker's own claimed order", () => {
       jobs: {
         [container.jobId]: jobView({
           jobId: container.jobId,
-          // The commitment is this job's, so rung 5b's first half passes...
-          c: container.c,
-          // ...and the owner is somebody else's, so its second half does not.
+          // The wrap and ct hash are this job's; the row's owner is somebody else's.
           owner: getAddress(ATTACKER.address) as Address,
           providerId: HONEST_PROVIDER_ID,
         }),
@@ -625,6 +655,35 @@ describe("P4: a wrap lifted onto an attacker's own claimed order", () => {
       seed_wrap: container.seedWrap.toString("base64"),
       ct_hash: container.ctHash,
       response_pubkey: response.publicKey.toString("hex"),
+      issued_at: Number(NOW_SECONDS),
+    });
+
+    const answer = await node.app.inject({ method: "POST", url: "/release", payload: body });
+    expect(answer.statusCode).toBe(400);
+    expect(errorOf(answer).code).toBe("wrap_mismatch");
+  });
+
+  it("refuses a claimed job this node holds no row for, with the same wrap_mismatch", async () => {
+    // Claimed on chain — through some other coordinator — and unknown here: there
+    // is no owner this node can prove, so there is nothing to derive under.
+    const keys = new KeyManager();
+    keys.boot();
+    const owner = getAddress(VICTIM.address) as Address;
+    const container = containerFor(owner, keys.current()!.publicKey);
+
+    const node = escrowNode({
+      keys,
+      jobs: {
+        [container.jobId]: jobView({ jobId: container.jobId, owner, row: false }),
+      },
+      providerIds: { [HONEST_OPERATOR.address]: HONEST_PROVIDER_ID },
+    });
+
+    const body = await signedRelease(HONEST_OPERATOR, {
+      job_id: container.jobId,
+      seed_wrap: container.seedWrap.toString("base64"),
+      ct_hash: container.ctHash,
+      response_pubkey: newRecipientKeypair().publicKey.toString("hex"),
       issued_at: Number(NOW_SECONDS),
     });
 
@@ -734,11 +793,10 @@ describe("the verification ladder", () => {
     const container = containerFor(owner, keys.current()!.publicKey);
     const response = newRecipientKeypair();
 
-    const jobs: Record<string, JobView> = {
+    const jobs: Record<string, JobFixture> = {
       [container.jobId]: jobView({
         jobId: container.jobId,
         owner,
-        c: container.c,
         providerId: HONEST_PROVIDER_ID,
       }),
     };
@@ -820,11 +878,11 @@ describe("the verification ladder", () => {
     expect(node.stub.requests.filter((r) => r.method === "eth_call")).toHaveLength(0);
   });
 
-  it("3. refuses a wrap lifted from another order with wrap_mismatch, at the chain's own c", async () => {
+  it("3. refuses a wrap lifted from another order with wrap_mismatch, at the job's own id", async () => {
     const { keys, jobs, fields, owner } = await fixture();
     // A different client's wrap over this order's job id: `c` covers the wrap, so
-    // the commitment the chain holds for this job is not the one these two pieces
-    // reproduce.
+    // these two pieces reproduce another commitment, and under this job's owner
+    // another id.
     const other = containerFor(owner, keys.current()!.publicKey, "someone else's task");
 
     const node = escrowNode({
@@ -841,11 +899,11 @@ describe("the verification ladder", () => {
     expect(answer.statusCode).toBe(400);
     expect(errorOf(answer).code).toBe("wrap_mismatch");
 
-    // **This costs a chain read now, and that is the change C1 made.** The old
-    // parse-time weld refused here for free by re-deriving `jobId` from the
-    // *body's* owner — a check over data the caller supplies, which P4 already
-    // proved cannot authorise anything. One producer of `wrap_mismatch` was
-    // deleted; the two that read the chain remain, and this is the first of them.
+    // **This costs a chain read and a row read, and that is the change C1 made.**
+    // The old parse-time weld refused here for free by re-deriving `jobId` from
+    // the *body's* owner — a check over data the caller supplies, which P4
+    // already proved cannot authorise anything. The weld is now against the
+    // owner of the job's row, after the chain has said the job is claimed.
     expect(node.stub.requests.filter((r) => r.method === "eth_call").length).toBeGreaterThanOrEqual(1);
   });
 
@@ -919,7 +977,6 @@ describe("the verification ladder", () => {
           [container.jobId]: jobView({
             jobId: container.jobId,
             owner,
-            c: container.c,
             state,
             providerId: state === 0 ? 0 : HONEST_PROVIDER_ID,
           }),
@@ -971,7 +1028,6 @@ describe("the verification ladder", () => {
         [junk.jobId]: jobView({
           jobId: junk.jobId,
           owner,
-          c: junk.c,
           providerId: HONEST_PROVIDER_ID,
         }),
       },
@@ -997,7 +1053,7 @@ describe("the verification ladder", () => {
 // P7 / P15 — `escrow_key_lost`, per job, chain-only, one-sided
 // ---------------------------------------------------------------------------
 
-describe("escrow_key_lost is per-job and derived from the chain alone (P7, P15)", () => {
+describe("escrow_key_lost is per-job and derived from the order alone (P7, P15)", () => {
   /** A junk-to-this-node wrap on an undesignated job that expired before the epoch. */
   async function orphanFixture(over: { designated?: number; expiresAt?: bigint } = {}) {
     const keys = new KeyManager();
@@ -1011,7 +1067,6 @@ describe("escrow_key_lost is per-job and derived from the chain alone (P7, P15)"
       [lost.jobId]: jobView({
         jobId: lost.jobId,
         owner,
-        c: lost.c,
         providerId: HONEST_PROVIDER_ID,
         designated: over.designated ?? 0,
         expiresAt: over.expiresAt ?? BigInt(NOW_SECONDS - 7_200),
@@ -1077,8 +1132,8 @@ describe("escrow_key_lost is per-job and derived from the chain alone (P7, P15)"
 
   it("classifies the ambiguous band as unseal_failed, which is the one-sided direction", async () => {
     // A job that expires *after* the epoch began may have been posted either side
-    // of it; `getJob` carries no posting block or time, so the honest answer is
-    // the conservative one. The provider's escape is identical either way.
+    // of it; nothing `/release` reads carries a posting block or time, so the
+    // honest answer is the conservative one. The provider's escape is identical either way.
     const { keys, jobs, body } = await orphanFixture({ expiresAt: BigInt(NOW_SECONDS + 600) });
     const node = escrowNode({
       keys,
@@ -1091,7 +1146,7 @@ describe("escrow_key_lost is per-job and derived from the chain alone (P7, P15)"
     expect(errorOf(answer).code).toBe("unseal_failed");
   });
 
-  it("is a pure predicate over chain state and the epoch", () => {
+  it("is a pure predicate over the order's two members and the epoch", () => {
     const before = jobView({ designated: 0, expiresAt: BigInt(NOW_SECONDS - 7_200) });
     const after = jobView({ designated: 0, expiresAt: BigInt(NOW_SECONDS + 7_200) });
     const designated = jobView({ designated: 3, expiresAt: BigInt(NOW_SECONDS - 7_200) });
@@ -1146,7 +1201,6 @@ describe("a failed authorisation read on POST /release (R77)", () => {
       [container.jobId]: jobView({
         jobId: container.jobId,
         owner,
-        c: container.c,
         providerId: HONEST_PROVIDER_ID,
       }),
     };
@@ -1238,7 +1292,6 @@ describe("POST /release outside the readiness gate (P14, P26)", () => {
         [container.jobId]: jobView({
           jobId: container.jobId,
           owner,
-          c: container.c,
           providerId: HONEST_PROVIDER_ID,
         }),
       },
@@ -1291,7 +1344,6 @@ describe("/release on a static node", () => {
         [container.jobId]: jobView({
           jobId: container.jobId,
           owner,
-          c: container.c,
           providerId: HONEST_PROVIDER_ID,
         }),
       },

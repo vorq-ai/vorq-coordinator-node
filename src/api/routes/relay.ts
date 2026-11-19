@@ -34,7 +34,7 @@ const ChainContext = Type.Object({
   decimals: Type.Integer({ description: "The payment token's decimals." }),
   token_domain: Type.Object(
     { name: Type.String(), version: Type.String() },
-    { description: "The EIP-712 domain a payment authorization is signed under." },
+    { description: "The EIP-712 domain a deposit authorization is signed under." },
   ),
   head_block: Int(),
   block_time_ms: Type.Integer(),
@@ -83,7 +83,7 @@ export function relayRoutes(app: App, deps: RouteDeps): void {
       },
       // The payment token's own two facts, both from the address book: what an
       // amount on this wire is denominated in, and the EIP-712 name and version
-      // a client signs its payment authorization under.
+      // a client signs its deposit authorization under.
       decimals: addresses.decimals,
       token_domain: addresses.tokenDomain,
       head_block: headBlock,

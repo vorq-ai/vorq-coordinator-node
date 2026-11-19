@@ -3,16 +3,23 @@ import { jobRegistryAbi } from "../abi/jobRegistry.js";
 import type { Chain } from "../chain/client.js";
 import type { Config } from "../config.js";
 import type { Db } from "../db/db.js";
+import { EXIT_TERMS_COLUMNS, exitTermsOf, type ExitTerms, type ExitTermsRow } from "../orders.js";
 
 /**
- * The `reclaim` keeper: the one automatic on-chain write this node performs.
+ * The `reclaim` keeper: one of the two automatic on-chain writes this node
+ * performs; the other is the payout keeper (`keepers/payouts.ts`).
  *
  * ## What it is for
  *
- * `JobRegistry.reclaim(jobId)` is the protocol's only permissionless, unsigned
- * mutation. When a claimed job blows its SLA it does two things at once: it
- * refunds the client's locked capital in full, and it applies the −40 reputation
- * penalty that makes abandonment expensive.
+ * `JobRegistry.reclaim(jobId, terms)` is the protocol's only permissionless,
+ * unsigned mutation on a job. When a claimed job blows its SLA it does two things
+ * at once: it returns the client's locked capital to its balance, and it applies
+ * the −40 reputation penalty that makes abandonment expensive. `terms` is the
+ * job's own, built from its row; the contract checks it against the hash it
+ * stored at claim. Its `relayer` is whichever coordinator landed the claim, so a
+ * reclaim of a job another coordinator claimed pays that coordinator's relayer
+ * the gas fee, not this one. A claimed row whose `Claimed` is not indexed yet has
+ * no relayer and waits for the next pass.
  *
  * Neither happens on its own. The contract deliberately requires **no** signature
  * so that no single party can strand an escrow by doing nothing — but "anyone may
@@ -105,9 +112,9 @@ export async function reclaimTick(
   const head = await chain.publicClient.getBlock({ blockTag: "latest" });
   const chainNow = head.timestamp;
 
-  const { rows } = await deps.db.query<{ job_id: Buffer }>(
-    `SELECT job_id FROM jobs
-      WHERE state = $1 AND claimed_at + sla_secs < $2
+  const { rows } = await deps.db.query<ExitTermsRow & { job_id: Buffer }>(
+    `SELECT job_id, ${EXIT_TERMS_COLUMNS} FROM jobs
+      WHERE state = $1 AND claimed_at + sla_secs < $2 AND relayer IS NOT NULL
       ORDER BY claimed_at ASC
       LIMIT $3`,
     [STATE_CLAIMED, chainNow.toString(), RECLAIM_BATCH],
@@ -119,7 +126,7 @@ export async function reclaimTick(
   for (const row of rows) {
     const jobId = `0x${row.job_id.toString("hex")}` as Hex;
     try {
-      if (await reclaimOne(deps, chain, jobId)) reclaimed += 1;
+      if (await reclaimOne(deps, chain, jobId, exitTermsOf(row))) reclaimed += 1;
       else skipped += 1;
     } catch (error) {
       onError(error, jobId);
@@ -136,13 +143,18 @@ export async function reclaimTick(
  * working — so it is a return value rather than a throw. Anything else (an RPC
  * that fell over, a relay queue that filled) throws and is reported.
  */
-async function reclaimOne(deps: ReclaimDeps, chain: Chain, jobId: Hex): Promise<boolean> {
+async function reclaimOne(
+  deps: ReclaimDeps,
+  chain: Chain,
+  jobId: Hex,
+  terms: ExitTerms,
+): Promise<boolean> {
   try {
     await chain.publicClient.simulateContract({
       address: deps.config.addresses.jobRegistry,
       abi: jobRegistryAbi,
       functionName: "reclaim",
-      args: [jobId],
+      args: [jobId, terms],
       account: chain.account,
     });
   } catch {
@@ -151,7 +163,7 @@ async function reclaimOne(deps: ReclaimDeps, chain: Chain, jobId: Hex): Promise<
     return false;
   }
 
-  const data = encodeFunctionData({ abi: jobRegistryAbi, functionName: "reclaim", args: [jobId] });
+  const data = encodeFunctionData({ abi: jobRegistryAbi, functionName: "reclaim", args: [jobId, terms] });
   const hash = await chain.relay({ to: deps.config.addresses.jobRegistry, data });
   const receipt = await chain.receipt(hash, 120_000);
 

@@ -1,4 +1,4 @@
-import { decodeFunctionData, encodeEventTopics, type Hex } from "viem";
+import { decodeFunctionData, encodeEventTopics, getAddress, type Hex } from "viem";
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { jobRegistryAbi } from "../src/abi/jobRegistry.js";
 import { openDb, type Db } from "../src/db/db.js";
@@ -29,6 +29,13 @@ const TEST_SCHEMA = "vorq_reclaim_keeper_test";
 
 /** The timestamp `stubChain` reports on every block. The chain's clock. */
 const CHAIN_NOW = 1_800_000_000n;
+
+/**
+ * The relayer that landed every seeded claim: another coordinator's. The keeper
+ * reclaims any expired claim, and the terms it passes back must carry the
+ * claim's relayer, never this node's own.
+ */
+const FOREIGN_RELAYER = `0x${"f0".repeat(20)}` as Hex;
 
 /** `Ended`, as a receipt log — what proves the reclaim actually took effect. */
 const endedLog = (jobId: Hex) => ({
@@ -73,13 +80,16 @@ describe.skipIf(!TEST_DATABASE_URL)("the reclaim keeper's sweep", () => {
     state: number;
     claimedAt: bigint;
     slaSecs: bigint;
+    /** The claim's relayer; defaults to {@link FOREIGN_RELAYER} on a claimed row, none on an open one. */
+    relayer?: Hex | null;
   }): Promise<Hex> {
     const jobId = jobIdOf(options.n);
+    const relayer = options.relayer === undefined ? (options.state === 0 ? null : FOREIGN_RELAYER) : options.relayer;
     await db.query(
       `INSERT INTO jobs (job_id, owner, c, model_id, sla_secs, designated, rate_in, rate_out,
                          units_in, units_out, expires_at, state, provider_id, claimed_at,
-                         task_cid, as_of_block, gas_fee)
-       VALUES ($1, $2, $3, 1, $4, 0, 0, 0, 0, 0, $5, $6, 7, $7, ''::bytea, 1000, 0)`,
+                         task_cid, as_of_block, gas_fee, relayer)
+       VALUES ($1, $2, $3, 1, $4, 0, 2000000, 8000000, 1000, 500, $5, $6, 7, $7, ''::bytea, 1000, 3000, $8)`,
       [
         Buffer.from(jobId.slice(2), "hex"),
         Buffer.alloc(20, options.n),
@@ -88,6 +98,7 @@ describe.skipIf(!TEST_DATABASE_URL)("the reclaim keeper's sweep", () => {
         (CHAIN_NOW + 86_400n).toString(),
         options.state,
         options.claimedAt.toString(),
+        relayer === null ? null : Buffer.from(relayer.slice(2), "hex"),
       ],
     );
     return jobId;
@@ -127,11 +138,41 @@ describe.skipIf(!TEST_DATABASE_URL)("the reclaim keeper's sweep", () => {
 
     expect(result).toEqual({ candidates: 1, reclaimed: 1, skipped: 0 });
 
-    // And it reclaimed *that* job: the calldata names it.
+    // And it reclaimed *that* job: the calldata names it, and carries the
+    // job's exit terms from its row — what the contract hashes against the
+    // `termsHash` it stored at claim.
     expect(stub.relayed).toHaveLength(1);
     const call = decodeFunctionData({ abi: jobRegistryAbi, data: stub.relayed[0]! });
     expect(call.functionName).toBe("reclaim");
     expect(call.args?.[0]).toBe(expired);
+    expect(call.args?.[1]).toEqual({
+      owner: getAddress(`0x${"01".repeat(20)}`),
+      rateIn: 2_000_000n,
+      rateOut: 8_000_000n,
+      unitsIn: 1000,
+      unitsOut: 500,
+      slaSecs: 3600,
+      gasFee: 3000n,
+      relayer: getAddress(FOREIGN_RELAYER),
+    });
+    expect(FOREIGN_RELAYER.toLowerCase()).not.toBe(stub.chain.account.address.toLowerCase());
+    // The simulate carried the same terms.
+    expect(stub.simulated).toEqual(stub.relayed);
+  });
+
+  /**
+   * A claimed row whose `Claimed` this node has not indexed — reconcile wrote
+   * its state, not its relayer — has no exit terms: the relayer is hashed into
+   * them and nothing may stand in for it. It waits for the indexer.
+   */
+  it("leaves an expired claim whose relayer is not indexed yet alone", async () => {
+    await seedJob({ n: 6, state: 1, claimedAt: CHAIN_NOW - 7200n, slaSecs: 3600n, relayer: null });
+
+    const stub = stubChain(config);
+    const result = await reclaimTick(depsWith(stub), noErrors);
+
+    expect(result).toEqual({ candidates: 0, reclaimed: 0, skipped: 0 });
+    expect(stub.simulated).toEqual([]);
   });
 
   /**

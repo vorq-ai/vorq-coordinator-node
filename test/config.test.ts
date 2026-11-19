@@ -120,6 +120,17 @@ describe("loadConfig defaults", () => {
     );
   });
 
+  it("limits relayed deposits and withdrawals by default, and never not at all", () => {
+    // Its own knob, not JOB_RATE_LIMIT's: a withdrawal carries no fee, so an
+    // unlimited default lets a dust balance spend the relayer's gas.
+    expect(loadConfig(required).moneyRateLimit).toBe(24);
+    expect(loadConfig({ ...required, JOB_RATE_LIMIT: "5" }).moneyRateLimit).toBe(24);
+    expect(loadConfig({ ...required, MONEY_RATE_LIMIT: "3" }).moneyRateLimit).toBe(3);
+    expect(() => loadConfig({ ...required, MONEY_RATE_LIMIT: "0" })).toThrow(
+      'MONEY_RATE_LIMIT must be an integer in [1, 1440], got "0"',
+    );
+  });
+
   it("rejects a getLogs cap of zero, which would stall the indexer", () => {
     expect(() => loadConfig({ ...required, GETLOGS_CAP: "0" })).toThrow(
       'GETLOGS_CAP must be an integer in [1, 1000000], got "0"',

@@ -63,7 +63,9 @@ Every key is required:
 | `RELAY_MAX_DEPTH` | `32` | `1`–`4096` | Relays that may queue on the relayer account. Beyond it: `503 relay_unavailable`, `relay_queue_full`. |
 | `RELAY_QUEUE_TIMEOUT_MS` | `10000` | `1`–`600000` | Longest a relay waits in that queue. Beyond it: `503 relay_unavailable`, `relay_queue_timeout`. |
 | `RELAYER_LOW_BALANCE_GWEI` | `50000000` | `1`–`1000000000000` | Relayer balance, in gwei, under which the daily balance check logs an error. The default is 0.05 ETH. |
-| `JOB_RATE_LIMIT` | `0` (no limit) | `0`–`1000000` | Jobs one wallet may post for one model through `POST /v1/jobs` in 24 hours. Beyond it: `429 rate_limit_exceeded`. Counted in memory, so a restart resets it and each instance counts its own. |
+| `JOB_RATE_LIMIT` | `0` (no limit) | `0`–`1000000` | Jobs one wallet may submit for one model through `POST /v1/jobs` in 24 hours. Beyond it: `429 rate_limit_exceeded`. Counted in memory, so a restart resets it and each instance counts its own. |
+| `MONEY_RATE_LIMIT` | `24` | `1`–`1440` | Deposits plus withdrawals one wallet may have relayed through `POST /v1/deposits` and `POST /v1/withdrawals` in 24 hours, counted together. Beyond it: `429 rate_limit_exceeded`. Counted in memory, so a restart resets it and each instance counts its own. |
+| `PAYOUT_INTERVAL_MS` | `86400000` (24 hours) | `60000`–`604800000` | How often the payout keeper relays `payProvider` for every provider with earnings, then `payRelayer` for the node's relayer, then `payTreasury`. The first pass runs at boot. |
 
 ## Object storage and files
 

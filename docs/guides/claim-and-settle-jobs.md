@@ -24,7 +24,7 @@ Ask for as many jobs as you have free slots for one model:
 curl -s "$VORQ/evm/jobs?state=Open&model=$MODEL_ID&free=4" -H "authorization: Bearer $TOKEN"
 ```
 
-The coordinator leases you up to `free` of the oldest matching open jobs (open bids, or jobs designated to you) for 20 seconds by default, and returns only the jobs you hold. Other pollers do not see them while the lease lasts. The poll also marks you as live with those free slots, which is what lets a `402` quote name you as a candidate. Poll at least every 15 seconds to stay live.
+The coordinator leases you up to `free` of the oldest matching open orders (open bids, or orders designated to you) for 20 seconds by default, and returns only the ones you hold. An open order is held by the coordinator and is not on chain yet: your claim puts it there. Other pollers do not see them while the lease lasts. The poll also marks you as live with those free slots, which is what lets a `402` quote name you as a candidate. Poll at least every 15 seconds to stay live.
 
 A lease is advisory. The chain decides every claim.
 
@@ -35,7 +35,7 @@ curl -s -X POST "$VORQ/evm/simulate/claim" -H 'content-type: application/json' \
   -d "{\"job_id\": \"$JOB_ID\", \"address\": \"$PROVIDER_ADDR\"}"
 ```
 
-`{"ok": true}` means the claim would pass the contract's checks right now. Otherwise `reason` names the first check that fails: `UnknownJob`, `NotOpen`, `UnknownProvider`, `NotListed`, `ModelNotAllowed`, `NotDesignated` or `AtCapacity`.
+`{"ok": true}` means the claim would pass the contract's checks right now. Otherwise `reason` names the first check that fails: `NotOpen` (no open order under this id), `SlaNotAllowed`, `AlreadyExpired`, `UnknownModel`, `ModelDisabled`, `UnknownProvider`, `NotListed`, `ModelNotAllowed`, `NotDesignated`, `AtCapacity`, `GasFeeChanged` (the order was quoted at another gas fee) or `InsufficientDeposit` (the owner's balance does not cover the lock).
 
 Fetch the job's container by its `task_cid` from an IPFS gateway and check that it reproduces the order's `c` before claiming. See [Payloads and file retention](../concepts/payloads-and-file-retention.md).
 
@@ -53,7 +53,7 @@ curl -s -X POST "$VORQ/evm/ops" \
 { "tx_hash": "0x…", "status": "success", "block_number": 12345678 }
 ```
 
-The claim collects the client's payment. A `409` body names the contract's reason, for example `{"ok": false, "reason": "NotOpen"}` when another provider claimed first.
+The coordinator adds the client's signed order from its own record and relays `claim(order, owner, orderSig, issuedAt, signature)`: the order goes on chain and the job is claimed in one transaction, which locks `cap + fee + gas_fee` from the client's prepaid balance. A `409` body names the reason, for example `{"ok": false, "reason": "NotOpen"}` when another provider claimed first, or `InsufficientDeposit` when the client's balance is short.
 
 ## 4. Get the payload key
 
@@ -91,11 +91,15 @@ For a result larger than the 20 MiB request body allows, upload it first with `P
 { "tx_hash": "0x…", "status": "success", "block_number": 12345690, "result_cid": "bafy…" }
 ```
 
-Settle before `claimed_at + sla_secs`. After that, anyone can reclaim the job and the client is refunded.
+Settle before `claimed_at + sla_secs`. After that, anyone can reclaim the job and the client's lock returns to its balance.
+
+The coordinator adds the job's terms from its record to `settle` and `fail`, including the relayer that landed the claim; the contract checks them against what it stored at claim. You can settle or fail through any coordinator, not only the one that relayed your claim. A job the coordinator has no record of, or whose claim it has not indexed yet, is refused `NotClaimed`.
+
+Settlement credits your charge to your provider id inside the `JobRegistry`. The coordinator's payout keeper pays it out once a day (`PAYOUT_INTERVAL_MS`) to your provider's current operator key.
 
 ## If you cannot deliver
 
-Relay a `fail` op (`Fail(bytes32 jobId,uint64 issuedAt)`). The client is refunded. Within 300 seconds of the claim there is no reputation penalty; after that, the provider's reputation drops.
+Relay a `fail` op (`Fail(bytes32 jobId,uint64 issuedAt)`). The client's lock, less the gas fee, returns to its balance. Within 300 seconds of the claim there is no reputation penalty; after that, the provider's reputation drops.
 
 ## Timing rules
 

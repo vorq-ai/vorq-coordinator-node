@@ -9,7 +9,7 @@ description: Run your own coordinator against a VORQ deployment, with Postgres, 
 - PostgreSQL 16 or newer. Migrations refuse older versions.
 - A JSON-RPC endpoint for the chain the VORQ contracts are deployed on.
 - An S3-compatible object store that pins each object to IPFS and returns its CID, either as a `CID` element in the `CompleteMultipartUpload` response or as an `x-amz-meta-cid` response header. A plain S3 bucket does not mint CIDs, and every upload through it fails.
-- A relayer account (`RELAYER_KEY`) funded with ETH. It pays the gas for every relayed transaction.
+- A relayer account (`RELAYER_KEY`) funded with ETH. It pays the gas for every relayed transaction and earns the gas and deposit fees of what it lands.
 - The deployment's address book (see [Configuration](../reference/configuration.md#address-book)).
 
 ## 1. Get the code and a database
@@ -77,8 +77,10 @@ Unset, the node sends no CORS headers.
 
 ## Keep it running
 
-- **Relayer balance.** When the relayer runs out of ETH, relayed writes answer `503 relay_unavailable` with `code: "relayer_funds"`. Top it up. The order's `gas_fee` is set by the `JobRegistry` and paid to its treasury, not to the relayer.
+- **Relayer balance.** When the relayer runs out of ETH, relayed writes answer `503 relay_unavailable` with `code: "relayer_funds"`. Top it up. Fee earnings arrive in the payment token, not in ETH.
 - **Reclaims.** The node calls `reclaim` once a minute for claimed jobs past their SLA, so clients are refunded even when nobody else acts.
+- **Payouts.** Every `PAYOUT_INTERVAL_MS` (daily by default) the node relays `payProvider` for each provider with earnings, paid to its current operator key, then `payRelayer` for its own relayer account, and then `payTreasury`. The relayer pays the gas of each payout.
+- **Fee earnings.** Your relayer earns the `gas_fee` of every job whose claim it landed, on every exit (settle, fail or reclaim, whoever relays the exit), and the `deposit_fee` of every deposit it landed. The protocol fee goes to the treasury. `relayerEarned(<relayer>)` on the `JobRegistry` reads what is owed. `payRelayer` pays it to the relayer account itself, so sweep the payment token from that account to wherever you keep it.
 - **Reorgs.** If `/readyz` reports `reason: "reorg"`, rebuild the index: see [Recover from a reorg](./recover-from-a-reorg.md).
 - **Open bids.** To accept open-bid orders, run the escrow: see [Run the escrow](./run-the-escrow.md).
 - **Error reporting.** Set `SENTRY_DSN` to report errors. The Docker image preloads the reporter; with `npm start` it is preloaded too.

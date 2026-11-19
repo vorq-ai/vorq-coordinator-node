@@ -115,7 +115,7 @@ describe("escrow open-order release", () => {
 
     // ---- the provider claims, on chain ------------------------------------
 
-    await claimOnChain(addresses, posted.jobId);
+    await claimOnChain(addresses, posted);
     expect(await jobStateOf(addresses, posted.jobId)).toBe(1);
 
     // ---- the release ------------------------------------------------------

@@ -66,6 +66,8 @@ function config(mode: EscrowMode): Config {
     relayerLowBalanceGwei: 50_000_000,
     match: { leaseMs: 20_000, livenessMs: 15_000, candidates: 3 },
     jobRateLimit: 0,
+    moneyRateLimit: 24,
+    payoutIntervalMs: 86_400_000,
     escrow: {
       mode,
       releaseOrdinal: 1,
